@@ -1,0 +1,11 @@
+name: surgical_robot_env
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.10
+  - pytorch
+  - numpy
+  - pip
+  - pip:
+    - isaacsim-rl

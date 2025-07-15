@@ -1,0 +1,143 @@
+# Training parameters for Surgical Human-Robot Shared Control
+# Compatible with the SharedControlTrainer algorithm
+# Note: Network operates in real-world scale (10x smaller than simulation)
+
+params:
+  seed: 42
+
+  # Environment wrapper settings
+  env:
+    clip_actions: 1.0      # Real world scale actions [-1, 1]
+    clip_observations: 1.0  # Real world scale observations (positions in meters)
+    simulation_scale: 10.0  # Simulation is 10x larger than real world
+
+  # Algorithm configuration
+  algo:
+    name: shared_control_surgical
+
+  # Model configuration  
+  model:
+    name: surgical_actor_critic
+    
+  # Network architecture
+  network:
+    name: actor_critic
+    separate: False
+    
+    # Actor network settings
+    actor:
+      hidden_dims: [256, 256, 128]
+      activation: relu
+      output_activation: tanh
+      
+    # Critic network settings  
+    critic:
+      hidden_dims: [256, 256, 128]
+      activation: relu
+      
+    # Dynamics identifier network
+    identifier:
+      hidden_dims: [256, 256]
+      activation: relu
+      
+    # Network initialization
+    initializer:
+      name: xavier_uniform
+      gain: 1.0
+      
+  # Checkpoint settings
+  load_checkpoint: False
+  load_path: ''
+  
+  # Training configuration
+  config:
+    name: surgical_shared_control
+    env_name: surgical_direct
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    
+    # Training hyperparameters
+    learning_rate: 3e-4
+    identifier_lr: 1e-3
+    batch_size: 512
+    buffer_size: 100000
+    min_buffer_size: 1000
+    
+    # Training schedule
+    max_epochs: 2000
+    steps_per_epoch: 1000
+    update_frequency: 10
+    save_frequency: 100
+    eval_frequency: 50
+    
+    # Gradient settings
+    max_grad_norm: 0.5
+    clip_grad_norm: True
+    
+    # Loss function weights
+    actor_loss_weight: 1.0
+    critic_loss_weight: 0.5
+    identifier_loss_weight: 0.1
+    entropy_weight: 0.01
+    
+    # Reward shaping
+    reward_scale: 1.0
+    gamma: 0.99  # Discount factor
+    tau: 0.005   # Soft update coefficient
+    
+    # Human-robot collaboration parameters
+    collaboration_weight: 2.0
+    human_trust_factor: 0.8
+    adaptation_rate: 0.1
+    
+    # Constraint-specific parameters
+    collision_tolerance: 0.001  # 1mm tolerance
+    force_limit: 5.0           # 5N maximum force
+    velocity_limit: 0.1        # 0.1 m/s maximum velocity
+    
+    # Shared control weights
+    q1_weight: 10.0    # Position tracking weight
+    q2_weight: 5.0     # Velocity penalty weight  
+    q3_weight: 15.0    # Constraint violation weight
+    r_weight: 0.1      # Action penalty weight
+    
+    # Human dynamics model parameters
+    human_stiffness: 201.0
+    human_damping: 21.0
+    interaction_threshold: 0.1
+    
+    # Curriculum learning
+    curriculum_enabled: True
+    initial_force_limit: 2.0
+    final_force_limit: 5.0
+    curriculum_episodes: 500
+    
+    # Logging and monitoring
+    log_level: INFO
+    tensorboard_logging: True
+    wandb_logging: False
+    save_best_after: 100
+    
+    # Environment-specific settings
+    num_actors: -1  # Will be set automatically based on num_envs
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    
+    # Exploration settings
+    exploration_noise: 0.1
+    exploration_decay: 0.995
+    min_exploration: 0.01
+    
+    # Safety and robustness
+    action_noise_std: 0.05
+    observation_noise_std: 0.01
+    domain_randomization: True
+    
+    # Task-specific rewards
+    distance_reward_scale: 1.0
+    collision_penalty_scale: -10.0
+    task_completion_scale: 50.0
+    smoothness_penalty_scale: -0.1
+    human_collaboration_scale: 2.0
