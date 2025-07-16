@@ -1,9 +1,8 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Simplified Configuration for Surgical Direct Environment."""
+"""论文对齐的手术直接环境配置 - 基于论文方程实现"""
 
 from __future__ import annotations
 
@@ -18,16 +17,18 @@ from isaaclab.utils import configclass
 
 @configclass
 class SurgicalDirectEnvCfg(DirectRLEnvCfg):
-    """Simplified Configuration for Surgical Direct Environment."""
+    """论文对齐的手术直接环境配置"""
     
-    # Environment settings
-    episode_length_s = 8.0  # 8 seconds per episode
-    decimation = 2  # Control frequency decimation
+    # 环境设置
+    episode_length_s = 8.0  
+    decimation = 2  
     action_space = 3  # xyz forces only
-    observation_space = 19  # Simplified: pos(3) + vel(3) + target_pos(3) + target_vel(3) + constraint(5) + workspace(2)
-    state_space = 0
     
-    # Simulation settings
+    # 论文方程(18)的状态空间: z = [x, ẋ, f]^T ∈ R^9
+    observation_space = 12  # 修改为: pos(3) + vel(3) + force(3) + desired_pos(3) = 12D
+    state_space = 9  # 论文标准状态: z = [x, ẋ, f]^T ∈ R^9
+    
+    # 仿真设置
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,  # 120 Hz simulation
         render_interval=decimation,
@@ -40,49 +41,49 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
         ),
     )
     
-    # Scene settings
+    # 场景设置
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=512, 
         env_spacing=2.0, 
         replicate_physics=True
     )
     
-    # Scalpel (represented as sphere) - real-world scale
+    # 手术刀配置
     scalpel = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Scalpel",
         spawn=sim_utils.UsdFileCfg(
             usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/scalpel_simple.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=True,  # No gravity
+                disable_gravity=True,
                 max_depenetration_velocity=1.0,
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.015),  # Start 15mm above constraint center
-            rot=(1.0, 0.0, 0.0, 0.0),  # No rotation
+            pos=(0.0, 0.0, 0.015),
+            rot=(1.0, 0.0, 0.0, 0.0),
             lin_vel=(0.0, 0.0, 0.0),
             ang_vel=(0.0, 0.0, 0.0),
         ),
     )
     
-    # Constraint - real-world scale
+    # 约束配置
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
             usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/ConeConstraint.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,  # Cannot be moved
+                kinematic_enabled=True,
                 disable_gravity=True,
             ),
             scale=(0.017, 0.017, 0.0125),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.0),  # At world origin
+            pos=(0.0, 0.0, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
     
-    # Ground plane
+    # 地面
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -96,77 +97,75 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
         ),
     )
     
-    # Force and control parameters - real-world scale
-    max_force = 1.0  # Reduced maximum force (N)
-    force_scale = 1.0  # Force scaling factor
+    # 力和控制参数
+    max_force = 1.0  
+    force_scale = 1.0  
     
-    # Reward scales (balanced for reasonable rewards)
-    collision_penalty_scale = -5.0       # Moderate collision penalty
-    distance_reward_scale = 2.0
-    smoothness_reward_scale = 0.5        # Positive smoothness reward
-    human_collaboration_scale = 1.0      # Moderate collaboration reward
-    task_completion_scale = 10.0         # Moderate completion reward
+    # 论文方程(13)的成本函数权重 - 严格按论文设置
+    Q1_weight = 100.0   # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d) 
+    Q2_weight = 0.01    # 速度调节权重 ẋ^T Q_2 ẋ
+    Q3_weight = 0.001   # 力调节权重 f^T Q_3 f
+    R_weight = 0.001    # 控制输入权重 u^T R u
     
-    # Task parameters (real-world scale)
-    target_height = 0.005  # Target height inside constraint (5mm)
-    collision_threshold = 0.0001  # Collision detection threshold (0.1mm)
+    # 论文方程(6)的人体阻抗参数
+    human_damping_CH = [21.0, 21.0, 21.0]        # C_H 矩阵对角元素
+    human_stiffness_KH = [201.0, 201.0, 201.0]   # K_H 矩阵对角元素
+    interaction_force_threshold = 0.1             # 交互力阈值
     
-    # Constraint geometry parameters (real-world scale)
-    constraint_inner_radius_min = 0.01   # 10mm (thin end radius)
-    constraint_inner_radius_max = 0.05   # 50mm (thick end radius, 10cm diameter)
-    constraint_outer_radius_min = 0.015  # 15mm 
-    constraint_outer_radius_max = 0.055  # 55mm
-    constraint_height = 0.1              # 100mm (10cm height)
+    # 任务参数
+    target_height = 0.005  
+    collision_threshold = 0.0001  
     
-    # Human dynamics model parameters (aligned with paper Eq. 6)
-    human_stiffness = 201.0
-    human_damping = 21.0
-    interaction_force_threshold = 0.1
+    # 约束几何参数
+    constraint_inner_radius_min = 0.01   
+    constraint_inner_radius_max = 0.05   
+    constraint_outer_radius_min = 0.015  
+    constraint_outer_radius_max = 0.055  
+    constraint_height = 0.1              
     
-    # Human workspace parameters
-    human_workspace_radius = 0.2         # 20cm radius around origin
-    human_max_velocity = 0.3             # 30cm/s maximum human velocity
-    human_intention_weight = 0.3         # Weight for human intention in action fusion
+    # 人体工作空间参数
+    human_workspace_radius = 0.2         
+    human_max_velocity = 0.3             
     
-    # Human-robot collaboration parameters (aligned with paper)
-    robot_action_weight = 0.7            # 70% robot weight in action fusion
-    human_action_weight = 0.3            # 30% human weight in action fusion
-    collaboration_adaptation_rate = 0.05 # Rate of adaptation for collaboration weights
+    # 论文共享控制参数
+    robot_action_weight = 0.7            # α in paper
+    human_action_weight = 0.3            # 1-α in paper  
+    collaboration_adaptation_rate = 0.05 # 自适应率
     
-    # Trajectory parameters
-    trajectory_update_frequency = 10     # Update trajectory target every 10 steps
-    trajectory_completion_threshold = 0.005  # 5mm threshold for trajectory point completion
-    spiral_trajectory_turns = 2.0        # Number of turns in spiral trajectory
-    spiral_radius_range = (0.01, 0.04)   # 1-4cm radius range for spiral
-    spiral_height_range = (0.002, 0.08)  # 2-80mm height range for spiral
-    trajectory_points_count = 200        # Number of points in trajectory
+    # 轨迹参数
+    trajectory_update_frequency = 10     
+    trajectory_completion_threshold = 0.005  
+    spiral_trajectory_turns = 2.0        
+    spiral_radius_range = (0.01, 0.04)   
+    spiral_height_range = (0.002, 0.08)  
+    trajectory_points_count = 200        
     
-    # Safety parameters
-    max_constraint_distance = 0.02       # 20mm maximum allowed distance from constraint
-    emergency_stop_distance = 0.001      # 1mm emergency stop distance
-    collision_recovery_force = 1.0       # 1N force for collision recovery
-    sphere_radius = 0.002                # 2mm sphere radius for collision detection
+    # 安全参数
+    max_constraint_distance = 0.02       
+    emergency_stop_distance = 0.001      
+    collision_recovery_force = 1.0       
+    sphere_radius = 0.002                
     
-    # Action scaling parameters
-    action_velocity_scale = 0.1           # Scale actions to 10cm/s max velocity
-    action_force_scale = 1.0             # Direct force scaling
-    max_action_norm = 0.1                # Maximum action norm (10cm/s)
+    # 动作缩放参数
+    action_velocity_scale = 0.1           
+    action_force_scale = 1.0             
+    max_action_norm = 0.1                
     
-    # Observation normalization parameters
-    position_normalization_range = 0.3   # ±30cm normalization range
-    velocity_normalization_range = 0.5   # ±50cm/s normalization range
-    force_normalization_range = 5.0      # ±5N normalization range
-    observation_clamp_range = 10.0       # Clamp observations to ±10
+    # 观测归一化参数
+    position_normalization_range = 0.3   
+    velocity_normalization_range = 0.5   
+    force_normalization_range = 5.0      
+    observation_clamp_range = 10.0       
     
-    # Environment reset parameters
-    reset_position_noise = 0.005         # ±5mm position noise on reset
-    reset_velocity_noise = 0.002         # ±2mm/s velocity noise on reset
-    reset_within_workspace = True        # Always reset within human workspace
-    reset_workspace_radius_range = (0.02, 0.15)  # 2-15cm from workspace center
+    # 环境重置参数
+    reset_position_noise = 0.005         
+    reset_velocity_noise = 0.002         
+    reset_within_workspace = True        
+    reset_workspace_radius_range = (0.02, 0.15)  
     
-    # Physics simulation parameters
-    physics_dt = 1/120                   # 120Hz physics simulation
-    render_dt = 1/60                     # 60Hz rendering
-    solver_iterations = 4                # Physics solver iterations
-    solver_velocity_iterations = 1       # Velocity solver iterations
-    use_gpu_physics = True               # Enable GPU physics if available
+    # 物理仿真参数
+    physics_dt = 1/120                   
+    render_dt = 1/60                     
+    solver_iterations = 4                
+    solver_velocity_iterations = 1       
+    use_gpu_physics = True

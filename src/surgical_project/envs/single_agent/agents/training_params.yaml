@@ -1,128 +1,168 @@
-# Simplified Training parameters for Surgical Human-Robot Shared Control
-# Aligned with the paper's framework and equations
+# 论文对齐的手术机器人人机共享控制训练参数
+# 严格按照论文方程和理论框架设置
 
 params:
   seed: 42
 
-  # Environment wrapper settings
+  # 环境包装设置
   env:
-    clip_actions: 1.0      # Real world scale actions [-1, 1]
-    clip_observations: 1.0  # Real world scale observations
+    clip_actions: 1.0      # 真实世界尺度动作 [-1, 1]
+    clip_observations: 1.0  # 真实世界尺度观测
 
-  # Algorithm configuration
+  # 算法配置
   algo:
-    name: shared_control_surgical
+    name: paper_shared_control_surgical  # 论文对齐算法
 
-  # Model configuration  
+  # 模型配置  
   model:
-    name: surgical_actor_critic
+    name: paper_surgical_actor_critic    # 论文对齐模型
     
-  # Network architecture (simplified)
+  # 网络架构（论文对齐）
   network:
-    name: actor_critic
+    name: paper_actor_critic
     separate: false
     
-    # Actor network settings
+    # Actor网络设置（论文方程50）
     actor:
       hidden_dims: [256, 128]
       activation: relu
       output_activation: tanh
       
-    # Critic network settings  
+    # Critic网络设置（论文方程29）
     critic:
       hidden_dims: [256, 128]
       activation: relu
       
-    # Dynamics identifier network
+    # 动力学识别网络（论文方程34）
     identifier:
       hidden_dims: [128, 128]
       activation: relu
       
-    # Network initialization
+    # 网络初始化
     initializer:
       name: orthogonal
       gain: 1.0
       
-  # Training configuration
+  # 训练配置
   config:
-    name: surgical_shared_control
+    name: paper_surgical_shared_control
     env_name: surgical_direct
     device: cuda:0
     
-    # Core training hyperparameters (all numeric values)
-    learning_rate: 0.0003
-    identifier_lr: 0.001
-    batch_size: 256
-    buffer_size: 50000
+    # 核心训练超参数（所有数值）
+    learning_rate: 0.0001      # 降低学习率提高稳定性
+    identifier_lr: 0.0005      # 动力学识别器学习率
+    batch_size: 128            # 减小批量大小
+    buffer_size: 10000         # 减小缓冲区大小
     min_buffer_size: 1000
     
-    # Training schedule
+    # 训练计划
     max_epochs: 1000
     steps_per_epoch: 500
     update_frequency: 20
     save_frequency: 100
     eval_frequency: 50
     
-    # Gradient settings
-    max_grad_norm: 0.5
+    # 梯度设置
+    max_grad_norm: 1.0         # 增加梯度裁剪阈值
     clip_grad_norm: true
     
-    # RL parameters
-    gamma: 0.99  # Discount factor
-    tau: 0.005   # Soft update coefficient
+    # 强化学习参数
+    gamma: 0.99  # 折扣因子
+    tau: 0.005   # 软更新系数
     
-    # Human-robot collaboration parameters (from paper)
+    # 论文方程(13)的成本函数权重 - 严格按论文设置
+    Q1_weight: 100.0    # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d)
+    Q2_weight: 0.01     # 速度调节权重 ẋ^T Q_2 ẋ  
+    Q3_weight: 0.001    # 力调节权重 f^T Q_3 f
+    R_weight: 0.001     # 控制输入权重 u^T R u
+    
+    # 论文方程(6)的人体动力学参数
+    human_damping_CH: [21.0, 21.0, 21.0]        # C_H 阻尼矩阵对角元素
+    human_stiffness_KH: [201.0, 201.0, 201.0]   # K_H 刚度矩阵对角元素
+    interaction_threshold: 0.1
+    
+    # 论文共享控制参数
     robot_action_weight: 0.7    # α in paper's shared control framework
     human_action_weight: 0.3    # 1-α in paper
     collaboration_adaptation_rate: 0.05
     
-    # Human dynamics model parameters (paper Equation 6)
-    human_stiffness: 201.0      # KH in CHx˙ + KH(x - xH) = -f
-    human_damping: 21.0         # CH in CHx˙ + KH(x - xH) = -f
-    interaction_threshold: 0.1
+    # 工作空间和轨迹参数
+    human_workspace_radius: 0.2     # 20cm工作空间半径
+    human_max_velocity: 0.3         # 30cm/s最大人体速度
+    trajectory_tracking_scale: 5.0
+    workspace_compliance_scale: 2.0
     
-    # Cost function weights (paper Equation 13)
-    q1_weight: 100.0    # Position tracking weight in r = (x-xd)ᵀQ₁(x-xd) + ...
-    q2_weight: 50.0     # Velocity penalty weight for x˙ᵀQ₂x˙
-    q3_weight: 200.0    # Force regulation weight for fᵀQ₃f
-    r_weight: 0.1       # Control input weight for uᵀRu
+    # 物理约束（真实世界尺度）
+    force_limit: 3.0                # 3N最大力
+    velocity_limit: 0.1             # 0.1 m/s最大速度
+    collision_tolerance: 0.0001     # 0.1mm碰撞容忍
     
-    # Reward shaping for environment
-    reward_scale: 1.0
-    collision_penalty_scale: -10.0
-    task_completion_scale: 20.0
-    smoothness_penalty_scale: -0.05
-    human_collaboration_scale: 2.0
+    # 奖励塑形（基于论文成本函数）
+    collision_penalty_scale: -10.0     # 碰撞惩罚
+    task_completion_scale: 20.0        # 任务完成奖励
+    smoothness_penalty_scale: -0.05    # 平滑性惩罚
+    workspace_penalty_scale: -5.0      # 工作空间惩罚
     
-    # Safety and robustness
+    # 安全和鲁棒性
     action_noise_std: 0.01
     observation_noise_std: 0.001
     domain_randomization: true
     
-    # Workspace and trajectory parameters
-    human_workspace_radius: 0.2     # 20cm workspace radius
-    human_max_velocity: 0.3         # 30cm/s max human velocity
-    trajectory_tracking_scale: 5.0
-    workspace_compliance_scale: 2.0
-    
-    # Physics constraints (real-world scale)
-    force_limit: 3.0                # 3N maximum force
-    velocity_limit: 0.1             # 0.1 m/s maximum velocity
-    collision_tolerance: 0.0001     # 0.1mm collision tolerance
-    
-    # Logging and monitoring
+    # 记录和监控
     log_level: INFO
     tensorboard_logging: true
     wandb_logging: false
     save_best_after: 50
     
-    # Environment-specific settings
-    num_actors: -1  # Will be set automatically based on num_envs
+    # 环境特定设置
+    num_actors: -1  # 将根据num_envs自动设置
     normalize_input: true
     normalize_value: true
     normalize_advantage: true
     
-    # Exploration settings
+    # 探索设置
     exploration_noise: 0.01
     exploration_decay: 0.995
     min_exploration: 0.001
+    
+    # 论文状态空间设置
+    state_space_dim: 9          # z = [x, ẋ, f]^T ∈ R^9
+    augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12
+    observation_space_dim: 12   # 观测空间维度
+    action_space_dim: 3         # u ∈ R^3
+    
+    # HJB方程求解参数（论文方程28）
+    hjb_learning_rate: 0.001
+    hjb_update_frequency: 10
+    hjb_error_threshold: 0.01
+    
+    # 动力学识别参数（论文方程34-36）
+    dynamics_learning_rate: 0.002
+    dynamics_update_frequency: 5
+    dynamics_prediction_horizon: 1
+    
+    # 论文Actor-Critic参数
+    value_function_learning_rate: 0.001  # Critic学习率
+    policy_learning_rate: 0.0005         # Actor学习率
+    
+    # 人体意图估计参数
+    intention_estimation_method: "impedance_model"  # 基于论文方程6
+    intention_smoothing_factor: 0.1
+    intention_prediction_horizon: 5
+    
+    # 共享控制融合参数
+    fusion_method: "adaptive_weighting"    # 自适应权重融合
+    force_based_adaptation: true           # 基于交互力的自适应
+    adaptation_time_constant: 0.1
+    
+    # 性能监控参数
+    track_paper_cost_components: true     # 跟踪论文成本函数各组件
+    track_hjb_residual: true              # 跟踪HJB方程残差
+    track_dynamics_error: true            # 跟踪动力学识别误差
+    track_human_intention_accuracy: true  # 跟踪人体意图估计精度
+    
+    # 实验设置
+    paper_experiment_mode: true           # 论文实验模式
+    theoretical_validation: true          # 理论验证
+    comparative_analysis: false           # 对比分析（与其他方法）

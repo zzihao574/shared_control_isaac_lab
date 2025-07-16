@@ -1,33 +1,38 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Model-based reinforcement learning algorithms for surgical robot training."""
+"""基于模型的强化学习算法 - 论文对齐版本"""
 
-# Import from actor_critic.py
+# 从 actor_critic.py 导入
 from .actor_critic import (
     SurgicalActor,
     SurgicalCritic,
     DynamicsIdentifierNetwork,
+    HJBSolver,
     SurgicalActorCritic,
 )
 
-# Import from shared_control.py
+# 从 shared_control.py 导入
 from .shared_control import (
     SharedControlTrainer,
-    HumanDynamicsModel,
+    HumanImpedanceModel,
+    PaperCostFunction,
+    AdaptiveSharedControl,
     ReplayBuffer,
 )
 
 __all__ = [
-    # Actor-Critic components
+    # Actor-Critic 组件
     "SurgicalActor",
-    "SurgicalCritic",
-    "DynamicsIdentifierNetwork", 
+    "SurgicalCritic", 
+    "DynamicsIdentifierNetwork",
+    "HJBSolver",
     "SurgicalActorCritic",
-    # Shared control components
+    # 共享控制组件
     "SharedControlTrainer",
-    "HumanDynamicsModel",
+    "HumanImpedanceModel",
+    "PaperCostFunction", 
+    "AdaptiveSharedControl",
     "ReplayBuffer",
 ]

@@ -1,47 +1,51 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Algorithms for surgical robot training.
+"""手术机器人强化学习算法配置包 - 论文对齐版本"""
 
-This package contains both single-agent (MBRL) and multi-agent (MARL) algorithms
-for surgical robot training with human-robot collaboration.
-"""
+# 导入基于模型的强化学习算法
+try:
+    from .mbrl import (
+        # Actor-Critic 组件
+        SurgicalActor,
+        SurgicalCritic,
+        DynamicsIdentifierNetwork,
+        HJBSolver,
+        SurgicalActorCritic,
+        # 共享控制组件
+        SharedControlTrainer,
+        HumanImpedanceModel,
+        PaperCostFunction,
+        AdaptiveSharedControl,
+        ReplayBuffer,
+    )
+    
+    _MBRL_AVAILABLE = True
+    print("[INFO] MBRL algorithms loaded successfully")
+    
+except ImportError as e:
+    print(f"[WARNING] Failed to import MBRL algorithms: {e}")
+    _MBRL_AVAILABLE = False
 
-# Import single-agent algorithms from mbrl subpackage
-from .mbrl import (
-    SurgicalActor,
-    SurgicalCritic,
-    DynamicsIdentifierNetwork,
-    SurgicalActorCritic,
-    SharedControlTrainer,
-    HumanDynamicsModel,
-    ReplayBuffer,
-)
+# 导出所有可用的组件
+__all__ = []
 
-# Import multi-agent algorithms from marl subpackage
-from .marl import (
-    MADDPGTrainer,
-    MADDPGAgent,
-    Actor,
-    Critic,
-    ReplayBuffer as MARLReplayBuffer,
-)
+if _MBRL_AVAILABLE:
+    __all__.extend([
+        # Actor-Critic 组件
+        "SurgicalActor",
+        "SurgicalCritic",
+        "DynamicsIdentifierNetwork", 
+        "HJBSolver",
+        "SurgicalActorCritic",
+        # 共享控制组件
+        "SharedControlTrainer",
+        "HumanImpedanceModel",
+        "PaperCostFunction",
+        "AdaptiveSharedControl", 
+        "ReplayBuffer",
+    ])
 
-__all__ = [
-    # Single-agent (MBRL) algorithms
-    "SurgicalActor",
-    "SurgicalCritic",
-    "DynamicsIdentifierNetwork",
-    "SurgicalActorCritic", 
-    "SharedControlTrainer",
-    "HumanDynamicsModel",
-    "ReplayBuffer",
-    # Multi-agent (MADDPG) algorithms
-    "MADDPGTrainer",
-    "MADDPGAgent",
-    "Actor",
-    "Critic", 
-    "MARLReplayBuffer",
-]
+# 版本信息
+__version__ = "1.0.0-paper-aligned"

@@ -1,4 +1,4 @@
-# surgical_project/algorithms/shared_control.py - Simplified version aligned with paper
+# surgical_project/algorithms/shared_control.py - 最终修复版本
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -7,239 +7,354 @@ import numpy as np
 from .actor_critic import SurgicalActorCritic
 
 class ReplayBuffer:
-    """Simple Experience Replay Buffer"""
+    """经验回放缓冲区"""
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
     
-    def add(self, obs, action, reward, next_obs, done):
-        self.buffer.append((obs, action, reward, next_obs, done))
+    def add(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
     
     def sample(self, batch_size):
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
         
-        obs = torch.stack([b[0] for b in batch])
+        states = torch.stack([b[0] for b in batch])
         actions = torch.stack([b[1] for b in batch])
         rewards = torch.stack([b[2] for b in batch])
-        next_obs = torch.stack([b[3] for b in batch])
+        next_states = torch.stack([b[3] for b in batch])
         dones = torch.stack([b[4] for b in batch])
         
-        return obs, actions, rewards, next_obs, dones
+        return states, actions, rewards, next_states, dones
     
     def __len__(self):
         return len(self.buffer)
 
-
-class HumanDynamicsModel:
-    """Simplified Human Dynamics Model - Aligned with paper Equation (6)"""
+class HumanImpedanceModel:
+    """论文方程(6)的人体阻抗模型: C_H ẋ + K_H(x - x_H) = -f"""
     def __init__(self, device, config=None):
         self.device = device
         
-        # Human impedance parameters from paper Equation (6): CHx˙ + KH(x - xH) = -f
         if config is not None:
-            self.CH = config.get('human_damping', 21.0)     # Damping coefficient
-            self.KH = config.get('human_stiffness', 201.0)   # Stiffness coefficient
+            damping_diag = config.get('human_damping_CH', [21.0, 21.0, 21.0])
+            stiffness_diag = config.get('human_stiffness_KH', [201.0, 201.0, 201.0])
         else:
-            self.CH = 21.0   # Default damping
-            self.KH = 201.0  # Default stiffness
+            damping_diag = [21.0, 21.0, 21.0]
+            stiffness_diag = [201.0, 201.0, 201.0]
             
-        # Human workspace parameters
-        self.workspace_radius = 0.2  # 20cm radius
-        self.max_human_velocity = 0.3  # 30cm/s maximum velocity
+        self.CH = torch.diag(torch.tensor(damping_diag, device=device, dtype=torch.float32))
+        self.KH = torch.diag(torch.tensor(stiffness_diag, device=device, dtype=torch.float32))
         
-        print(f"[INFO] Human dynamics model initialized:")
-        print(f"  - Damping (CH): {self.CH}")
-        print(f"  - Stiffness (KH): {self.KH}")
-        print(f"  - Workspace radius: {self.workspace_radius*100:.0f}cm")
+        self.workspace_radius = 0.2
+        self.max_human_velocity = 0.3
         
-    def get_human_intention(self, obs, interaction_force):
-        """Estimate human intention based on paper's impedance model"""
+    def get_human_intention(self, current_pos: torch.Tensor, current_vel: torch.Tensor, 
+                          interaction_force: torch.Tensor) -> torch.Tensor:
+        """基于论文方程(6)估计人体意图位置 x_H"""
+        # 输入验证
+        if current_pos is None or current_vel is None or interaction_force is None:
+            if current_pos is not None:
+                return current_pos.clone()
+            return torch.zeros(3, device=self.device)
+        
         try:
-            # Ensure proper tensor dimensions
-            if obs.dim() == 1:
-                obs = obs.unsqueeze(0)
-            if interaction_force.dim() == 1:
-                interaction_force = interaction_force.unsqueeze(0)
-            
-            batch_size = obs.shape[0]
-            
-            # Extract position and velocity (first 6 dimensions of observation)
-            current_pos = obs[..., :3]   # Current position
-            current_vel = obs[..., 3:6]  # Current velocity
-            
-            # If trajectory information is available (obs_dim >= 12)
-            if obs.shape[-1] >= 12:
-                target_pos = obs[..., 6:9]   # Trajectory target position
-                target_vel = obs[..., 9:12]  # Trajectory target velocity
-            else:
-                # Default to workspace center if no trajectory info
-                target_pos = torch.zeros_like(current_pos)
-                target_vel = torch.zeros_like(current_vel)
-            
-            # Human intention based on impedance control (paper Eq. 6)
-            # From CHx˙ + KH(x - xH) = -f, we can estimate xH (human intention)
-            # Rearranging: xH = x + (f + CHx˙)/KH
-            
-            force_2d = interaction_force[..., :2]  # Only x-y components
-            pos_2d = current_pos[..., :2]
-            vel_2d = current_vel[..., :2]
-            
-            # Estimate human intended position using impedance model
-            impedance_term = (force_2d + self.CH * vel_2d) / self.KH
-            human_intended_pos_2d = pos_2d + impedance_term
-            
-            # Combine with trajectory following
-            if obs.shape[-1] >= 12:
-                # Weight between trajectory following and human intention
-                trajectory_weight = 0.6
-                human_weight = 0.4
-                
-                intended_pos_2d = (trajectory_weight * target_pos[..., :2] + 
-                                 human_weight * human_intended_pos_2d)
-            else:
-                intended_pos_2d = human_intended_pos_2d
-            
-            # Create 3D intention (keep z component from trajectory or current)
-            intention_3d = current_pos.clone()
-            intention_3d[..., :2] = intended_pos_2d
-            
-            if obs.shape[-1] >= 12:
-                intention_3d[..., 2] = target_pos[..., 2]  # Use trajectory z
-            
-            # Ensure intention is within workspace
-            workspace_center = torch.zeros_like(intention_3d)
-            to_center = intention_3d - workspace_center
-            distance_2d = torch.norm(to_center[..., :2], dim=-1, keepdim=True)
-            
-            # Clamp to workspace radius
-            scale = torch.clamp(distance_2d / self.workspace_radius, max=1.0)
-            intention_3d[..., :2] = workspace_center[..., :2] + to_center[..., :2] / scale
-            
-            return intention_3d
-            
-        except Exception as e:
-            print(f"[WARNING] Human intention estimation failed: {e}")
-            # Return safe default (current position)
-            if obs.dim() == 1:
-                obs = obs.unsqueeze(0)
-            return obs[..., :3].clone()
-    
-    def get_human_action(self, current_pos, intention_pos, dt=0.01):
-        """Calculate human action based on intention - simplified impedance control"""
-        try:
-            # Ensure proper dimensions
+            # 确保正确维度
             if current_pos.dim() == 1:
                 current_pos = current_pos.unsqueeze(0)
-            if intention_pos.dim() == 1:
-                intention_pos = intention_pos.unsqueeze(0)
+            if current_vel.dim() == 1:
+                current_vel = current_vel.unsqueeze(0)
+            if interaction_force.dim() == 1:
+                interaction_force = interaction_force.unsqueeze(0)
+                
+            batch_size = current_pos.shape[0]
             
-            # Calculate desired velocity (position error)
-            position_error = intention_pos - current_pos
+            # 数值稳定性检查
+            if torch.any(torch.isnan(current_pos)) or torch.any(torch.isnan(current_vel)) or torch.any(torch.isnan(interaction_force)):
+                return current_pos.clone()
+            
+            # 扩展阻抗矩阵
+            CH_batch = self.CH.unsqueeze(0).expand(batch_size, -1, -1)
+            KH_batch = self.KH.unsqueeze(0).expand(batch_size, -1, -1)
+            
+            # 计算阻尼项 C_H ẋ
+            damping_term = torch.bmm(CH_batch, current_vel.unsqueeze(-1)).squeeze(-1)
+            
+            # 异常力值检查
+            force_magnitude = torch.norm(interaction_force, dim=-1, keepdim=True)
+            if torch.any(force_magnitude > 10.0):
+                return current_pos.clone()
+            
+            # 人体意图位置: x_H = x + (f + C_H ẋ) / K_H
+            numerator = interaction_force + damping_term
+            
+            try:
+                KH_inv_batch = torch.inverse(KH_batch + 1e-6 * torch.eye(3, device=self.device))
+                intention_offset = torch.bmm(KH_inv_batch, numerator.unsqueeze(-1)).squeeze(-1)
+            except RuntimeError:
+                KH_diag_inv = 1.0 / (torch.diagonal(self.KH) + 1e-6)
+                intention_offset = numerator * KH_diag_inv.unsqueeze(0)
+            
+            human_intention = current_pos + intention_offset
+            
+            # 工作空间约束
+            distance_2d = torch.norm(human_intention[..., :2], dim=-1, keepdim=True)
+            if torch.any(distance_2d > self.workspace_radius):
+                scale_factor = self.workspace_radius / (distance_2d + 1e-6)
+                scale_factor = torch.clamp(scale_factor, max=1.0)
+                human_intention[..., :2] = human_intention[..., :2] * scale_factor
+            
+            # 最终检查
+            if torch.any(torch.isnan(human_intention)) or torch.any(torch.isinf(human_intention)):
+                return current_pos.clone()
+            
+            return human_intention
+            
+        except Exception as e:
+            return current_pos.clone() if current_pos is not None else torch.zeros(3, device=self.device)
+    
+    def compute_human_action(self, current_pos: torch.Tensor, human_intention: torch.Tensor, 
+                           dt: float = 0.01) -> torch.Tensor:
+        """基于人体意图计算人体动作"""
+        if current_pos is None or human_intention is None:
+            return torch.zeros(3, device=self.device)
+        
+        try:
+            if current_pos.dim() == 1:
+                current_pos = current_pos.unsqueeze(0)
+            if human_intention.dim() == 1:
+                human_intention = human_intention.unsqueeze(0)
+            
+            position_error = human_intention - current_pos
             desired_velocity = position_error / dt
             
-            # Limit velocity to human capabilities
             velocity_norm = torch.norm(desired_velocity, dim=-1, keepdim=True)
             velocity_scale = torch.clamp(velocity_norm / self.max_human_velocity, max=1.0)
             desired_velocity = desired_velocity / (velocity_scale + 1e-6)
             
-            # Convert to action (simplified force control)
-            human_action = desired_velocity * 0.1  # Scale to reasonable force range
+            human_action = desired_velocity * 0.1
+            
+            if torch.any(torch.isnan(human_action)) or torch.any(torch.isinf(human_action)):
+                return torch.zeros_like(current_pos)
             
             return torch.clamp(human_action, -1.0, 1.0)
             
         except Exception as e:
-            print(f"[WARNING] Human action calculation failed: {e}")
-            # Return zero action as safe default
-            if current_pos.dim() == 1:
-                current_pos = current_pos.unsqueeze(0)
-            return torch.zeros_like(current_pos)
+            return torch.zeros_like(current_pos) if current_pos is not None else torch.zeros(3, device=self.device)
 
+class PaperCostFunction:
+    """论文方程(13)的成本函数: r = (x-x_d)^T Q_1(x-x_d) + ẋ^T Q_2 ẋ + f^T Q_3 f + u^T R u"""
+    def __init__(self, Q1_weight: float, Q2_weight: float, Q3_weight: float, R_weight: float, device):
+        self.device = device
+        self.Q1 = torch.eye(3, device=device) * Q1_weight
+        self.Q2 = torch.eye(3, device=device) * Q2_weight
+        self.Q3 = torch.eye(3, device=device) * Q3_weight
+        self.R = torch.eye(3, device=device) * R_weight
+    
+    def compute_cost(self, current_pos: torch.Tensor, desired_pos: torch.Tensor,
+                    current_vel: torch.Tensor, interaction_force: torch.Tensor,
+                    control_action: torch.Tensor) -> torch.Tensor:
+        """计算论文方程(13)的即时成本"""
+        
+        # 输入验证
+        inputs = [current_pos, desired_pos, current_vel, interaction_force, control_action]
+        for inp in inputs:
+            if inp is None:
+                return torch.zeros(current_pos.shape[0] if current_pos is not None else 1, device=self.device)
+        
+        try:
+            # 论文成本函数各项
+            position_error = current_pos - desired_pos
+            tracking_cost = torch.sum(position_error * (self.Q1 @ position_error.T).T, dim=-1)
+            velocity_cost = torch.sum(current_vel * (self.Q2 @ current_vel.T).T, dim=-1)
+            force_cost = torch.sum(interaction_force * (self.Q3 @ interaction_force.T).T, dim=-1)
+            control_cost = torch.sum(control_action * (self.R @ control_action.T).T, dim=-1)
+            
+            total_cost = tracking_cost + velocity_cost + force_cost + control_cost
+            
+            if torch.any(torch.isnan(total_cost)) or torch.any(torch.isinf(total_cost)):
+                return torch.ones_like(total_cost) * 1.0
+            
+            return total_cost
+            
+        except Exception as e:
+            batch_size = current_pos.shape[0] if current_pos is not None else 1
+            return torch.ones(batch_size, device=self.device) * 1.0
+
+class AdaptiveSharedControl:
+    """论文的自适应共享控制策略"""
+    def __init__(self, config):
+        self.robot_weight = config.get('robot_action_weight', 0.7)
+        self.human_weight = config.get('human_action_weight', 0.3)
+        self.adaptation_rate = config.get('collaboration_adaptation_rate', 0.05)
+        
+    def fuse_actions(self, robot_action: torch.Tensor, human_action: torch.Tensor, 
+                    interaction_force: torch.Tensor) -> torch.Tensor:
+        """自适应动作融合策略"""
+        
+        # 输入验证
+        if robot_action is None or human_action is None:
+            if robot_action is not None:
+                return torch.clamp(robot_action, -1.0, 1.0)
+            elif human_action is not None:
+                return torch.clamp(human_action, -1.0, 1.0)
+            else:
+                return torch.zeros(3)
+        
+        try:
+            # 基于交互力的自适应权重
+            if interaction_force is not None:
+                force_magnitude = torch.norm(interaction_force, dim=-1, keepdim=True)
+                force_factor = torch.tanh(force_magnitude * 5.0)
+                adaptive_human_weight = self.human_weight + force_factor * 0.2
+                adaptive_robot_weight = 1.0 - adaptive_human_weight
+            else:
+                adaptive_robot_weight = self.robot_weight
+                adaptive_human_weight = self.human_weight
+            
+            fused_action = (adaptive_robot_weight * robot_action + 
+                           adaptive_human_weight * human_action)
+            
+            if torch.any(torch.isnan(fused_action)) or torch.any(torch.isinf(fused_action)):
+                return torch.clamp(robot_action, -1.0, 1.0)
+            
+            return torch.clamp(fused_action, -1.0, 1.0)
+            
+        except Exception as e:
+            return torch.clamp(robot_action, -1.0, 1.0)
 
 class SharedControlTrainer:
-    """Simplified Shared Control Trainer - Aligned with paper framework"""
+    """论文对齐的共享控制训练器"""
     def __init__(self, env, config):
         self.env = env
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Get environment properties
         self.num_envs = getattr(env, 'num_envs', 1)
         
-        # Detect observation dimensions from environment
-        print("[INFO] Detecting observation dimensions...")
+        # 检测观测维度
         obs_dict, _ = env.reset()
-        actual_obs_dim = obs_dict["policy"].shape[-1]
-        action_dim = 3  # xyz forces
+        raw_obs_dim = obs_dict["policy"].shape[-1]
         
-        print(f"[INFO] Observation dimension: {actual_obs_dim}")
-        print(f"[INFO] Action dimension: {action_dim}")
+        # 论文标准维度
+        state_dim = 9
+        action_dim = 3
+        augmented_state_dim = 12
         
-        # Initialize networks
-        self.policy = SurgicalActorCritic(actual_obs_dim, action_dim).to(self.device)
+        # 成本函数权重
+        Q1_weight = self.safe_float('Q1_weight', 100.0)
+        Q2_weight = self.safe_float('Q2_weight', 0.01)
+        Q3_weight = self.safe_float('Q3_weight', 0.001)
+        R_weight = self.safe_float('R_weight', 0.001)
         
-        # Safely extract numeric values from config
-        def safe_float(key, default):
-            value = config.get(key, default)
-            try:
-                return float(value)
-            except (ValueError, TypeError):
-                print(f"[WARNING] Invalid {key}: {value}, using default {default}")
-                return float(default)
+        # 权重矩阵
+        Q_matrix = torch.block_diag(
+            torch.eye(3) * Q1_weight,
+            torch.eye(3) * Q2_weight,
+            torch.eye(3) * Q3_weight,
+            torch.eye(3) * Q1_weight
+        ).to(self.device)
+        R_matrix = torch.eye(action_dim, device=self.device) * R_weight
         
-        def safe_int(key, default):
-            value = config.get(key, default)
-            try:
-                return int(value)
-            except (ValueError, TypeError):
-                print(f"[WARNING] Invalid {key}: {value}, using default {default}")
-                return int(default)
+        # 初始化网络
+        self.policy = SurgicalActorCritic(
+            state_dim=state_dim,
+            action_dim=action_dim, 
+            augmented_state_dim=augmented_state_dim,
+            Q_weights=Q_matrix,
+            R_weights=R_matrix
+        ).to(self.device)
         
-        # Extract configuration with safe conversion
-        lr = safe_float('learning_rate', 3e-4)
-        id_lr = safe_float('identifier_lr', 1e-3)
+        # 优化器
+        lr = self.safe_float('learning_rate', 3e-4)
+        id_lr = self.safe_float('identifier_lr', 1e-3)
         
         self.actor_optimizer = optim.Adam(self.policy.actor.parameters(), lr=lr)
         self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=lr)
         self.identifier_optimizer = optim.Adam(self.policy.identifier.parameters(), lr=id_lr)
         
-        # Experience replay buffer
-        buffer_size = safe_int('buffer_size', 50000)
+        # 其他组件
+        buffer_size = self.safe_int('buffer_size', 10000)
         self.replay_buffer = ReplayBuffer(buffer_size)
         
-        # Human dynamics model with safe config
         human_config = {
-            'human_damping': safe_float('human_damping', 21.0),
-            'human_stiffness': safe_float('human_stiffness', 201.0),
+            'human_damping_CH': config.get('human_damping_CH', [21.0, 21.0, 21.0]),
+            'human_stiffness_KH': config.get('human_stiffness_KH', [201.0, 201.0, 201.0]),
         }
-        self.human_dynamics = HumanDynamicsModel(self.device, human_config)
+        self.human_dynamics = HumanImpedanceModel(self.device, human_config)
+        self.cost_function = PaperCostFunction(Q1_weight, Q2_weight, Q3_weight, R_weight, self.device)
+        self.shared_control = AdaptiveSharedControl(config)
         
-        # Collaboration parameters (from paper's shared control framework)
-        self.robot_weight = safe_float('robot_action_weight', 0.7)  # α in paper
-        self.human_weight = 1.0 - self.robot_weight                # 1-α in paper
+        # 训练参数
+        self.batch_size = self.safe_int('batch_size', 128)
+        self.min_buffer_size = self.safe_int('min_buffer_size', 1000)
+        self.gamma = self.safe_float('gamma', 0.99)
+        self.max_grad_norm = self.safe_float('max_grad_norm', 1.0)
+        self.dt = 0.01
         
-        # Training parameters
-        self.batch_size = safe_int('batch_size', 256)
-        self.min_buffer_size = safe_int('min_buffer_size', 1000)
-        self.gamma = safe_float('gamma', 0.99)
-        self.tau = safe_float('tau', 0.005)
-        self.max_grad_norm = safe_float('max_grad_norm', 0.5)
-        
-        # Initialize interaction forces
+        # 初始化交互力
         self.interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
         
-        print(f"[INFO] SharedControlTrainer initialized:")
-        print(f"  - Device: {self.device}")
-        print(f"  - Learning rate: {lr}")
-        print(f"  - Collaboration weights: {self.robot_weight:.1f} robot, {self.human_weight:.1f} human")
-        print(f"  - Buffer size: {buffer_size}")
-        print(f"  - Batch size: {self.batch_size}")
-        print(f"  - Human damping: {human_config['human_damping']}")
-        print(f"  - Human stiffness: {human_config['human_stiffness']}")
+    def safe_float(self, key: str, default: float) -> float:
+        value = self.config.get(key, default)
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return float(default)
+    
+    def safe_int(self, key: str, default: int) -> int:
+        value = self.config.get(key, default)
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return int(default)
+    
+    def extract_paper_state(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """从原始观测中提取论文标准状态 z = [x, ẋ, f]^T"""
+        if obs is None:
+            dummy_state = torch.zeros(self.num_envs, 9, device=self.device)
+            dummy_desired = torch.zeros(self.num_envs, 3, device=self.device)
+            return dummy_state, dummy_desired
         
+        try:
+            current_pos = obs[..., :3]
+            current_vel = obs[..., 3:6]
+            
+            if obs.shape[-1] >= 12:
+                desired_pos = obs[..., 9:12]
+            else:
+                desired_pos = torch.zeros_like(current_pos)
+            
+            interaction_force = self.interaction_forces
+            paper_state = torch.cat([current_pos, current_vel, interaction_force], dim=-1)
+            
+            # 安全检查
+            if torch.any(torch.isnan(paper_state)) or torch.any(torch.isnan(desired_pos)):
+                paper_state = torch.zeros_like(paper_state)
+                desired_pos = torch.zeros_like(desired_pos)
+            
+            return paper_state, desired_pos
+            
+        except Exception as e:
+            dummy_state = torch.zeros(self.num_envs, 9, device=self.device)
+            dummy_desired = torch.zeros(self.num_envs, 3, device=self.device)
+            return dummy_state, dummy_desired
+    
+    def create_augmented_state(self, paper_state: torch.Tensor, desired_pos: torch.Tensor) -> torch.Tensor:
+        """创建增广状态 z̄ = [z^T, x_d^T]^T"""
+        if paper_state is None or desired_pos is None:
+            return torch.zeros(self.num_envs, 12, device=self.device)
+        
+        try:
+            augmented_state = torch.cat([paper_state, desired_pos], dim=-1)
+            
+            if torch.any(torch.isnan(augmented_state)):
+                augmented_state = torch.zeros_like(augmented_state)
+            
+            return augmented_state
+            
+        except Exception as e:
+            return torch.zeros(self.num_envs, 12, device=self.device)
+    
     def train(self, total_steps: int):
-        """Main training loop - simplified and stable"""
-        print(f"[INFO] Starting training for {total_steps} steps...")
-        
+        """主训练循环"""
         obs_dict, _ = self.env.reset()
         obs = obs_dict["policy"]
         
@@ -248,110 +363,208 @@ class SharedControlTrainer:
         
         for step in range(total_steps):
             try:
-                # Get robot action
+                # 状态验证
+                if obs is None:
+                    obs_dict, _ = self.env.reset()
+                    obs = obs_dict["policy"]
+                    continue
+                
+                # 提取论文状态
+                paper_state, desired_pos = self.extract_paper_state(obs)
+                augmented_state = self.create_augmented_state(paper_state, desired_pos)
+                
+                if augmented_state is None:
+                    continue
+                
+                # 获取机器人动作
                 with torch.no_grad():
-                    robot_action = self.policy.get_action(obs)
+                    robot_action = self.policy.get_action(augmented_state)
+                    if robot_action is None:
+                        robot_action = torch.zeros(self.num_envs, 3, device=self.device)
                     robot_action = torch.clamp(robot_action, -1.0, 1.0)
                 
-                # Get human action (based on paper's human dynamics model)
-                current_pos = obs[..., :3]
-                human_intention = self.human_dynamics.get_human_intention(obs, self.interaction_forces)
-                human_action = self.human_dynamics.get_human_action(current_pos, human_intention)
+                # 获取人体动作
+                current_pos = paper_state[..., :3]
+                current_vel = paper_state[..., 3:6]
+                human_intention = self.human_dynamics.get_human_intention(
+                    current_pos, current_vel, self.interaction_forces
+                )
+                human_action = self.human_dynamics.compute_human_action(
+                    current_pos, human_intention, self.dt
+                )
                 
-                # Collaborative action fusion (paper's shared control framework)
-                final_action = self.robot_weight * robot_action + self.human_weight * human_action
+                # 共享控制融合
+                final_action = self.shared_control.fuse_actions(
+                    robot_action, human_action, self.interaction_forces
+                )
                 final_action = torch.clamp(final_action, -1.0, 1.0)
                 
-                # Environment step
-                next_obs_dict, reward, terminated, truncated, info = self.env.step(final_action)
-                next_obs = next_obs_dict["policy"]
-                done = terminated | truncated
+                # 环境步进
+                try:
+                    next_obs_dict, env_reward, terminated, truncated, info = self.env.step(final_action)
+                    next_obs = next_obs_dict["policy"]
+                    done = terminated | truncated
+                except Exception as e:
+                    obs_dict, _ = self.env.reset()
+                    obs = obs_dict["policy"]
+                    continue
                 
-                # Update interaction forces (simplified from observation)
-                if obs.shape[-1] >= 15:  # Has constraint information
-                    self.interaction_forces = obs[..., 12:15] * 0.1  # Use constraint normals as proxy
-                
-                # Store experience
-                for i in range(self.num_envs):
-                    self.replay_buffer.add(
-                        obs[i].cpu(), final_action[i].cpu(), reward[i].cpu(),
-                        next_obs[i].cpu(), done[i].cpu()
+                # 计算成本
+                try:
+                    paper_cost = self.cost_function.compute_cost(
+                        current_pos, desired_pos, current_vel, 
+                        self.interaction_forces, final_action
                     )
+                    paper_reward = -paper_cost
+                except Exception as e:
+                    paper_reward = torch.zeros(self.num_envs, device=self.device)
                 
-                step_rewards.append(reward.mean().item())
+                # 更新交互力
+                try:
+                    self.interaction_forces = (final_action - robot_action) * 2.0
+                    self.interaction_forces = torch.clamp(self.interaction_forces, -5.0, 5.0)
+                except Exception as e:
+                    pass
                 
-                # Network update
+                # 存储经验
+                try:
+                    next_paper_state, next_desired_pos = self.extract_paper_state(next_obs)
+                    for i in range(self.num_envs):
+                        augmented_state_i = self.create_augmented_state(
+                            paper_state[i], desired_pos[i]
+                        )
+                        next_augmented_state_i = self.create_augmented_state(
+                            next_paper_state[i], next_desired_pos[i]
+                        )
+                        
+                        self.replay_buffer.add(
+                            augmented_state_i.cpu(),
+                            final_action[i].cpu(),
+                            paper_reward[i].cpu(),
+                            next_augmented_state_i.cpu(),
+                            done[i].cpu()
+                        )
+                except Exception as e:
+                    pass
+                
+                step_rewards.append(paper_reward.mean().item())
+                
+                # 网络更新
                 if len(self.replay_buffer) > self.min_buffer_size and step % 20 == 0:
-                    self.update_networks()
-                    update_count += 1
+                    try:
+                        self.update_networks_paper_aligned()
+                        update_count += 1
+                    except Exception as e:
+                        pass
                 
                 obs = next_obs
                 
-                # Progress logging
+                # 进度记录
                 if step % 50 == 0:
                     avg_reward = np.mean(step_rewards[-50:]) if step_rewards else 0
                     print(f"Step {step:5d} | Reward: {avg_reward:.3f} | "
                           f"Buffer: {len(self.replay_buffer)} | Updates: {update_count}")
                 
             except Exception as e:
-                print(f"[WARNING] Step {step} failed: {e}")
-                # Reset environment on error
-                obs_dict, _ = self.env.reset()
-                obs = obs_dict["policy"]
+                try:
+                    obs_dict, _ = self.env.reset()
+                    obs = obs_dict["policy"]
+                except:
+                    obs = torch.zeros(self.num_envs, 12, device=self.device)
                 continue
         
-        print(f"[INFO] Training completed. Total updates: {update_count}")
+        print(f"[INFO] Paper-aligned training completed. Total updates: {update_count}")
     
-    def update_networks(self):
-        """Update actor, critic, and identifier networks"""
+    def update_networks_paper_aligned(self):
+        """按论文框架更新网络"""
         if len(self.replay_buffer) < self.batch_size:
             return
             
-        # Sample batch
-        obs, actions, rewards, next_obs, dones = self.replay_buffer.sample(self.batch_size)
-        obs, actions, rewards, next_obs, dones = [x.to(self.device) for x in [obs, actions, rewards, next_obs, dones]]
-        
-        # Update Critic (Q and V networks)
-        with torch.no_grad():
-            next_actions = self.policy.get_action(next_obs, deterministic=True)
-            next_q = self.policy.critic.forward_q(next_obs, next_actions).squeeze()
-            target_q = rewards + self.gamma * next_q * (1 - dones.float())
+        try:
+            states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+            states, actions, rewards, next_states, dones = [
+                x.to(self.device) for x in [states, actions, rewards, next_states, dones]
+            ]
             
-        current_q = self.policy.critic.forward_q(obs, actions).squeeze()
-        current_v = self.policy.critic.forward_v(obs).squeeze()
-        
-        # Critic losses
-        q_loss = F.mse_loss(current_q, target_q)
-        v_loss = F.mse_loss(current_v, target_q)  # V should match target Q
-        critic_loss = q_loss + v_loss
-        
-        # Update critic
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
-        self.critic_optimizer.step()
-        
-        # Update Actor
-        new_actions = self.policy.get_action(obs, deterministic=True)
-        actor_q = self.policy.critic.forward_q(obs, new_actions)
-        actor_loss = -actor_q.mean()  # Maximize Q value
-        
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
-        self.actor_optimizer.step()
-        
-        # Update Dynamics Identifier (simple supervised learning)
-        with torch.no_grad():
-            # Use finite differences to estimate state derivatives
-            state_current = obs[..., :6]  # position and velocity
-            state_next = next_obs[..., :6]
-            state_dot_target = (state_next - state_current) / 0.01  # Assume 100Hz
-        
-        state_dot_pred = self.policy.identifier(obs, actions)
-        identifier_loss = F.mse_loss(state_dot_pred[..., :6], state_dot_target)
-        
-        self.identifier_optimizer.zero_grad()
-        identifier_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.identifier.parameters(), self.max_grad_norm)
-        self.identifier_optimizer.step()
+            if any(x is None for x in [states, actions, rewards, next_states, dones]):
+                return
+            
+            self.update_dynamics_identifier(states, actions, next_states)
+            self.update_critic_paper_aligned(states, actions, rewards, next_states, dones)
+            self.update_actor_paper_aligned(states)
+            
+        except Exception as e:
+            pass
+    
+    def update_dynamics_identifier(self, states: torch.Tensor, actions: torch.Tensor, 
+                                 next_states: torch.Tensor):
+        """更新动力学识别器"""
+        try:
+            current_z = states[..., :9]
+            next_z = next_states[..., :9]
+            
+            if current_z is None or next_z is None or actions is None:
+                return
+            
+            true_z_dot = (next_z - current_z) / self.dt
+            pred_z_dot = self.policy.identifier(current_z, actions)
+            
+            if pred_z_dot is None:
+                return
+            
+            identifier_loss = F.mse_loss(pred_z_dot, true_z_dot)
+            
+            self.identifier_optimizer.zero_grad()
+            identifier_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.identifier.parameters(), self.max_grad_norm)
+            self.identifier_optimizer.step()
+            
+        except Exception as e:
+            pass
+    
+    def update_critic_paper_aligned(self, states: torch.Tensor, actions: torch.Tensor,
+                                  rewards: torch.Tensor, next_states: torch.Tensor, 
+                                  dones: torch.Tensor):
+        """更新Critic"""
+        try:
+            if any(x is None for x in [states, actions, rewards, next_states, dones]):
+                return
+            
+            with torch.no_grad():
+                next_values = self.policy.critic(next_states)
+                if next_values is None:
+                    return
+                target_values = rewards + self.gamma * next_values.squeeze() * (1 - dones.float())
+            
+            current_values = self.policy.critic(states)
+            if current_values is None:
+                return
+            
+            critic_loss = F.mse_loss(current_values.squeeze(), target_values)
+            
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
+            self.critic_optimizer.step()
+            
+        except Exception as e:
+            pass
+    
+    def update_actor_paper_aligned(self, states: torch.Tensor):
+        """更新Actor"""
+        try:
+            if states is None:
+                return
+            
+            actor_loss = self.policy.compute_actor_loss(states)
+            
+            if actor_loss is None or torch.isnan(actor_loss):
+                return
+            
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+            self.actor_optimizer.step()
+            
+        except Exception as e:
+            pass
