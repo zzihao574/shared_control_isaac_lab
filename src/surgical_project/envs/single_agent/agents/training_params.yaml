@@ -1,6 +1,5 @@
-# Training parameters for Surgical Human-Robot Shared Control
-# Compatible with the SharedControlTrainer algorithm
-# Note: Network operates in real-world scale (10x smaller than simulation)
+# Simplified Training parameters for Surgical Human-Robot Shared Control
+# Aligned with the paper's framework and equations
 
 params:
   seed: 42
@@ -8,8 +7,7 @@ params:
   # Environment wrapper settings
   env:
     clip_actions: 1.0      # Real world scale actions [-1, 1]
-    clip_observations: 1.0  # Real world scale observations (positions in meters)
-    simulation_scale: 10.0  # Simulation is 10x larger than real world
+    clip_observations: 1.0  # Real world scale observations
 
   # Algorithm configuration
   algo:
@@ -19,125 +17,112 @@ params:
   model:
     name: surgical_actor_critic
     
-  # Network architecture
+  # Network architecture (simplified)
   network:
     name: actor_critic
-    separate: False
+    separate: false
     
     # Actor network settings
     actor:
-      hidden_dims: [256, 256, 128]
+      hidden_dims: [256, 128]
       activation: relu
       output_activation: tanh
       
     # Critic network settings  
     critic:
-      hidden_dims: [256, 256, 128]
+      hidden_dims: [256, 128]
       activation: relu
       
     # Dynamics identifier network
     identifier:
-      hidden_dims: [256, 256]
+      hidden_dims: [128, 128]
       activation: relu
       
     # Network initialization
     initializer:
-      name: xavier_uniform
+      name: orthogonal
       gain: 1.0
       
-  # Checkpoint settings
-  load_checkpoint: False
-  load_path: ''
-  
   # Training configuration
   config:
     name: surgical_shared_control
     env_name: surgical_direct
-    device: 'cuda:0'
-    device_name: 'cuda:0'
-    multi_gpu: False
+    device: cuda:0
     
-    # Training hyperparameters
-    learning_rate: 3e-4
-    identifier_lr: 1e-3
-    batch_size: 512
-    buffer_size: 100000
+    # Core training hyperparameters (all numeric values)
+    learning_rate: 0.0003
+    identifier_lr: 0.001
+    batch_size: 256
+    buffer_size: 50000
     min_buffer_size: 1000
     
     # Training schedule
-    max_epochs: 2000
-    steps_per_epoch: 1000
-    update_frequency: 10
+    max_epochs: 1000
+    steps_per_epoch: 500
+    update_frequency: 20
     save_frequency: 100
     eval_frequency: 50
     
     # Gradient settings
     max_grad_norm: 0.5
-    clip_grad_norm: True
+    clip_grad_norm: true
     
-    # Loss function weights
-    actor_loss_weight: 1.0
-    critic_loss_weight: 0.5
-    identifier_loss_weight: 0.1
-    entropy_weight: 0.01
-    
-    # Reward shaping
-    reward_scale: 1.0
+    # RL parameters
     gamma: 0.99  # Discount factor
     tau: 0.005   # Soft update coefficient
     
-    # Human-robot collaboration parameters
-    collaboration_weight: 2.0
-    human_trust_factor: 0.8
-    adaptation_rate: 0.1
+    # Human-robot collaboration parameters (from paper)
+    robot_action_weight: 0.7    # α in paper's shared control framework
+    human_action_weight: 0.3    # 1-α in paper
+    collaboration_adaptation_rate: 0.05
     
-    # Constraint-specific parameters
-    collision_tolerance: 0.001  # 1mm tolerance
-    force_limit: 5.0           # 5N maximum force
-    velocity_limit: 0.1        # 0.1 m/s maximum velocity
-    
-    # Shared control weights
-    q1_weight: 10.0    # Position tracking weight
-    q2_weight: 5.0     # Velocity penalty weight  
-    q3_weight: 15.0    # Constraint violation weight
-    r_weight: 0.1      # Action penalty weight
-    
-    # Human dynamics model parameters
-    human_stiffness: 201.0
-    human_damping: 21.0
+    # Human dynamics model parameters (paper Equation 6)
+    human_stiffness: 201.0      # KH in CHx˙ + KH(x - xH) = -f
+    human_damping: 21.0         # CH in CHx˙ + KH(x - xH) = -f
     interaction_threshold: 0.1
     
-    # Curriculum learning
-    curriculum_enabled: True
-    initial_force_limit: 2.0
-    final_force_limit: 5.0
-    curriculum_episodes: 500
+    # Cost function weights (paper Equation 13)
+    q1_weight: 100.0    # Position tracking weight in r = (x-xd)ᵀQ₁(x-xd) + ...
+    q2_weight: 50.0     # Velocity penalty weight for x˙ᵀQ₂x˙
+    q3_weight: 200.0    # Force regulation weight for fᵀQ₃f
+    r_weight: 0.1       # Control input weight for uᵀRu
+    
+    # Reward shaping for environment
+    reward_scale: 1.0
+    collision_penalty_scale: -10.0
+    task_completion_scale: 20.0
+    smoothness_penalty_scale: -0.05
+    human_collaboration_scale: 2.0
+    
+    # Safety and robustness
+    action_noise_std: 0.01
+    observation_noise_std: 0.001
+    domain_randomization: true
+    
+    # Workspace and trajectory parameters
+    human_workspace_radius: 0.2     # 20cm workspace radius
+    human_max_velocity: 0.3         # 30cm/s max human velocity
+    trajectory_tracking_scale: 5.0
+    workspace_compliance_scale: 2.0
+    
+    # Physics constraints (real-world scale)
+    force_limit: 3.0                # 3N maximum force
+    velocity_limit: 0.1             # 0.1 m/s maximum velocity
+    collision_tolerance: 0.0001     # 0.1mm collision tolerance
     
     # Logging and monitoring
     log_level: INFO
-    tensorboard_logging: True
-    wandb_logging: False
-    save_best_after: 100
+    tensorboard_logging: true
+    wandb_logging: false
+    save_best_after: 50
     
     # Environment-specific settings
     num_actors: -1  # Will be set automatically based on num_envs
-    normalize_input: True
-    normalize_value: True
-    normalize_advantage: True
+    normalize_input: true
+    normalize_value: true
+    normalize_advantage: true
     
     # Exploration settings
-    exploration_noise: 0.1
+    exploration_noise: 0.01
     exploration_decay: 0.995
-    min_exploration: 0.01
-    
-    # Safety and robustness
-    action_noise_std: 0.05
-    observation_noise_std: 0.01
-    domain_randomization: True
-    
-    # Task-specific rewards
-    distance_reward_scale: 1.0
-    collision_penalty_scale: -10.0
-    task_completion_scale: 50.0
-    smoothness_penalty_scale: -0.1
-    human_collaboration_scale: 2.0
+    min_exploration: 0.001

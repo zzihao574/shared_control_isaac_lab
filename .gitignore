@@ -1,0 +1,5 @@
+# .gitignore
+*
+!/assets/
+!/scripts/
+!/src/surgical_project/
