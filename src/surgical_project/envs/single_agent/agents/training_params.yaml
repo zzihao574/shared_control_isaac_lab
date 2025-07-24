@@ -6,16 +6,16 @@ params:
 
   # 环境包装设置
   env:
-    clip_actions: 1.0      # 真实世界尺度动作 [-1, 1]
-    clip_observations: 1.0  # 真实世界尺度观测
+    clip_actions: 1.0
+    clip_observations: 1.0
 
   # 算法配置
   algo:
-    name: paper_shared_control_surgical  # 论文对齐算法
+    name: paper_shared_control_surgical
 
   # 模型配置  
   model:
-    name: paper_surgical_actor_critic    # 论文对齐模型
+    name: paper_surgical_actor_critic
     
   # 网络架构（论文对齐）
   network:
@@ -49,11 +49,11 @@ params:
     env_name: surgical_direct
     device: cuda:0
     
-    # 核心训练超参数（所有数值）
-    learning_rate: 0.0001      # 降低学习率提高稳定性
-    identifier_lr: 0.0005      # 动力学识别器学习率
-    batch_size: 128            # 减小批量大小
-    buffer_size: 10000         # 减小缓冲区大小
+    # 核心训练超参数
+    learning_rate: 0.0001
+    identifier_lr: 0.0005
+    batch_size: 128
+    buffer_size: 10000
     min_buffer_size: 1000
     
     # 训练计划
@@ -64,14 +64,14 @@ params:
     eval_frequency: 50
     
     # 梯度设置
-    max_grad_norm: 1.0         # 增加梯度裁剪阈值
+    max_grad_norm: 1.0
     clip_grad_norm: true
     
     # 强化学习参数
-    gamma: 0.99  # 折扣因子
-    tau: 0.005   # 软更新系数
+    gamma: 0.99
+    tau: 0.005
     
-    # 论文方程(13)的成本函数权重 - 严格按论文设置
+    # 论文方程(13)的成本函数权重
     Q1_weight: 100.0    # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d)
     Q2_weight: 0.01     # 速度调节权重 ẋ^T Q_2 ẋ  
     Q3_weight: 0.001    # 力调节权重 f^T Q_3 f
@@ -83,26 +83,26 @@ params:
     interaction_threshold: 0.1
     
     # 论文共享控制参数
-    robot_action_weight: 0.7    # α in paper's shared control framework
-    human_action_weight: 0.3    # 1-α in paper
+    robot_action_weight: 0.7    # α in paper
+    human_action_weight: 0.3    # 1-α in paper  
     collaboration_adaptation_rate: 0.05
     
     # 工作空间和轨迹参数
-    human_workspace_radius: 0.2     # 20cm工作空间半径
-    human_max_velocity: 0.3         # 30cm/s最大人体速度
+    human_workspace_radius: 0.2
+    human_max_velocity: 0.3
     trajectory_tracking_scale: 5.0
     workspace_compliance_scale: 2.0
     
-    # 物理约束（真实世界尺度）
-    force_limit: 3.0                # 3N最大力
-    velocity_limit: 0.1             # 0.1 m/s最大速度
-    collision_tolerance: 0.0001     # 0.1mm碰撞容忍
+    # 物理约束
+    force_limit: 3.0
+    velocity_limit: 0.1
+    collision_tolerance: 0.0001
     
-    # 奖励塑形（基于论文成本函数）
-    collision_penalty_scale: -10.0     # 碰撞惩罚
-    task_completion_scale: 20.0        # 任务完成奖励
-    smoothness_penalty_scale: -0.05    # 平滑性惩罚
-    workspace_penalty_scale: -5.0      # 工作空间惩罚
+    # 奖励塑形
+    collision_penalty_scale: -10.0
+    task_completion_scale: 20.0
+    smoothness_penalty_scale: -0.05
+    workspace_penalty_scale: -5.0
     
     # 安全和鲁棒性
     action_noise_std: 0.01
@@ -116,7 +116,7 @@ params:
     save_best_after: 50
     
     # 环境特定设置
-    num_actors: -1  # 将根据num_envs自动设置
+    num_actors: -1
     normalize_input: true
     normalize_value: true
     normalize_advantage: true
@@ -126,43 +126,8 @@ params:
     exploration_decay: 0.995
     min_exploration: 0.001
     
-    # 论文状态空间设置
+    # 论文状态空间设置 - 考虑约束信息
     state_space_dim: 9          # z = [x, ẋ, f]^T ∈ R^9
-    augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12
-    observation_space_dim: 12   # 观测空间维度
+    augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12 (论文核心状态)
+    observation_space_dim: 19   # 扩展观测空间包含约束信息
     action_space_dim: 3         # u ∈ R^3
-    
-    # HJB方程求解参数（论文方程28）
-    hjb_learning_rate: 0.001
-    hjb_update_frequency: 10
-    hjb_error_threshold: 0.01
-    
-    # 动力学识别参数（论文方程34-36）
-    dynamics_learning_rate: 0.002
-    dynamics_update_frequency: 5
-    dynamics_prediction_horizon: 1
-    
-    # 论文Actor-Critic参数
-    value_function_learning_rate: 0.001  # Critic学习率
-    policy_learning_rate: 0.0005         # Actor学习率
-    
-    # 人体意图估计参数
-    intention_estimation_method: "impedance_model"  # 基于论文方程6
-    intention_smoothing_factor: 0.1
-    intention_prediction_horizon: 5
-    
-    # 共享控制融合参数
-    fusion_method: "adaptive_weighting"    # 自适应权重融合
-    force_based_adaptation: true           # 基于交互力的自适应
-    adaptation_time_constant: 0.1
-    
-    # 性能监控参数
-    track_paper_cost_components: true     # 跟踪论文成本函数各组件
-    track_hjb_residual: true              # 跟踪HJB方程残差
-    track_dynamics_error: true            # 跟踪动力学识别误差
-    track_human_intention_accuracy: true  # 跟踪人体意图估计精度
-    
-    # 实验设置
-    paper_experiment_mode: true           # 论文实验模式
-    theoretical_validation: true          # 理论验证
-    comparative_analysis: false           # 对比分析（与其他方法）

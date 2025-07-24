@@ -9,7 +9,6 @@ from .actor_critic import (
     SurgicalActor,
     SurgicalCritic,
     DynamicsIdentifierNetwork,
-    HJBSolver,
     SurgicalActorCritic,
 )
 
@@ -27,7 +26,6 @@ __all__ = [
     "SurgicalActor",
     "SurgicalCritic", 
     "DynamicsIdentifierNetwork",
-    "HJBSolver",
     "SurgicalActorCritic",
     # 共享控制组件
     "SharedControlTrainer",
