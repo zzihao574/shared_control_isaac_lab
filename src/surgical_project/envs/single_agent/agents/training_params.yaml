@@ -1,133 +1,133 @@
 # 论文对齐的手术机器人人机共享控制训练参数
-# 严格按照论文方程和理论框架设置
+# 严格按照论文方程和理论框架设置，集成CBF约束
 
-params:
-  seed: 42
+# 基础设置
+seed: 42
+device: 'cuda:0'
 
-  # 环境包装设置
-  env:
-    clip_actions: 1.0
-    clip_observations: 1.0
+# 训练核心参数
+max_iterations: 5000
+learning_rate: 0.0001
+identifier_lr: 0.0005
+batch_size: 128
+buffer_size: 10000
+min_buffer_size: 1000
 
-  # 算法配置
-  algo:
-    name: paper_shared_control_surgical
+# 训练调度
+update_frequency: 20
+save_frequency: 100
+eval_frequency: 50
+log_frequency: 50
 
-  # 模型配置  
-  model:
-    name: paper_surgical_actor_critic
+# 评估设置
+eval_episodes: 3
+max_eval_steps: 500
+
+# 梯度设置
+max_grad_norm: 1.0
+clip_grad_norm: true
+
+# 强化学习参数
+gamma: 0.99
+tau: 0.005
+dt: 0.01
+
+# 网络架构配置
+network:
+  # Actor网络设置（论文方程50）
+  actor:
+    hidden_dims: [256, 128]
+    activation: relu
+    output_activation: tanh
     
-  # 网络架构（论文对齐）
-  network:
-    name: paper_actor_critic
-    separate: false
+  # Critic网络设置（论文方程29）
+  critic:
+    hidden_dims: [256, 128]
+    activation: relu
     
-    # Actor网络设置（论文方程50）
-    actor:
-      hidden_dims: [256, 128]
-      activation: relu
-      output_activation: tanh
-      
-    # Critic网络设置（论文方程29）
-    critic:
-      hidden_dims: [256, 128]
-      activation: relu
-      
-    # 动力学识别网络（论文方程34）
-    identifier:
-      hidden_dims: [128, 128]
-      activation: relu
-      
-    # 网络初始化
-    initializer:
-      name: orthogonal
-      gain: 1.0
-      
-  # 训练配置
-  config:
-    name: paper_surgical_shared_control
-    env_name: surgical_direct
-    device: cuda:0
+  # 动力学识别网络（论文方程34）
+  identifier:
+    hidden_dims: [128, 128]
+    activation: relu
     
-    # 核心训练超参数
-    learning_rate: 0.0001
-    identifier_lr: 0.0005
-    batch_size: 128
-    buffer_size: 10000
-    min_buffer_size: 1000
+  # 网络初始化
+  initializer:
+    name: orthogonal
+    gain: 1.0
+    identifier_gain: 0.1  # 动力学网络专用增益
     
-    # 训练计划
-    max_epochs: 1000
-    steps_per_epoch: 500
-    update_frequency: 20
-    save_frequency: 100
-    eval_frequency: 50
-    
-    # 梯度设置
-    max_grad_norm: 1.0
-    clip_grad_norm: true
-    
-    # 强化学习参数
-    gamma: 0.99
-    tau: 0.005
-    
-    # 论文方程(13)的成本函数权重
-    Q1_weight: 100.0    # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d)
-    Q2_weight: 0.01     # 速度调节权重 ẋ^T Q_2 ẋ  
-    Q3_weight: 0.001    # 力调节权重 f^T Q_3 f
-    R_weight: 0.001     # 控制输入权重 u^T R u
-    
-    # 论文方程(6)的人体动力学参数
-    human_damping_CH: [21.0, 21.0, 21.0]        # C_H 阻尼矩阵对角元素
-    human_stiffness_KH: [201.0, 201.0, 201.0]   # K_H 刚度矩阵对角元素
-    interaction_threshold: 0.1
-    
-    # 论文共享控制参数
-    robot_action_weight: 0.7    # α in paper
-    human_action_weight: 0.3    # 1-α in paper  
-    collaboration_adaptation_rate: 0.05
-    
-    # 工作空间和轨迹参数
-    human_workspace_radius: 0.2
-    human_max_velocity: 0.3
-    trajectory_tracking_scale: 5.0
-    workspace_compliance_scale: 2.0
-    
-    # 物理约束
-    force_limit: 3.0
-    velocity_limit: 0.1
-    collision_tolerance: 0.0001
-    
-    # 奖励塑形
-    collision_penalty_scale: -10.0
-    task_completion_scale: 20.0
-    smoothness_penalty_scale: -0.05
-    workspace_penalty_scale: -5.0
-    
-    # 安全和鲁棒性
-    action_noise_std: 0.01
-    observation_noise_std: 0.001
-    domain_randomization: true
-    
-    # 记录和监控
-    log_level: INFO
-    tensorboard_logging: true
-    wandb_logging: false
-    save_best_after: 50
-    
-    # 环境特定设置
-    num_actors: -1
-    normalize_input: true
-    normalize_value: true
-    normalize_advantage: true
-    
-    # 探索设置
-    exploration_noise: 0.01
-    exploration_decay: 0.995
-    min_exploration: 0.001
-    
-    # 论文状态空间设置 - 考虑约束信息
-    state_space_dim: 9          # z = [x, ẋ, f]^T ∈ R^9
-    augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12 (论文核心状态)
-    observation_space_dim: 19   # 扩展观测空间包含约束信息
-    action_space_dim: 3         # u ∈ R^3
+  # 探索噪声
+  action_noise_std: 0.01
+
+# 论文方程(13)的成本函数权重
+Q1_weight: 100.0    # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d)
+Q2_weight: 0.01     # 速度调节权重 ẋ^T Q_2 ẋ  
+Q3_weight: 0.001    # 力调节权重 f^T Q_3 f
+R_weight: 0.001     # 控制输入权重 u^T R u
+
+# 论文方程(6)的人体动力学参数
+human_damping_CH: [21.0, 21.0, 21.0]        # C_H 阻尼矩阵对角元素
+human_stiffness_KH: [201.0, 201.0, 201.0]   # K_H 刚度矩阵对角元素
+interaction_threshold: 0.1
+
+# 论文共享控制参数
+robot_action_weight: 0.7    # α in paper
+human_action_weight: 0.3    # 1-α in paper  
+collaboration_adaptation_rate: 0.05
+
+# CBF约束参数
+cbf_gamma: 1.0          # CBF中的γ参数，控制约束强度
+cbf_weight: 10.0        # CBF在成本函数中的权重  
+safety_margin: 0.002    # 安全边界距离
+
+# 交互力参数
+interaction_force_scale: 2.0
+max_interaction_force: 5.0
+
+# 探索设置
+exploration_noise: 0.01
+exploration_decay: 0.995
+min_exploration: 0.001
+
+# 论文状态空间设置
+state_space_dim: 9          # z = [x, ẋ, f]^T ∈ R^9 (论文核心状态)
+augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12 (增广状态)
+observation_space_dim: 12   # 简化观测空间
+action_space_dim: 3         # u ∈ R^3 (笛卡尔空间力控制)
+
+# 人类平衡点设置（论文要求）
+equilibrium_points:
+  - [0.0, 0.15, 0.03]    # 第一个平衡点 xH1
+  - [0.2, 0.15, 0.03]    # 第二个平衡点 xH2
+
+# 轨迹和工作空间参数
+human_workspace_radius: 0.2
+human_max_velocity: 0.3
+trajectory_tracking_scale: 5.0
+workspace_compliance_scale: 2.0
+target_reach_threshold: 0.01  # 目标点到达阈值（基于距离）
+
+# 物理约束
+force_limit: 3.0
+velocity_limit: 0.1
+collision_tolerance: 0.001
+
+# 奖励塑形
+collision_penalty_scale: -50.0  # 提高约束违反惩罚
+task_completion_scale: 20.0
+smoothness_penalty_scale: -0.05
+workspace_penalty_scale: -5.0
+
+# 安全和鲁棒性
+domain_randomization: true
+
+# 记录和监控
+log_level: INFO
+tensorboard_logging: true
+wandb_logging: false
+
+# CBF安全集合定义（文档用）
+safety_set:
+  description: "安全集合 C = {x ∈ R^n | s(x) ≥ 0}"
+  boundary_description: "约束边界 ∂C = {x ∈ R^n | s(x) = 0}"
+  interior_description: "安全内部 Int(C) = {x ∈ R^n | s(x) > 0}"

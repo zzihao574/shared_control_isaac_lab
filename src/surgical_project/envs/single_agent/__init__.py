@@ -4,32 +4,31 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Surgical Human-Robot Shared Control Environment.
+Surgical Human-Robot Shared Control Environment
+论文对齐的手术机器人人机共享控制环境，集成CBF约束
 """
 
 import gymnasium as gym
+from . import agents  # 导入agents模块
 
 ##
 # Register Gym environments.
 ##
 
-try:
-    # Print debug info about registration
-    module_name = __name__
-    print(f"[DEBUG] Registering environment from module: {module_name}")
-    
-    gym.register(
-        id="Isaac-Surgical-Direct-v0",
-        entry_point="surgical_project.envs.single_agent.surgical_direct_env:SurgicalDirectEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": "surgical_project.envs.single_agent.surgical_direct_env_cfg:SurgicalDirectEnvCfg",
-        },
-    )
-    
-    print(f"[INFO] Successfully registered Isaac-Surgical-Direct-v0")
-    
-except Exception as e:
-    print(f"[ERROR] Failed to register environment: {e}")
-    import traceback
-    traceback.print_exc()
+gym.register(
+    id="Isaac-Surgical-Direct-v0",
+    entry_point="surgical_project.envs.single_agent.surgical_direct_env:SurgicalDirectEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "surgical_project.envs.single_agent.surgical_direct_env_cfg:SurgicalDirectEnvCfg",
+    },
+)
+
+print(f"[INFO] Successfully registered Isaac-Surgical-Direct-v0")
+print(f"[INFO] Environment features:")
+print(f"  - Paper-aligned human-robot shared control")
+print(f"  - CBF (Control Barrier Function) constraints")  
+print(f"  - Distance-based trajectory switching")
+print(f"  - Human impedance model (Equation 6)")
+print(f"  - Extended cost function (Equation 13 + CBF)")
+print(f"  - Simple YAML configuration support")
