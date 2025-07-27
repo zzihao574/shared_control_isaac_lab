@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""论文对齐的手术直接环境配置 - 包含Omni haptic device"""
+"""Paper-aligned surgical direct environment configuration - including Omni haptic device"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from isaaclab.assets import AssetBaseCfg
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
-    """简化的场景配置，只包含基础元素"""
+    """Simplified scene configuration containing only basic elements"""
     
     # ground plane
     ground = AssetBaseCfg(
@@ -35,16 +35,16 @@ class MySceneCfg(InteractiveSceneCfg):
 
 @configclass
 class SurgicalDirectEnvCfg(DirectRLEnvCfg):
-    """论文对齐的手术直接环境配置 - 使用Omni haptic device"""
+    """Paper-aligned surgical direct environment configuration - using Omni haptic device"""
     
-    # 环境设置
+    # Environment settings
     episode_length_s = 8.0  
     decimation = 2  
     action_space = 3  # xyz forces in Cartesian space for robot
-    observation_space = 12  # 简化观测空间：位置(3) + 速度(3) + 目标位置(3) + 填充(3)
-    state_space = 9  # 论文标准状态: z = [x, ẋ, f]^T ∈ R^9
+    observation_space = 12  # Simplified observation space: position(3) + velocity(3) + target position(3) + padding(3)
+    state_space = 9  # Paper standard state: z = [x, ẋ, f]^T ∈ R^9
     
-    # 仿真设置
+    # Simulation settings
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,  # 120 Hz simulation
         render_interval=decimation,
@@ -57,7 +57,7 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
         ),
     )
     
-    # 场景设置
+    # Scene settings
     scene: InteractiveSceneCfg = MySceneCfg(num_envs=1, env_spacing=4.0, replicate_physics=True)
     
     # Omni haptic device
@@ -154,7 +154,7 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
         },
     )
 
-    # 约束配置
+    # Constraint configuration
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
@@ -171,40 +171,19 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
         ),
     )
     
-    # 力和控制参数
+    # Force and control parameters
     max_robot_force = 3.3
     max_human_force = 3.3
     force_scale = 1.0  
     
-    # 末端执行器参数
+    # End effector parameters
     end_effector_body_name = "stylus"
     end_effector_body_id = 6
     
-    # 论文方程(13)的成本函数权重
-    Q1_weight = 100.0   # 位置跟踪权重
-    Q2_weight = 0.01    # 速度调节权重
-    Q3_weight = 0.001   # 力调节权重
-    R_weight = 0.001    # 控制输入权重
+    # Trajectory parameters - distance-based target switching
+    target_reach_threshold = 0.01  # Target point reach threshold
     
-    # 论文方程(6)的人体阻抗参数
-    human_damping_CH = [21.0, 21.0, 21.0]
-    human_stiffness_KH = [201.0, 201.0, 201.0]
-    interaction_force_threshold = 0.1
-    
-    # 论文共享控制参数
-    robot_action_weight = 0.7
-    human_action_weight = 0.3
-    collaboration_adaptation_rate = 0.05
-    
-    # 轨迹参数 - 基于目标点的切换
-    target_reach_threshold = 0.01  # 目标点到达阈值
-    
-    # CBF约束参数
-    cbf_gamma = 1.0          # CBF中的γ参数，控制约束强度
-    cbf_weight = 10.0        # CBF在成本函数中的权重
-    safety_margin = 0.002    # 安全边界距离
-    
-    # 物理仿真参数
+    # Physics simulation parameters
     physics_dt = 1/120
     render_dt = 1/60
     solver_iterations = 4

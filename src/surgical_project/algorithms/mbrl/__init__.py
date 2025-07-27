@@ -2,9 +2,9 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""基于模型的强化学习算法 - 论文对齐版本，集成CBF约束"""
+"""Model-based reinforcement learning algorithms - paper-aligned version, integrating CBF constraints"""
 
-# 从 actor_critic.py 导入
+# Import from actor_critic.py
 from .actor_critic import (
     SurgicalActor,
     SurgicalCritic,
@@ -12,17 +12,17 @@ from .actor_critic import (
     SurgicalActorCritic,
 )
 
-# 从 shared_control.py 导入
+# Import from shared_control.py
 from .shared_control import (
     SharedControlTrainer,
 )
 
 __all__ = [
-    # Actor-Critic 网络组件
+    # Actor-Critic network components
     "SurgicalActor",
     "SurgicalCritic", 
     "DynamicsIdentifierNetwork",
     "SurgicalActorCritic",
-    # 主要训练器
+    # Main trainer
     "SharedControlTrainer",
 ]

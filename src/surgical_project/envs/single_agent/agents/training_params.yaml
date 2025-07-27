@@ -1,133 +1,160 @@
-# 论文对齐的手术机器人人机共享控制训练参数
-# 严格按照论文方程和理论框架设置，集成CBF约束
+# Paper-aligned surgical robot human-robot shared control training parameters
+# Strictly configured according to paper equations and theoretical framework, integrating CBF constraints
 
-# 基础设置
+# Basic settings
 seed: 42
 device: 'cuda:0'
 
-# 训练核心参数
-max_iterations: 5000
+# Core training parameters
+max_episodes: 1000  # Changed from iterations to episodes for off-policy training
 learning_rate: 0.0001
 identifier_lr: 0.0005
 batch_size: 128
 buffer_size: 10000
 min_buffer_size: 1000
 
-# 训练调度
-update_frequency: 20
+# Training schedule
+update_frequency: 1  # Update after each episode in off-policy training
 save_frequency: 100
 eval_frequency: 50
-log_frequency: 50
+log_frequency: 10
 
-# 评估设置
+# Evaluation settings
 eval_episodes: 3
 max_eval_steps: 500
 
-# 梯度设置
+# Gradient settings
 max_grad_norm: 1.0
 clip_grad_norm: true
 
-# 强化学习参数
+# Reinforcement learning parameters
 gamma: 0.99
 tau: 0.005
 dt: 0.01
 
-# 网络架构配置
-network:
-  # Actor网络设置（论文方程50）
-  actor:
-    hidden_dims: [256, 128]
-    activation: relu
-    output_activation: tanh
-    
-  # Critic网络设置（论文方程29）
+# RBF Network configuration (Paper-aligned single layer RBF)
+rbf_network:
+  # Critic network settings (Paper equation 29)
   critic:
-    hidden_dims: [256, 128]
-    activation: relu
+    nodes: 10  # lc
+    gaussian_width: 15.0  # ηc,i
     
-  # 动力学识别网络（论文方程34）
+  # Actor network settings (Paper equation 50)
+  actor:
+    nodes: 10  # la
+    gaussian_width: 10.0  # ηa,i
+    
+  # Dynamics identifier network (Paper equation 34)
   identifier:
-    hidden_dims: [128, 128]
-    activation: relu
+    nodes: 10  # lid
+    gaussian_width: 100.0  # ηid,i
     
-  # 网络初始化
-  initializer:
-    name: orthogonal
-    gain: 1.0
-    identifier_gain: 0.1  # 动力学网络专用增益
-    
-  # 探索噪声
-  action_noise_std: 0.01
+  # RBF initialization
+  mu_range: [-1.0, 1.0]  # μc,ij = μa,ij = μid,ij = -1 + 0.2i
+  mu_step: 0.2
 
-# 论文方程(13)的成本函数权重
-Q1_weight: 100.0    # 位置跟踪权重 (x-x_d)^T Q_1 (x-x_d)
-Q2_weight: 0.01     # 速度调节权重 ẋ^T Q_2 ẋ  
-Q3_weight: 0.001    # 力调节权重 f^T Q_3 f
-R_weight: 0.001     # 控制输入权重 u^T R u
+# Network input dimensions
+critic_input_dim: 12     # z̄ = [zᵀ, xᵀd]ᵀ ∈ R¹²
+actor_input_dim: 18      # Za = [q, q̇, ẋr, ẍr] = [6+6+3+3]
+identifier_input_dim: 9  # z ∈ R⁹ for state, + 3 for action = 12
 
-# 论文方程(6)的人体动力学参数
-human_damping_CH: [21.0, 21.0, 21.0]        # C_H 阻尼矩阵对角元素
-human_stiffness_KH: [201.0, 201.0, 201.0]   # K_H 刚度矩阵对角元素
+# Paper equation (13) cost function weights
+Q1_weight: 100.0    # Position tracking weight (x-xd)ᵀ Q₁ (x-xd)
+Q2_weight: 0.01     # Velocity regulation weight ẋᵀ Q₂ ẋ  
+Q3_weight: 0.001    # Force regulation weight fᵀ Q₃ f
+R_weight: 0.001     # Control input weight uᵀ R u
+
+# Paper equation (6) human dynamics parameters
+human_damping_CH: [21.0, 21.0, 21.0]        # CH damping matrix diagonal elements
+human_stiffness_KH: [201.0, 201.0, 201.0]   # KH stiffness matrix diagonal elements
+human_damping_variation: [20.0, 20.0, 20.0] # Variation range for position-dependent CH
+human_stiffness_variation: [200.0, 200.0, 200.0] # Variation range for position-dependent KH
 interaction_threshold: 0.1
 
-# 论文共享控制参数
-robot_action_weight: 0.7    # α in paper
-human_action_weight: 0.3    # 1-α in paper  
-collaboration_adaptation_rate: 0.05
+# Control parameters
+K1_gain: 1.0        # K1 matrix gain for reference trajectory
+K2_gain: 600.0      # K2 matrix gain for sliding surface
+kΓ_gain: 3.5        # kΓ for actor update law
 
-# CBF约束参数
-cbf_gamma: 1.0          # CBF中的γ参数，控制约束强度
-cbf_weight: 10.0        # CBF在成本函数中的权重  
-safety_margin: 0.002    # 安全边界距离
+# CBF constraint parameters
+cbf_gamma: 1.0          # γ parameter in CBF, controls constraint strength
+cbf_weight: 10.0        # CBF weight in cost function  
+safety_margin: 0.002    # Safety boundary distance
 
-# 交互力参数
+# Interaction force parameters
 interaction_force_scale: 2.0
 max_interaction_force: 5.0
 
-# 探索设置
+# Exploration settings
 exploration_noise: 0.01
 exploration_decay: 0.995
 min_exploration: 0.001
 
-# 论文状态空间设置
-state_space_dim: 9          # z = [x, ẋ, f]^T ∈ R^9 (论文核心状态)
-augmented_state_dim: 12     # z̄ = [z^T, x_d^T]^T ∈ R^12 (增广状态)
-observation_space_dim: 12   # 简化观测空间
-action_space_dim: 3         # u ∈ R^3 (笛卡尔空间力控制)
+# Paper state space settings
+state_space_dim: 9          # z = [x, ẋ, f]ᵀ ∈ R⁹ (paper core state)
+augmented_state_dim: 12     # z̄ = [zᵀ, xᵀd]ᵀ ∈ R¹² (augmented state)
+observation_space_dim: 12   # Simplified observation space
+action_space_dim: 3         # u ∈ R³ (Cartesian space force control)
 
-# 人类平衡点设置（论文要求）
+# Human equilibrium points (paper requirements)
 equilibrium_points:
-  - [0.0, 0.15, 0.03]    # 第一个平衡点 xH1
-  - [0.2, 0.15, 0.03]    # 第二个平衡点 xH2
+  - [-0.2, 0.15, 0.03]    # First equilibrium point xH1 (start)
+  - [0.2, 0.15, 0.03]     # Second equilibrium point xH2 (end)
 
-# 轨迹和工作空间参数
+# Trajectory and workspace parameters
 human_workspace_radius: 0.2
 human_max_velocity: 0.3
 trajectory_tracking_scale: 5.0
 workspace_compliance_scale: 2.0
-target_reach_threshold: 0.01  # 目标点到达阈值（基于距离）
+target_reach_threshold: 0.01  # Target point reach threshold (distance-based)
 
-# 物理约束
+# Initial stylus position
+initial_stylus_position: [-0.2, 0.15, 0.03]
+reset_stylus_position: [-0.2, 0.15, 0.03]
+
+# Physical constraints
 force_limit: 3.0
 velocity_limit: 0.1
 collision_tolerance: 0.001
 
-# 奖励塑形
-collision_penalty_scale: -50.0  # 提高约束违反惩罚
+# Update law learning rates (from paper)
+sigma_critic: 10.0      # σc for critic update
+sigma_actor: 10.0       # σa for actor update  
+sigma_identifier: 10.0  # σid for identifier update
+
+# Reward shaping
+collision_penalty_scale: -50.0  # Increased constraint violation penalty
 task_completion_scale: 20.0
 smoothness_penalty_scale: -0.05
 workspace_penalty_scale: -5.0
 
-# 安全和鲁棒性
+# Safety and robustness
 domain_randomization: true
 
-# 记录和监控
+# Logging and monitoring
 log_level: INFO
 tensorboard_logging: true
-wandb_logging: false
+wandb_logging: false  # Set to true to enable wandb logging
 
-# CBF安全集合定义（文档用）
+# Wandb configuration (when enabled)
+wandb_config:
+  project: "surgical-shared-control"
+  entity: null  # Set your wandb entity/username here
+  tags: ["surgical", "shared-control", "rbf", "cbf", "isaac-lab"]
+  notes: "Paper-aligned surgical human-robot shared control with RBF networks and CBF constraints"
+
+# Joint configuration for Phantom Omni (6 DOF)
+joint_names: ["waist", "shoulder", "elbow", "yaw", "pitch", "roll"]
+joint_limits:
+  waist: [-0.98, 0.98]
+  shoulder: [0.0, 1.75]
+  elbow: [-0.81, 1.25]
+  yaw: [3.92, 8.83]
+  pitch: [-0.5, 1.75]
+  roll: [-2.58, 2.58]
+
+# CBF safety set definition (for documentation)
 safety_set:
-  description: "安全集合 C = {x ∈ R^n | s(x) ≥ 0}"
-  boundary_description: "约束边界 ∂C = {x ∈ R^n | s(x) = 0}"
-  interior_description: "安全内部 Int(C) = {x ∈ R^n | s(x) > 0}"
+  description: "Safety set C = {x ∈ Rⁿ | s(x) ≥ 0}"
+  boundary_description: "Constraint boundary ∂C = {x ∈ Rⁿ | s(x) = 0}"
+  interior_description: "Safe interior Int(C) = {x ∈ Rⁿ | s(x) > 0}"

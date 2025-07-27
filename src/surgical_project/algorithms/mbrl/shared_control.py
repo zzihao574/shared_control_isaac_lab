@@ -1,50 +1,66 @@
-# 论文对齐的手术机器人人机共享控制算法 - 重构版本，支持完整YAML配置
+# Paper-aligned surgical robot human-robot shared control algorithm - fixed version with wandb integration
 import torch
 import yaml
 import os
+import wandb
 from typing import Dict, Any, Tuple
 from pathlib import Path
+from tqdm import tqdm
+import numpy as np
 
 from .actor_critic import SurgicalActorCritic
 from ..utils import (
     ReplayBuffer, PaperCostFunction, HumanImpedanceModel, 
-    AdaptiveSharedControl, OffPolicyTrainer, ControlBarrierFunction,
-    extract_paper_state, create_augmented_state
+    OffPolicyTrainer, ControlBarrierFunction,
+    extract_paper_state, create_augmented_state, extract_actor_input, compute_robot_control
 )
 
 
 class SharedControlTrainer:
-    """论文对齐的共享控制训练器 - 重构版本，支持完整配置"""
+    """Paper-aligned shared control trainer with wandb integration and fixed environment access"""
     def __init__(self, env, agent_cfg: Dict[str, Any], log_dir: str = None):
         self.env = env
         self.device = torch.device(agent_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.num_envs = getattr(env, 'num_envs', 1)
         self.log_dir = log_dir or "logs"
         
-        # 直接使用agent_cfg，不再加载额外配置文件
+        # Use agent_cfg directly without loading additional config files
         self.config = agent_cfg
         
-        # 从配置中获取网络架构参数
-        network_cfg = self.config.get('network', {})
+        # Initialize wandb if enabled
+        self.use_wandb = agent_cfg.get('wandb_logging', False)
+        if self.use_wandb:
+            wandb.init(
+                project="surgical-shared-control",
+                config=agent_cfg,
+                name=f"surgical_training_{agent_cfg.get('seed', 42)}",
+                tags=["surgical", "shared-control", "rbf", "cbf"]
+            )
+            print("[INFO] Wandb logging initialized")
         
-        # 论文标准维度
+        # Extract network architecture parameters from configuration
+        network_cfg = self.config.get('rbf_network', {})
+        
+        # Paper standard dimensions
         state_dim = self.config.get('state_space_dim', 9)
         action_dim = self.config.get('action_space_dim', 3)
         augmented_state_dim = self.config.get('augmented_state_dim', 12)
+        actor_input_dim = self.config.get('actor_input_dim', 18)  # [q, q̇, ẋr, ẍr]
         
-        # 初始化网络
+        # Initialize networks with RBF configuration
         self.policy = SurgicalActorCritic(
             state_dim=state_dim,
             action_dim=action_dim, 
             augmented_state_dim=augmented_state_dim,
-            network_cfg=network_cfg  # 传递网络配置
+            actor_input_dim=actor_input_dim,
+            network_cfg=self.config  # Pass complete config including RBF settings
         ).to(self.device)
         
-        # 初始化组件 - 从配置获取所有参数
+        # Initialize components - get all parameters from configuration
         buffer_size = self.config.get('buffer_size', 10000)
         self.replay_buffer = ReplayBuffer(buffer_size, self.device)
         
-        # 成本函数 - 使用配置参数
+        # Cost function - use configuration parameters
         self.cost_function = PaperCostFunction(
             Q1_weight=self.config.get('Q1_weight', 100.0),
             Q2_weight=self.config.get('Q2_weight', 0.01),
@@ -54,42 +70,42 @@ class SharedControlTrainer:
             device=self.device
         )
         
-        # 人体阻抗模型 - 使用配置参数
+        # Human impedance model - use configuration parameters
         self.human_dynamics = HumanImpedanceModel(
             device=self.device,
             damping_diag=self.config.get('human_damping_CH', [21.0, 21.0, 21.0]),
-            stiffness_diag=self.config.get('human_stiffness_KH', [201.0, 201.0, 201.0])
+            stiffness_diag=self.config.get('human_stiffness_KH', [201.0, 201.0, 201.0]),
+            damping_variation=self.config.get('human_damping_variation', [20.0, 20.0, 20.0]),
+            stiffness_variation=self.config.get('human_stiffness_variation', [200.0, 200.0, 200.0])
         )
         
-        # 共享控制 - 使用配置参数
-        self.shared_control = AdaptiveSharedControl(
-            robot_weight=self.config.get('robot_action_weight', 0.7),
-            human_weight=self.config.get('human_action_weight', 0.3)
-        )
-        
-        # Off-Policy训练器
+        # Off-Policy trainer with paper update laws
         self.trainer = OffPolicyTrainer(self.policy, self.config, self.device)
         
-        # CBF约束管理器 - 使用配置参数
+        # CBF constraint manager - use configuration parameters
         self.cbf = ControlBarrierFunction(
             gamma=self.config.get('cbf_gamma', 1.0),
             safety_margin=self.config.get('safety_margin', 0.002),
             device=self.device
         )
         
-        # 初始化交互力
+        # Initialize interaction force (will be computed from paper equations)
         self.interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
         
-        # 人类平衡点 - 从配置获取
+        # Human equilibrium points - from configuration
         equilibrium_points_cfg = self.config.get('equilibrium_points', [
-            [0.0, 0.15, 0.03],  # 默认第一个平衡点
-            [0.2, 0.15, 0.03]   # 默认第二个平衡点
+            [-0.2, 0.15, 0.03],  # Default first equilibrium point (start)
+            [0.2, 0.15, 0.03]    # Default second equilibrium point (end)
         ])
         self.equilibrium_points = torch.tensor(
             equilibrium_points_cfg, device=self.device, dtype=torch.float32
         )
         
-        # 训练参数
+        # Control parameters from configuration
+        self.K1_gain = self.config.get('K1_gain', 1.0)
+        self.K2_gain = self.config.get('K2_gain', 600.0)
+        
+        # Training parameters
         self.save_frequency = self.config.get('save_frequency', 100)
         self.eval_frequency = self.config.get('eval_frequency', 50)
         self.log_frequency = self.config.get('log_frequency', 50)
@@ -97,221 +113,229 @@ class SharedControlTrainer:
         print(f"[INFO] SharedControlTrainer initialized:")
         print(f"  - Device: {self.device}")
         print(f"  - Network parameters: {sum(p.numel() for p in self.policy.parameters()):,}")
+        print(f"  - RBF networks: Critic({network_cfg.get('critic', {}).get('nodes', 10)} nodes), "
+              f"Actor({network_cfg.get('actor', {}).get('nodes', 10)} nodes), "
+              f"Identifier({network_cfg.get('identifier', {}).get('nodes', 10)} nodes)")
         print(f"  - CBF gamma: {self.config.get('cbf_gamma', 1.0)}")
         print(f"  - Human equilibrium points: {self.equilibrium_points.cpu().numpy().tolist()}")
-        print(f"  - Save frequency: {self.save_frequency}")
-        print(f"  - Evaluation frequency: {self.eval_frequency}")
+        print(f"  - Control gains: K1={self.K1_gain}, K2={self.K2_gain}")
         
     def get_current_equilibrium_point(self, target_index: int) -> torch.Tensor:
-        """根据当前目标索引获取对应的人类平衡点"""
+        """Get corresponding human equilibrium point based on current target index"""
         if target_index >= len(self.equilibrium_points):
             target_index = len(self.equilibrium_points) - 1
         return self.equilibrium_points[target_index]
     
-    def train(self, total_steps: int):
-        """主训练循环 - 增强版本，支持更多配置功能"""
-        obs_dict, _ = self.env.reset()
-        obs = obs_dict["policy"]
-        
-        step_rewards = []
-        update_count = 0
+    def get_unwrapped_env(self):
+        """Get unwrapped environment to access joint data"""
+        # Handle various wrapper types
+        env = self.env
+        while hasattr(env, 'env') or hasattr(env, 'unwrapped'):
+            if hasattr(env, 'unwrapped'):
+                return env.unwrapped
+            elif hasattr(env, 'env'):
+                env = env.env
+            else:
+                break
+        return env
+    
+    def train_off_policy(self, total_episodes: int):
+        """
+        Train using off-policy RL method similar to the provided template
+        """
         min_buffer_size = self.config.get('min_buffer_size', 1000)
-        update_frequency = self.config.get('update_frequency', 20)
+        batch_size = self.config.get('batch_size', 128)
+        episodes_per_iter = max(1, total_episodes // 10)
         
-        print(f"[INFO] Starting training for {total_steps} steps")
-        print(f"[INFO] Minimum buffer size: {min_buffer_size}")
-        print(f"[INFO] Update frequency: {update_frequency}")
+        return_list = []
         
-        for step in range(total_steps):
-            try:
-                # 提取论文状态
-                paper_state, desired_pos = extract_paper_state(obs, self.interaction_forces)
-                augmented_state = create_augmented_state(paper_state, desired_pos)
-                
-                # 获取机器人动作 - 使用配置的探索噪声
-                with torch.no_grad():
-                    robot_action = self.policy.get_action(
-                        augmented_state, 
-                        deterministic=False,
-                        exploration_noise=self.config.get('exploration_noise', 0.01)
-                    )
-                    robot_action = torch.clamp(robot_action, -1.0, 1.0)
-                
-                # 获取当前目标索引
-                # ===== 安全获取 trajectory_manager ====
-                # 先尝试直接访问
-                if hasattr(self.env, 'trajectory_manager'):
-                    tm = self.env.trajectory_manager
-                # 如果被封装在 wrapper 里，则 unwrap 一层
-                elif hasattr(self.env, 'env') and hasattr(self.env.env, 'trajectory_manager'):
-                    tm = self.env.env.trajectory_manager
-                else:
-                    tm = None
-
-                if tm is not None:
-                    current_target_index = tm.current_target_index
-                else:
-                    current_target_index = 0
-                # ======================================
-                current_equilibrium = self.get_current_equilibrium_point(current_target_index)
-                
-                # 计算人类动作
-                current_pos = paper_state[..., :3]
-                human_action = self.human_dynamics.compute_human_action(
-                    current_pos, 
-                    current_equilibrium.unsqueeze(0).expand(self.num_envs, -1),
-                    dt=self.config.get('dt', 0.01)
-                )
-                
-                # 共享控制融合
-                final_action = self.shared_control.fuse_actions(
-                    robot_action, human_action, self.interaction_forces
-                )
-                final_action = torch.clamp(final_action, -1.0, 1.0)
-                
-                # 环境步进
-                next_obs_dict, env_reward, terminated, truncated, info = self.env.step(final_action)
-                next_obs = next_obs_dict["policy"]
-                done = terminated | truncated
-                
-                # 计算成本
-                current_pos = paper_state[..., :3]
-                current_vel = paper_state[..., 3:6]
-                
-                # 获取CBF值
-                cbf_values = None
-                if hasattr(self.env, 'safety_distances'):
-                    cbf_values = self.cbf.compute_cbf_value(self.env.safety_distances)
-                
-                paper_cost = self.cost_function.compute_cost(
-                    current_pos, desired_pos, current_vel, 
-                    self.interaction_forces, final_action, cbf_values
-                )
-                paper_reward = -paper_cost
-                
-                # 更新交互力
-                self.interaction_forces = (final_action - robot_action) * self.config.get('interaction_force_scale', 2.0)
-                self.interaction_forces = torch.clamp(
-                    self.interaction_forces, 
-                    -self.config.get('max_interaction_force', 5.0), 
-                    self.config.get('max_interaction_force', 5.0)
-                )
-                
-                # 存储经验
-                next_paper_state, next_desired_pos = extract_paper_state(next_obs, self.interaction_forces)
-                for i in range(self.num_envs):
-                    augmented_state_i = create_augmented_state(paper_state[i], desired_pos[i])
-                    next_augmented_state_i = create_augmented_state(
-                        next_paper_state[i], next_desired_pos[i]
-                    )
+        print(f"[INFO] Starting off-policy training for {total_episodes} episodes")
+        print(f"[INFO] Using paper control law: u = Ŵᵀₐ Sa(Za) - e - K2*ev")
+        
+        for iter_idx in range(10):
+            with tqdm(total=episodes_per_iter, desc=f'Iteration {iter_idx}') as pbar:
+                for episode_idx in range(episodes_per_iter):
+                    episode_return = 0
                     
-                    self.replay_buffer.add(
-                        augmented_state_i,
-                        final_action[i],
-                        paper_reward[i],
-                        next_augmented_state_i,
-                        done[i]
-                    )
-                
-                step_rewards.append(paper_reward.mean().item())
-                
-                # 网络更新
-                if len(self.replay_buffer) > min_buffer_size and step % update_frequency == 0:
-                    self.trainer.update_networks(self.replay_buffer)
-                    update_count += 1
-                
-                obs = next_obs
-                
-                # 进度记录
-                if step % self.log_frequency == 0:
-                    avg_reward = sum(step_rewards[-self.log_frequency:]) / min(self.log_frequency, len(step_rewards))
-                    print(f"Step {step:5d} | Reward: {avg_reward:.3f} | "
-                          f"Buffer: {len(self.replay_buffer)} | Updates: {update_count}")
+                    # Reset environment
+                    obs_dict, _ = self.env.reset()
+                    obs = obs_dict["policy"]
+                    done = False
+                    step_count = 0
+                    max_steps = self.config.get('max_eval_steps', 500)
                     
-                    # 详细日志
-                    if hasattr(self.env, 'extras') and 'log' in self.env.extras:
-                        log_info = self.env.extras['log']
-                        print(f"  Target: {current_target_index} | "
-                              f"Progress: {log_info.get('trajectory_progress', 0):.2f} | "
-                              f"Safety: {log_info.get('safety_distance', 0):.4f}")
-                
-                # 定期保存检查点
-                if step > 0 and step % self.save_frequency == 0:
-                    self._save_checkpoint(step)
-                
-                # 定期评估
-                if step > 0 and step % self.eval_frequency == 0:
-                    self._run_evaluation(step)
-                
-            except Exception as e:
-                print(f"[ERROR] Training step {step} failed: {e}")
-                obs_dict, _ = self.env.reset()
-                obs = obs_dict["policy"]
-                continue
+                    while not done and step_count < max_steps:
+                        # Get action using current policy
+                        action = self._take_action(obs)
+                        
+                        # Environment step
+                        next_obs_dict, reward, terminated, truncated, info = self.env.step(action)
+                        next_obs = next_obs_dict["policy"]
+                        done = (terminated | truncated).any()
+                        
+                        # Add to replay buffer
+                        self._add_to_buffer(obs, action, reward, next_obs, done)
+                        
+                        obs = next_obs
+                        episode_return += reward.mean().item()
+                        step_count += 1
+                        
+                        # Update networks if buffer has enough samples
+                        if len(self.replay_buffer) > min_buffer_size:
+                            self._update_networks()
+                    
+                    return_list.append(episode_return)
+                    
+                    # Log progress
+                    if (episode_idx + 1) % 10 == 0:
+                        avg_return = np.mean(return_list[-10:])
+                        pbar.set_postfix({
+                            'episode': f'{episodes_per_iter * iter_idx + episode_idx + 1}',
+                            'return': f'{avg_return:.3f}'
+                        })
+                        
+                        # Wandb logging
+                        if self.use_wandb:
+                            wandb.log({
+                                'episode': episodes_per_iter * iter_idx + episode_idx + 1,
+                                'episode_return': episode_return,
+                                'avg_return_10': avg_return,
+                                'buffer_size': len(self.replay_buffer)
+                            })
+                    
+                    pbar.update(1)
         
-        print(f"[INFO] Training completed. Total updates: {update_count}")
-        print(f"[INFO] Final average reward: {sum(step_rewards[-100:]) / min(100, len(step_rewards)):.3f}")
+        print(f"[INFO] Training completed. Final average return: {np.mean(return_list[-10:]):.3f}")
+        
+        if self.use_wandb:
+            wandb.finish()
+        
+        return return_list
     
-    def _save_checkpoint(self, step: int):
-        """保存检查点"""
-        if not self.log_dir:
-            return
-            
-        checkpoint_path = os.path.join(self.log_dir, "checkpoints", f"checkpoint_step_{step}.pth")
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        
+    def _take_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Take action using current policy following paper framework"""
         try:
-            checkpoint_data = {
-                'policy_state_dict': self.policy.state_dict(),
-                'actor_optimizer_state_dict': self.trainer.actor_optimizer.state_dict(),
-                'critic_optimizer_state_dict': self.trainer.critic_optimizer.state_dict(),
-                'identifier_optimizer_state_dict': self.trainer.identifier_optimizer.state_dict(),
-                'training_step': step,
-                'config': self.config,
-            }
+            # Extract paper state z = [x, ẋ, f]ᵀ for critic and identifier
+            paper_state, desired_pos = extract_paper_state(obs, self.interaction_forces)
             
-            torch.save(checkpoint_data, checkpoint_path)
-            print(f"[INFO] Checkpoint saved: {checkpoint_path}")
+            # Get joint states for actor input Za = [q, q̇, ẋr, ẍr]
+            unwrapped_env = self.get_unwrapped_env()
+            joint_pos = unwrapped_env.get_joint_positions()
+            joint_vel = unwrapped_env.get_joint_velocities()
+            
+            # Compute desired velocity and acceleration for reference trajectory
+            current_pos = paper_state[..., :3]
+            current_vel = paper_state[..., 3:6]
+            
+            # Simple desired trajectory (straight line motion)
+            desired_vel = torch.zeros_like(current_pos)
+            desired_vel[..., 0] = 0.08  # Constant velocity in x direction
+            
+            # Extract actor input Za = [q, q̇, ẋr, ẍr]
+            actor_input = extract_actor_input(
+                joint_pos, joint_vel, desired_pos, desired_vel, 
+                current_pos, self.K1_gain, self.config.get('dt', 0.01)
+            )
+            
+            # Get robot action from actor network
+            with torch.no_grad():
+                actor_output = self.policy.get_action(
+                    actor_input, 
+                    deterministic=False,
+                    exploration_noise=self.config.get('exploration_noise', 0.01)
+                )
+            
+            # Compute robot control according to paper: u = Ŵᵀₐ Sa(Za) - e - K2*ev
+            tracking_error = current_pos - desired_pos
+            sliding_error = current_vel - desired_vel + self.K1_gain * tracking_error
+            
+            robot_control = compute_robot_control(
+                actor_output, tracking_error, sliding_error, self.K2_gain
+            )
+            robot_control = torch.clamp(robot_control, -1.0, 1.0)
+            
+            # Compute human force for next iteration
+            # Get current target index for human equilibrium point
+            try:
+                tm = getattr(unwrapped_env, 'trajectory_manager', None)
+                current_target_index = tm.current_target_index if tm else 0
+            except:
+                current_target_index = 0
+                
+            current_equilibrium = self.get_current_equilibrium_point(current_target_index)
+            
+            # Compute human force using impedance model
+            human_force = self.human_dynamics.compute_human_force(
+                current_pos, 
+                current_equilibrium.unsqueeze(0).expand(self.num_envs, -1),
+                current_vel
+            )
+            
+            # Update interaction forces for next iteration
+            self.interaction_forces = human_force.clone()
+            
+            return robot_control
+            
         except Exception as e:
-            print(f"[ERROR] Failed to save checkpoint: {e}")
+            print(f"[WARNING] Action computation failed: {e}, using zero action")
+            return torch.zeros(self.num_envs, 3, device=self.device)
     
-    def _run_evaluation(self, step: int):
-        """运行评估"""
-        eval_episodes = self.config.get('eval_episodes', 3)
-        max_eval_steps = self.config.get('max_eval_steps', 500)
-        
-        eval_rewards = []
-        print(f"[INFO] Running evaluation at step {step}...")
-        
-        for eval_ep in range(eval_episodes):
-            obs_dict, _ = self.env.reset()
-            ep_reward = 0
-            eval_step_count = 0
+    def _add_to_buffer(self, obs: torch.Tensor, action: torch.Tensor, 
+                       reward: torch.Tensor, next_obs: torch.Tensor, done: torch.Tensor):
+        """Add experience to replay buffer with both state representations"""
+        try:
+            # Extract augmented states for critic/identifier
+            paper_state, desired_pos = extract_paper_state(obs, self.interaction_forces)
+            augmented_state = create_augmented_state(paper_state, desired_pos)
             
-            while eval_step_count < max_eval_steps:
-                obs = obs_dict["policy"]
-                
-                # 使用确定性策略评估
-                paper_state, desired_pos = extract_paper_state(obs, self.interaction_forces)
-                augmented_state = create_augmented_state(paper_state, desired_pos)
-                
-                with torch.no_grad():
-                    action = self.policy.get_action(augmented_state, deterministic=True)
-                
-                obs_dict, reward, terminated, truncated, info = self.env.step(action)
-                ep_reward += reward.mean().item()
-                eval_step_count += 1
-                
-                if (terminated | truncated).any():
-                    break
+            next_paper_state, next_desired_pos = extract_paper_state(next_obs, self.interaction_forces)
+            next_augmented_state = create_augmented_state(next_paper_state, next_desired_pos)
             
-            eval_rewards.append(ep_reward)
-        
-        avg_eval_reward = sum(eval_rewards) / len(eval_rewards)
-        print(f"[INFO] Evaluation complete. Average reward: {avg_eval_reward:.3f}")
+            # Extract actor inputs Za = [q, q̇, ẋr, ẍr]
+            unwrapped_env = self.get_unwrapped_env()
+            joint_pos = unwrapped_env.get_joint_positions()
+            joint_vel = unwrapped_env.get_joint_velocities()
+            
+            current_pos = paper_state[..., :3]
+            current_vel = paper_state[..., 3:6]
+            desired_vel = torch.zeros_like(current_pos)
+            desired_vel[..., 0] = 0.08  # Simple desired velocity
+            
+            actor_input = extract_actor_input(
+                joint_pos, joint_vel, desired_pos, desired_vel, 
+                current_pos, self.K1_gain, self.config.get('dt', 0.01)
+            )
+            
+            # For next actor input, approximate using current method
+            next_current_pos = next_paper_state[..., :3]
+            next_actor_input = extract_actor_input(
+                joint_pos, joint_vel, next_desired_pos, desired_vel,
+                next_current_pos, self.K1_gain, self.config.get('dt', 0.01)
+            )
+            
+            # Add to buffer for each environment with both state representations
+            for i in range(self.num_envs):
+                self.replay_buffer.add(
+                    augmented_state[i],
+                    actor_input[i],
+                    action[i],
+                    reward[i],
+                    next_augmented_state[i],
+                    next_actor_input[i],
+                    done if done.dim() == 0 else done[i]
+                )
+        except Exception as e:
+            print(f"[WARNING] Failed to add to buffer: {e}")
+    
+    def _update_networks(self):
+        """Update networks using paper update laws"""
+        try:
+            self.trainer.update_networks(self.replay_buffer)
+        except Exception as e:
+            print(f"[WARNING] Network update failed: {e}")
     
     def save_model(self, path: str):
-        """保存模型"""
+        """Save model"""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
             'config': self.config,
@@ -319,7 +343,7 @@ class SharedControlTrainer:
         print(f"[INFO] Model saved to {path}")
     
     def load_model(self, path: str):
-        """加载模型"""
+        """Load model"""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         print(f"[INFO] Model loaded from {path}")

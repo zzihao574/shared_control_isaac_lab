@@ -5,11 +5,10 @@
 
 """
 Surgical Human-Robot Shared Control Environment
-论文对齐的手术机器人人机共享控制环境，集成CBF约束
 """
 
 import gymnasium as gym
-from . import agents  # 导入agents模块
+from . import agents 
 
 ##
 # Register Gym environments.
