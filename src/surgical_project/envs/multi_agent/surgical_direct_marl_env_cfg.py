@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObjectCfg
+from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectMARLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -20,28 +21,28 @@ from isaaclab.utils import configclass
 class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     """Configuration for Surgical Direct MARL Environment."""
     
-    # Environment settings
-    episode_length_s = 10.0  # 10 seconds per episode
-    decimation = 2  # Control frequency decimation
+    # Environment settings (与MBRL对齐)
+    episode_length_s = 8.0  # 与MBRL统一
+    decimation = 2
     
     # Multi-agent settings
-    possible_agents = ["human", "robot"]  # Two agents: human and robot
+    possible_agents = ["human", "robot"]
     
-    # Agent-specific action and observation spaces
+    # Agent-specific action and observation spaces (与MBRL基础观测对齐)
     action_spaces = {
-        "human": 3,   # xyz forces from human (haptic device)
-        "robot": 3,   # xyz forces from robot (control policy)
+        "human": 3,   # xyz forces (与MBRL统一)
+        "robot": 3,   # xyz forces (与MBRL统一)
     }
     
     observation_spaces = {
-        "human": 21,   # Updated: actual observation dimension  
-        "robot": 21,   # Updated: actual observation dimension
+        "human": 18,   # 基础12D + 人类特有6D (意图3D + 信任3D)
+        "robot": 18,   # 基础12D + 机器人特有6D (人类动作3D + 信任3D)
     }
     
-    # Global state space (centralized training)
-    state_space = 30  # Updated: combined state information for centralized critic
+    # Global state space
+    state_space = 24  # 全局状态信息
     
-    # Simulation settings
+    # Simulation settings (与MBRL完全对齐)
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,  # 120 Hz simulation
         render_interval=decimation,
@@ -56,42 +57,118 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     
     # Scene settings
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=512,  # Reduced for MARL training
-        env_spacing=3.0, 
+        num_envs=512,
+        env_spacing=4.0,  # 与MBRL对齐
         replicate_physics=True
     )
     
-    # Scalpel (controlled by both agents)
-    scalpel = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/Scalpel",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/scalpei_simple.usd",
+    # Phantom Omni (由两个智能体协作控制)
+    phantom_omni = ArticulationCfg(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=sim_utils.UrdfFileCfg(
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=True,  # No gravity
-                max_depenetration_velocity=1.0,
+                disable_gravity=True,
             ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=False,
+                solver_position_iteration_count=100,
+                solver_velocity_iteration_count=100,
+                sleep_threshold=0.01,
+                stabilization_threshold=0.01,
+                fix_root_link=True
+            ),
+            scale=(1, 1, 1),
+            asset_path='/home/zzh/workspace/surgical_robot_project/assets/models/urdf/omni.urdf',
+            usd_dir='/home/zzh/workspace/surgical_robot_project/assets/models/usd',
+            joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+                gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                    stiffness={
+                        "waist": 1,    
+                        "shoulder": 1,
+                        "elbow": 1,
+                        "yaw": 10000,      
+                        "pitch": 10000,    
+                        "roll": 10000,     
+                    }, 
+                    damping={
+                        "waist": 0.1,
+                        "shoulder": 0.1,
+                        "elbow": 0.1,
+                        "yaw": 1000,       
+                        "pitch": 1000,     
+                        "roll": 1000,      
+                    },
+                ),
+                drive_type="acceleration",
+                target_type="position"
+            ),
+            fix_base=True,
+            root_link_name='base',
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.15),  # Start 150mm above constraint center
-            rot=(1.0, 0.0, 0.0, 0.0),
-            lin_vel=(0.0, 0.0, 0.0),
-            ang_vel=(0.0, 0.0, 0.0),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0, 0, 0),
+            rot=(1, 0.0, 0.0, 0.0),
+            joint_pos={
+                "waist": 0.0,
+                "shoulder": 0.0,
+                "elbow": 0.0,
+                "yaw": 4.0,
+                "pitch": 1.2,
+                "roll": 0.0,
+            },
+            joint_vel={
+                "waist": 0.0,
+                "shoulder": 0.0,
+                "elbow": 0.0,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "roll": 0.0,
+            },
         ),
+        actuators={
+            "arm_joints": IdealPDActuatorCfg(
+                joint_names_expr=[
+                    "waist", 
+                    "shoulder", 
+                    "elbow", 
+                    "yaw", 
+                    "pitch", 
+                    "roll"
+                ],
+                stiffness={
+                    "waist": 1,    
+                    "shoulder": 1,
+                    "elbow": 1,
+                    "yaw": 10000,
+                    "pitch": 10000,
+                    "roll": 10000,
+                },
+                damping={
+                    "waist": 0.1,
+                    "shoulder": 0.1,
+                    "elbow": 0.1,
+                    "yaw": 1000,
+                    "pitch": 1000,
+                    "roll": 1000,
+                },
+            ),
+        },
     )
     
-    # Constraint (cone-shaped)
+    # Constraint (与MBRL完全一致)
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
             usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/ConeConstraint.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,  # Cannot be moved
+                kinematic_enabled=True,
                 disable_gravity=True,
             ),
-            scale=(0.05, 0.05, 0.05),  # Scale down by 0.05
+            scale=(0.01, 0.01, 0.015),  # 与MBRL一致
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.0),  # At world origin
+            pos=(0.0, 0.15, 0.0),  # 与MBRL一致
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
@@ -110,96 +187,81 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         ),
     )
     
-    # Force and control parameters
+    # Force and control parameters (与MBRL对齐)
     max_force = {
-        "human": 8.0,   # Human can apply higher force (haptic feedback)
-        "robot": 5.0,   # Robot has controlled force limit
+        "human": 3.3,   # 与MBRL统一
+        "robot": 3.3,   # 与MBRL统一
     }
     force_scale = 1.0
     
-    # Agent interaction parameters
-    interaction_coupling = 0.3  # How much agents influence each other
+    # End effector parameters (与MBRL对齐)
+    end_effector_body_name = "stylus"
+    end_effector_body_id = 6
+    interaction_coupling = 0.3
     force_sharing_ratio = {
-        "human": 0.6,   # Human contributes 60% of total force
-        "robot": 0.4,   # Robot contributes 40% of total force
+        "human": 0.6,
+        "robot": 0.4,
     }
     
-    # Reward scales (agent-specific)
-    reward_scales = {
-        "human": {
-            "collision_penalty": -8.0,
-            "distance_reward": 1.2,
-            "smoothness_penalty": -0.05,
-            "collaboration_reward": 3.0,
-            "task_completion": 60.0,
-            "intention_alignment": 2.0,
-        },
-        "robot": {
-            "collision_penalty": -10.0,
-            "distance_reward": 1.0,
-            "smoothness_penalty": -0.1,
-            "collaboration_reward": 2.5,
-            "task_completion": 50.0,
-            "adaptation_reward": 1.5,
-        }
-    }
+    # Trajectory parameters (与MBRL完全对齐)
+    target_reach_threshold = 0.01
+    target_points = [
+        (-0.2, 0.15, 0.03),  # 第一个平衡点
+        (0.2, 0.15, 0.03)    # 第二个平衡点
+    ]
     
-    # Simulation scaling factor
-    simulation_scale = 10.0  # Simulation is 10x larger than real world
+    # Constraint geometry parameters (与MBRL一致)
+    constraint_inner_radius_min = 0.1
+    constraint_inner_radius_max = 0.25
+    constraint_height = 0.2598
+    collision_threshold = 0.001
     
-    # Task parameters (in simulation scale)
-    target_height = 0.05  # Target height inside constraint
-    collision_threshold = 0.001  # Collision detection threshold
-    
-    # Constraint geometry parameters (in simulation scale, after 0.05 scaling)
-    constraint_inner_radius_min = 0.1   # 100mm in sim = 10mm real
-    constraint_inner_radius_max = 0.25  # 250mm in sim = 25mm real
-    constraint_outer_radius_min = 0.15  # 150mm in sim = 15mm real
-    constraint_outer_radius_max = 0.3   # 300mm in sim = 30mm real
-    constraint_height = 0.2598          # 259.8mm in sim = 25.98mm real
-    
-    # Human dynamics parameters (for simulation)
+    # Human dynamics parameters (与MBRL对齐)
     human_dynamics = {
         "stiffness": 201.0,
         "damping": 21.0,
-        "noise_std": 0.1,          # Human input noise
-        "reaction_delay": 0.05,    # 50ms reaction delay
-        "intention_update_rate": 10.0,  # Hz
+        "noise_std": 0.1,
+        "reaction_delay": 0.05,
+        "intention_update_rate": 10.0,
     }
     
-    # Robot dynamics parameters
-    robot_dynamics = {
-        "control_frequency": 50.0,  # Hz
-        "adaptation_rate": 0.1,
-        "learning_rate": 0.001,
-    }
-    
-    # Collaboration parameters
+    # Collaboration parameters (MARL特有)
     collaboration = {
-        "trust_factor": 0.8,        # Initial trust between agents
-        "trust_decay": 0.95,        # Trust decay on conflicts
-        "trust_recovery": 1.02,     # Trust recovery on success
-        "conflict_threshold": 2.0,  # Force difference threshold for conflict
-        "alignment_bonus": 5.0,     # Reward bonus for aligned actions
+        "trust_factor": 0.8,
+        "trust_decay": 0.95,
+        "trust_recovery": 1.02,
+        "conflict_threshold": 2.0,
     }
     
-    # Task completion criteria
+    # Task completion criteria (与MBRL对齐)
     task_completion = {
-        "target_radius": 0.01,      # 10mm tolerance around target
-        "completion_time": 50,      # Steps to stay in target (1 second)
+        "target_radius": 0.01,
+        "completion_time": 50,
         "max_completion_bonus": 100.0,
-        "partial_completion_steps": [10, 25, 40],  # Progressive rewards
+        "partial_completion_steps": [10, 25, 40],
         "partial_completion_rewards": [10.0, 25.0, 40.0],
     }
     
-    # Observation noise models (optional)
-    observation_noise_model = {
-        "human": None,  # Human observations can have noise
-        "robot": None,  # Robot observations are precise
-    }
-    
-    # Action noise models (for realism)
-    action_noise_model = {
-        "human": None,  # Human actions have inherent noise
-        "robot": None,  # Robot actions are precise
+    # Reward scales (保持MARL差异化奖励)
+    reward_scales = {
+        "human": {
+            "tracking_reward": 100.0,      # 与MBRL对齐
+            "velocity_penalty": -0.01,      # 与MBRL对齐
+            "control_penalty": -0.001,      # 与MBRL对齐
+            "safety_penalty": -10.0,        # 与MBRL对齐
+            "collision_penalty": -50.0,     # 与MBRL对齐
+            "completion_reward": 20.0,      # 与MBRL对齐
+            "collaboration_reward": 2.0,    # MARL特有
+            "intention_alignment": 1.5,     # MARL特有
+        },
+        "robot": {
+            "tracking_reward": 100.0,
+            "velocity_penalty": -0.01,
+            "control_penalty": -0.001,
+            "safety_penalty": -10.0,
+            "collision_penalty": -50.0,
+            "completion_reward": 20.0,
+            "collaboration_reward": 2.0,    # MARL特有
+            "adaptation_reward": 1.5,       # MARL特有
+        }
     }

@@ -82,12 +82,12 @@ class SharedControlTrainer:
         # Off-Policy trainer with paper update laws
         self.trainer = OffPolicyTrainer(self.policy, self.config, self.device)
         
-        # CBF constraint manager - use configuration parameters
-        self.cbf = ControlBarrierFunction(
-            gamma=self.config.get('cbf_gamma', 1.0),
-            safety_margin=self.config.get('safety_margin', 0.002),
-            device=self.device
-        )
+        # # CBF constraint manager - use configuration parameters
+        # self.cbf = ControlBarrierFunction(
+        #     gamma=self.config.get('cbf_gamma', 1.0),
+        #     safety_margin=self.config.get('safety_margin', 0.002),
+        #     device=self.device
+        # )
         
         # Initialize interaction force (will be computed from paper equations)
         self.interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
@@ -172,10 +172,12 @@ class SharedControlTrainer:
                         next_obs_dict, reward, terminated, truncated, info = self.env.step(action)
                         next_obs = next_obs_dict["policy"]
                         done = (terminated | truncated).any()
+
+                        # 优化 Update interaction forces
                         
                         # Add to replay buffer
                         self._add_to_buffer(obs, action, reward, next_obs, done)
-                        
+
                         obs = next_obs
                         episode_return += reward.mean().item()
                         step_count += 1
@@ -229,7 +231,7 @@ class SharedControlTrainer:
             
             # Simple desired trajectory (straight line motion)
             desired_vel = torch.zeros_like(current_pos)
-            desired_vel[..., 0] = 0.08  # Constant velocity in x direction
+            desired_vel[..., 0] = 0.08  # ！！！！！！，改为期望速度和离目标点距离以及离障碍物距离相关
             
             # Extract actor input Za = [q, q̇, ẋr, ẍr]
             actor_input = extract_actor_input(
@@ -245,16 +247,16 @@ class SharedControlTrainer:
                     exploration_noise=self.config.get('exploration_noise', 0.01)
                 )
             
-            # Compute robot control according to paper: u = Ŵᵀₐ Sa(Za) - e - K2*ev
+            # Compute robot control according to paper: u = Ŵᵀₐ Sa(Za) - e - K2*ev #优化！！！！-f
             tracking_error = current_pos - desired_pos
             sliding_error = current_vel - desired_vel + self.K1_gain * tracking_error
             
             robot_control = compute_robot_control(
                 actor_output, tracking_error, sliding_error, self.K2_gain
             )
-            robot_control = torch.clamp(robot_control, -1.0, 1.0)
-            
-            # Compute human force for next iteration
+            robot_control = torch.clamp(robot_control, -1.0, 1.0) #优化！！！！，不要限制在+-1.0
+
+            # Compute human force for this iteration
             # Get current target index for human equilibrium point
             try:
                 tm = getattr(unwrapped_env, 'trajectory_manager', None)
@@ -262,7 +264,7 @@ class SharedControlTrainer:
             except:
                 current_target_index = 0
                 
-            current_equilibrium = self.get_current_equilibrium_point(current_target_index)
+            current_equilibrium = self.get_current_equilibrium_point(current_target_index) #优化！！！！，不是一个target index
             
             # Compute human force using impedance model
             human_force = self.human_dynamics.compute_human_force(
@@ -271,7 +273,7 @@ class SharedControlTrainer:
                 current_vel
             )
             
-            # Update interaction forces for next iteration
+            # Update interaction forces for this iteration
             self.interaction_forces = human_force.clone()
             
             return robot_control
@@ -299,7 +301,7 @@ class SharedControlTrainer:
             current_pos = paper_state[..., :3]
             current_vel = paper_state[..., 3:6]
             desired_vel = torch.zeros_like(current_pos)
-            desired_vel[..., 0] = 0.08  # Simple desired velocity
+            desired_vel[..., 0] = 0.08  # 优化！！！！， xd.不应该是一个常数
             
             actor_input = extract_actor_input(
                 joint_pos, joint_vel, desired_pos, desired_vel, 
@@ -318,11 +320,11 @@ class SharedControlTrainer:
                 self.replay_buffer.add(
                     augmented_state[i],
                     actor_input[i],
-                    action[i],
+                    action[i],               #优化！！！！！少了人力记录
                     reward[i],
                     next_augmented_state[i],
                     next_actor_input[i],
-                    done if done.dim() == 0 else done[i]
+                    done if done.dim() == 0 else done[i] #优化！！！！，缺了一个状态
                 )
         except Exception as e:
             print(f"[WARNING] Failed to add to buffer: {e}")

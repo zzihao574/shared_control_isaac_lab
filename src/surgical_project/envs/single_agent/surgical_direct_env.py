@@ -146,7 +146,7 @@ class SurgicalDirectEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Apply actions before physics step - implementing paper control framework"""
         # Robot control input u (from actor network output, processed according to paper)
-        robot_actions = torch.clamp(actions, -1.0, 1.0)
+        robot_actions = torch.clamp(actions, -1.0, 1.0)# 优化！！！！怎么那么爱限制
         self.robot_forces = robot_actions * self.cfg.max_robot_force * self.cfg.force_scale
         self.previous_robot_actions = robot_actions.clone()
         
@@ -205,6 +205,11 @@ class SurgicalDirectEnv(DirectRLEnv):
             body_ids=body_ids,
             env_ids=env_ids
         )
+    
+    def _update_safety_constraints(self):
+        """Update safety constraint information"""
+        end_effector_pos = self._get_end_effector_position()
+        self._compute_safety_barrier_function(end_effector_pos)#优化！！！！！可能不需要
 
     def _compute_safety_barrier_function(self, end_effector_positions: torch.Tensor) -> torch.Tensor:
         """
@@ -241,10 +246,9 @@ class SurgicalDirectEnv(DirectRLEnv):
     
     def _compute_physics_based_constraints(self, current_positions: torch.Tensor):
         """Use physics query API to compute distance and normal to constraint surface"""
-        try:
-            from carb._carb import Float3
-            
-            for i in range(current_positions.shape[0]):
+        
+        from carb._carb import Float3
+        for i in range(current_positions.shape[0]):
                 pos = current_positions[i].cpu().numpy()
                 query_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
                 
@@ -289,47 +293,7 @@ class SurgicalDirectEnv(DirectRLEnv):
                     self.safety_distances[i] = 0.004  # Assume safe (2x safety margin)
                     self.constraint_normals[i] = torch.tensor([1.0, 0.0, 0.0], device=self.device)
                     self.closest_constraint_points[i] = current_positions[i]
-                    self.is_violating_constraint[i] = False
-                    
-        except Exception as e:
-            print(f"[ERROR] Physics-based constraint computation failed: {e}")
-            # Fallback to simplified model
-            self._compute_simplified_constraints(current_positions)
-    
-    def _compute_simplified_constraints(self, current_positions: torch.Tensor):
-        """Simplified constraint model - based on geometric distance"""
-        # Assume constraint located near (0, 0.15, 0) in cone-shaped region
-        constraint_center = torch.tensor([0.0, 0.15, 0.0], device=self.device)
-        constraint_radius = 0.05  # Constraint radius
-        
-        for i in range(current_positions.shape[0]):
-            pos = current_positions[i]
-            
-            # Compute distance to constraint center
-            diff = pos - constraint_center
-            horizontal_dist = torch.norm(diff[:2])  # x-y plane distance
-            vertical_dist = torch.abs(diff[2])      # z direction distance
-            
-            # Simplified cone constraint: horizontal distance + weighted vertical distance
-            distance_to_constraint = torch.sqrt(horizontal_dist**2 + (vertical_dist * 2)**2)
-            safety_distance = torch.clamp(distance_to_constraint - constraint_radius, min=0.0)
-            
-            # Compute constraint normal
-            if horizontal_dist > 1e-6:
-                normal = diff / torch.norm(diff)
-            else:
-                normal = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-            
-            # Store results
-            self.safety_distances[i] = safety_distance
-            self.constraint_normals[i] = normal
-            self.closest_constraint_points[i] = constraint_center + normal * constraint_radius
-            self.is_violating_constraint[i] = safety_distance < 0.002  # safety_margin
-    
-    def _update_safety_constraints(self):
-        """Update safety constraint information"""
-        end_effector_pos = self._get_end_effector_position()
-        self._compute_safety_barrier_function(end_effector_pos)
+                    self.is_violating_constraint[i] = False    
         
     def _apply_action(self) -> None:
         """Apply processed actions to environment"""
@@ -377,7 +341,7 @@ class SurgicalDirectEnv(DirectRLEnv):
         control_penalty = -torch.sum(self.previous_robot_actions**2, dim=-1) * 0.001
         
         # 4. Safety constraint penalty
-        cbf_values = self._compute_safety_barrier_function(end_effector_pos)
+        cbf_values = self._compute_safety_barrier_function(end_effector_pos)                  #优化！！！！少了f项，多了到xd项
         safety_penalty = -cbf_values * 10.0
         
         # 5. Hard constraint violation penalty

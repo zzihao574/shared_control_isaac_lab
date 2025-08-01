@@ -137,7 +137,7 @@ class SurgicalActor(nn.Module):
         control_output = self.output_layer(rbf_features)
         
         # Apply tanh for bounded output
-        return torch.tanh(control_output)
+        return control_output
 
 
 class DynamicsIdentifierNetwork(nn.Module):
@@ -217,9 +217,9 @@ class SurgicalActorCritic(nn.Module):
             noise_std = exploration_noise if exploration_noise is not None else self.action_noise_std
             noise = torch.randn_like(action) * noise_std
             action = action + noise
-                
-        return torch.clamp(action, -1.0, 1.0)
-    
+
+        return torch.clamp(action, -1.0, 1.0)  # 优化
+
     def evaluate_value(self, augmented_state: torch.Tensor) -> torch.Tensor:
         """Evaluate value function using critic network"""
         return self.critic(augmented_state)

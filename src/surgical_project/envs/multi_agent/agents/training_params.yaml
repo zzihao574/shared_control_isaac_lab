@@ -1,179 +1,102 @@
-# Training parameters for Surgical Human-Robot MARL with RLlib
-# Compatible with Ray RLlib MADDPG algorithm
+# Training parameters for Surgical Human-Robot MARL with MADDPG
+# 与MBRL环境对齐的物理参数，保持MARL特有的协作机制
 
 env_config:
-  # Environment settings
+  # Environment settings (与MBRL对齐)
   env_name: "surgical_direct_marl"
   num_envs: 512
-  episode_length_s: 10.0
-  simulation_scale: 10.0
+  episode_length_s: 8.0  # 与MBRL统一
   
   # Multi-agent settings
   agents: ["human", "robot"]
   centralized_critic: true
   parameter_sharing: false
   
-  # Observation and action spaces
+  # Observation and action spaces (更新为实际维度)
   observation_spaces:
-    human: 18
-    robot: 18
+    human: 18  # 基础12D + 人类特有6D
+    robot: 18  # 基础12D + 机器人特有6D
   action_spaces:
-    human: 3
-    robot: 3
-  state_space: 24
+    human: 3   # xyz forces
+    robot: 3   # xyz forces
+  state_space: 24  # 全局状态
 
-# RLlib configuration
-rllib_config:
-  # Framework settings
-  framework: "torch"
-  num_workers: 8
-  num_envs_per_worker: 64
-  batch_mode: "complete_episodes"
+# MADDPG配置
+maddpg_config:
+  # 网络参数
+  lr: 0.01
+  gamma: 0.95
+  batch_size: 1024
+  num_units: 64
   
-  # Training settings
-  train_batch_size: 4096
-  sgd_minibatch_size: 512
-  num_sgd_iter: 10
-  lr: 0.0003
-  lr_schedule: null
+  # 训练参数
+  num_episodes: 25000
+  max_episode_len: 500
+  save_rate: 1000
   
-  # MADDPG specific settings
-  actor_lr: 0.0003
-  critic_lr: 0.0003
-  tau: 0.005
-  gamma: 0.99
+  # 探索参数
+  exploration_noise: 0.1
   
-  # Exploration settings
-  exploration_config:
-    type: "GaussianNoise"
-    random_timesteps: 10000
-    stddev: 0.2
-    initial_scale: 1.0
-    final_scale: 0.1
-    scale_timesteps: 500000
-  
-  # Replay buffer settings
-  buffer_size: 1000000
-  learning_starts: 10000
-  target_network_update_freq: 500
-  
-  # Network architecture
-  model:
-    fcnet_hiddens: [256, 256, 128]
-    fcnet_activation: "relu"
-    post_fcnet_hiddens: []
-    post_fcnet_activation: "relu"
-    
-  # Multi-agent specific
-  multiagent:
-    policies:
-      human_policy:
-        observation_space: null  # Will be set automatically
-        action_space: null       # Will be set automatically
-        config:
-          model:
-            fcnet_hiddens: [256, 256, 128]
-            fcnet_activation: "relu"
-          
-      robot_policy:
-        observation_space: null  # Will be set automatically
-        action_space: null       # Will be set automatically
-        config:
-          model:
-            fcnet_hiddens: [256, 256, 128] 
-            fcnet_activation: "relu"
-    
-    policy_mapping_fn: null  # Will be set in training script
-    policies_to_train: ["human_policy", "robot_policy"]
-    
-  # Evaluation settings
-  evaluation_interval: 50
-  evaluation_duration: 10
-  evaluation_num_workers: 2
-  evaluation_config:
-    explore: false
-    
-  # Checkpointing
-  checkpoint_freq: 100
-  keep_checkpoints_num: 5
-  
-  # Logging
-  log_level: "INFO"
-  log_sys_usage: true
-  
-  # Resource settings
-  num_gpus: 1
-  num_cpus_per_worker: 1
-  num_gpus_per_worker: 0
+  # 网络更新参数
+  tau: 0.01  # 软更新参数
+  max_replay_buffer_len: 25600  # batch_size * 25
 
-# Algorithm specific parameters
-algorithm_config:
-  # MADDPG parameters
-  actor_hidden_activation: "relu"
-  critic_hidden_activation: "relu"
-  n_step: 1
-  
-  # Loss function weights
-  actor_loss_coeff: 1.0
-  critic_loss_coeff: 1.0
-  
-  # Gradient settings
-  grad_clip: 40.0
-  
-  # Target network settings
-  target_noise: 0.2
-  target_noise_clip: 0.5
-  
-  # Agent-specific configurations
-  agent_configs:
-    human:
-      # Human agent typically has more exploration
-      exploration_noise: 0.3
-      learning_rate: 0.0003
-      buffer_size: 500000
+# Agent-specific configurations
+agent_configs:
+  human:
+    # 人类智能体配置
+    local_q_func: true   # 使用局部Q函数
+    exploration_noise: 0.1
+    
+    # 人类特有奖励权重
+    reward_weights:
+      tracking_reward: 100.0
+      velocity_penalty: -0.01
+      control_penalty: -0.001
+      safety_penalty: -10.0
+      collision_penalty: -50.0
+      completion_reward: 20.0
+      collaboration_reward: 2.0
+      intention_alignment: 1.5
       
-      # Human-specific reward weights
-      reward_weights:
-        collaboration: 3.0
-        intention_alignment: 2.0
-        task_completion: 60.0
-        collision_penalty: -8.0
-        
-    robot:
-      # Robot agent is more conservative
-      exploration_noise: 0.2
-      learning_rate: 0.0003
-      buffer_size: 500000
-      
-      # Robot-specific reward weights
-      reward_weights:
-        collaboration: 2.5
-        adaptation: 1.5
-        task_completion: 50.0
-        collision_penalty: -10.0
+  robot:
+    # 机器人智能体配置
+    local_q_func: false  # 使用全局Q函数
+    exploration_noise: 0.1
+    
+    # 机器人特有奖励权重
+    reward_weights:
+      tracking_reward: 100.0
+      velocity_penalty: -0.01
+      control_penalty: -0.001
+      safety_penalty: -10.0
+      collision_penalty: -50.0
+      completion_reward: 20.0
+      collaboration_reward: 2.0
+      adaptation_reward: 1.5
 
-# Environment specific parameters
+# Environment specific parameters (与MBRL对齐)
 env_specific:
-  # Force parameters
+  # 力参数
   max_forces:
-    human: 8.0
-    robot: 5.0
+    human: 3.3
+    robot: 3.3
     
-  # Collaboration parameters
+  # 协作参数 (MARL特有)
   force_sharing_ratio:
     human: 0.6
     robot: 0.4
     
   interaction_coupling: 0.3
   
-  # Trust and collaboration
+  # 信任和协作 (MARL特有)
   trust_parameters:
     initial_trust: 0.8
     trust_decay: 0.95
     trust_recovery: 1.02
     conflict_threshold: 2.0
     
-  # Human simulation parameters
+  # 人类动力学参数 (与MBRL对齐)
   human_dynamics:
     stiffness: 201.0
     damping: 21.0
@@ -181,75 +104,49 @@ env_specific:
     reaction_delay: 0.05
     intention_update_rate: 10.0
     
-  # Task parameters
+  # 轨迹参数 (与MBRL对齐)
+  trajectory:
+    target_points:
+      - [-0.2, 0.15, 0.03]  # 起始平衡点
+      - [0.2, 0.15, 0.03]   # 目标平衡点
+    target_reach_threshold: 0.01
+    
+  # 约束参数 (与MBRL对齐)
+  constraints:
+    collision_threshold: 0.001
+    constraint_center: [0.0, 0.15, 0.0]
+    constraint_radius: 0.05
+    
+  # 任务完成参数 (与MBRL对齐)
   task_completion:
     target_radius: 0.01
     completion_time: 50
     max_completion_bonus: 100.0
-    partial_rewards: [10.0, 25.0, 40.0]
-    partial_steps: [10, 25, 40]
 
 # Training schedule
 training:
-  total_timesteps: 5000000
-  checkpoint_interval: 100000
-  evaluation_interval: 50000
+  total_episodes: 25000
+  checkpoint_interval: 1000
+  evaluation_interval: 1000
   
-  # Curriculum learning
+  # 课程学习 (可选)
   curriculum:
-    enabled: true
-    stages:
-      - name: "basic_collaboration"
-        timesteps: 1000000
-        max_force_scale: 0.5
-        collision_penalty_scale: 0.5
-        
-      - name: "intermediate_precision"
-        timesteps: 2000000
-        max_force_scale: 0.8
-        collision_penalty_scale: 0.8
-        
-      - name: "full_task"
-        timesteps: 2000000
-        max_force_scale: 1.0
-        collision_penalty_scale: 1.0
+    enabled: false
 
 # Logging and monitoring
 logging:
-  tensorboard: true
-  wandb:
-    enabled: false
-    project: "surgical_marl"
-    tags: ["human_robot", "collaboration", "surgical"]
-    
+  log_frequency: 100
+  save_training_curves: true
+  
   custom_metrics:
     - "trust_levels"
-    - "collaboration_quality"
+    - "collaboration_quality" 
     - "task_completion_rate"
     - "conflict_frequency"
     - "force_alignment"
+    - "trajectory_progress"
     
-  log_frequency: 1000
-  
-# Hardware and performance
-performance:
-  torch_threads: 4
-  inter_op_parallelism: 1
-  intra_op_parallelism: 4
-  
-  # Memory management
-  memory_limit_gb: 32
-  gpu_memory_fraction: 0.8
-  
-# Debugging and development
-debug:
-  log_level: "INFO"
-  print_agent_actions: false
-  print_rewards: false
-  save_replay_buffer: false
-  
-  # Visualization
-  render_during_training: false
-  render_frequency: 1000
-  save_videos: false
-  video_frequency: 10000
+# Hardware settings
+hardware:
+  device: "cuda"
+  num_workers: 1

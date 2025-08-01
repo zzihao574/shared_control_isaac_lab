@@ -12,619 +12,568 @@ import numpy as np
 from typing import Any, Dict
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObject
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import sample_uniform
 
 from .surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
 
 
-class SurgicalDirectMARLEnv(DirectMARLEnv):
-    """Surgical Direct MARL Environment for Human-Robot Collaborative Control.
+class TrajectoryManager:
+    """轨迹管理器 - 距离驱动的目标点切换（与MBRL对齐）"""
     
-    This environment simulates a surgical task where a human and robot collaborate
-    to control a surgical tool (scalpel) within geometric constraints. Each agent
-    (human and robot) provides force inputs that are combined to control the scalpel.
-    """
+    def __init__(self, device: torch.device, target_points: list, reach_threshold: float = 0.01):
+        self.device = device
+        self.target_points = [torch.tensor(point, device=device, dtype=torch.float32) for point in target_points]
+        self.reach_threshold = reach_threshold
+        self.current_target_index = 0
+        
+    def get_current_target(self) -> torch.Tensor:
+        """获取当前目标点"""
+        return self.target_points[self.current_target_index]
+        
+    def update_target(self, current_pos: torch.Tensor) -> bool:
+        """基于当前位置更新目标点"""
+        current_target = self.target_points[self.current_target_index]
+        
+        if current_pos.dim() > 1:
+            distance = torch.norm(current_pos[0] - current_target)
+        else:
+            distance = torch.norm(current_pos - current_target)
+        
+        if distance < self.reach_threshold and self.current_target_index < len(self.target_points) - 1:
+            self.current_target_index += 1
+            return True
+        return False
+        
+    def reset_trajectory(self):
+        """重置轨迹到起始点"""
+        self.current_target_index = 0
+        
+    def get_progress(self) -> float:
+        """获取轨迹进度"""
+        return self.current_target_index / max(1, len(self.target_points) - 1)
+        
+    def is_final_target_reached(self, current_pos: torch.Tensor) -> bool:
+        """检查是否到达最终目标点"""
+        if self.current_target_index < len(self.target_points) - 1:
+            return False
+            
+        final_target = self.target_points[-1]
+        if current_pos.dim() > 1:
+            distance = torch.norm(current_pos[0] - final_target)
+        else:
+            distance = torch.norm(current_pos - final_target)
+            
+        return distance < self.reach_threshold
+
+
+class SurgicalDirectMARLEnv(DirectMARLEnv):
+    """人机协作手术MARL环境 - 协作控制Omni设备"""
     
     cfg: SurgicalDirectMARLEnvCfg
     
     def __init__(self, cfg: SurgicalDirectMARLEnvCfg, render_mode: str | None = None, **kwargs):
-        """Initialize the surgical MARL environment."""
+        """初始化环境"""
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Time step
+        # 时间步长
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
-        # Simulation scaling factor
-        self.sim_scale = self.cfg.simulation_scale
-        self.inv_sim_scale = 1.0 / self.sim_scale
+        # 轨迹管理器（与MBRL对齐）
+        self.trajectory_manager = TrajectoryManager(
+            device=self.device,
+            target_points=self.cfg.target_points,
+            reach_threshold=self.cfg.target_reach_threshold
+        )
         
-        # Initialize tracking variables
-        self.previous_actions = torch.zeros(self.num_envs, self.cfg.action_spaces["human"], device=self.device)
-        self.interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
-        self.human_intentions = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        # Agent actions (forces)
+        # 智能体动作和状态跟踪
         self.agent_actions = {
             agent: torch.zeros(self.num_envs, self.cfg.action_spaces[agent], device=self.device)
             for agent in self.cfg.possible_agents
         }
         
-        # Agent interaction tracking
-        self.interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
-        self.force_history = {
-            agent: torch.zeros(self.num_envs, 10, 3, device=self.device)  # Last 10 steps
-            for agent in self.cfg.possible_agents
-        }
-        self.history_idx = 0
+        # 物理参数跟踪
+        self.combined_forces = torch.zeros(self.num_envs, 3, device=self.device)
         
-        # Human simulation state
+        # 人类仿真状态
         self.human_intention = torch.zeros(self.num_envs, 3, device=self.device)
         self.human_reaction_timer = torch.zeros(self.num_envs, device=self.device)
         
-        # Collaboration metrics
+        # 协作指标
         self.trust_levels = {
             agent: torch.ones(self.num_envs, device=self.device) * self.cfg.collaboration["trust_factor"]
             for agent in self.cfg.possible_agents
         }
         self.conflict_counter = torch.zeros(self.num_envs, device=self.device)
         
-        # Task tracking
+        # 任务跟踪
         self.task_completed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.steps_in_target = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.partial_completion_achieved = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.device)
         
-        # Debug flag for observation dimensions
-        self._obs_dim_printed = False
+        # 约束相关变量（与MBRL对齐）
+        self.safety_distances = torch.zeros(self.num_envs, device=self.device)
+        self.constraint_normals = torch.zeros(self.num_envs, 3, device=self.device)
+        self.is_violating_constraint = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
-        print(f"[INFO] Surgical MARL environment initialized with {self.num_envs} environments")
-        print(f"[INFO] Agents: {self.cfg.possible_agents}")
-        print(f"[INFO] Expected observation dimensions:")
-        for agent in self.cfg.possible_agents:
-            print(f"  {agent}: {self.cfg.observation_spaces[agent]}")
-        print(f"[INFO] Action dimensions:")
-        for agent in self.cfg.possible_agents:
-            print(f"  {agent}: {self.cfg.action_spaces[agent]}")
+        print(f"[INFO] MARL环境初始化完成，{self.num_envs}个环境")
+        print(f"[INFO] 智能体: {self.cfg.possible_agents}")
+        print(f"[INFO] 观测维度: human={self.cfg.observation_spaces['human']}, robot={self.cfg.observation_spaces['robot']}")
         
     def _setup_scene(self):
-        """Set up the simulation scene."""
-        # Create scalpel (controlled by both agents)
-        self._scalpel = RigidObject(self.cfg.scalpel)
-        self.scene.rigid_objects["scalpel"] = self._scalpel
+        """设置仿真场景"""
+        # 创建Omni机器人（由两个智能体协作控制）
+        self._omni_robot = Articulation(self.cfg.phantom_omni)
+        self.scene.articulations["phantom_omni"] = self._omni_robot
         
-        # Create constraint (cone)
+        # 创建约束
         self._constraint = RigidObject(self.cfg.constraint)
         self.scene.rigid_objects["constraint"] = self._constraint
         
-        # Create terrain
+        # 创建地形
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
         
-        # Clone environments
+        # 克隆环境
         self.scene.clone_environments(copy_from_source=False)
         
-        # Add lighting
+        # 添加光照
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
-        """Apply agent actions before physics step.
-        
-        Args:
-            actions: Dictionary of actions for each agent
-        """
-        # Store and process agent actions
+        """物理步骤前应用动作"""
+        # 处理智能体动作
         for agent, action in actions.items():
             if agent in self.cfg.possible_agents:
-                # Clamp actions to valid range (real world scale)
                 action = torch.clamp(action, -1.0, 1.0)
-                
-                # Scale actions from real world to simulation scale
-                action_sim_scale = action * self.sim_scale
-                
-                # Scale to force values
                 max_force = self.cfg.max_force[agent]
-                forces = action_sim_scale * max_force * self.cfg.force_scale
-                
+                forces = action * max_force * self.cfg.force_scale
                 self.agent_actions[agent] = forces
-                
-                # Update force history
-                self.force_history[agent][:, self.history_idx] = forces
         
-        # Update history index
-        self.history_idx = (self.history_idx + 1) % 10
+        # 合成智能体力
+        self.combined_forces = self._combine_agent_forces()
         
-        # Combine agent forces
-        combined_forces = self._combine_agent_forces()
+        # 应用力到末端执行器
+        self._apply_forces_to_end_effector(self.combined_forces)
         
-        # Apply combined forces to scalpel
-        self._apply_forces_to_scalpel(combined_forces)
-        
-        # Update human simulation
+        # 更新人类仿真
         self._update_human_simulation()
         
-        # Update collaboration metrics
+        # 更新协作指标
         self._update_collaboration_metrics()
         
+        # 更新约束信息
+        self._update_safety_constraints()
+        
     def _combine_agent_forces(self) -> torch.Tensor:
-        """Combine forces from both agents based on collaboration model."""
+        """合成智能体力（MARL特有机制）"""
         human_forces = self.agent_actions["human"]
         robot_forces = self.agent_actions["robot"]
         
-        # Force sharing based on configuration
+        # 力分配比例
         human_ratio = self.cfg.force_sharing_ratio["human"]
         robot_ratio = self.cfg.force_sharing_ratio["robot"]
         
-        # Trust-based modulation
+        # 信任调制
         human_trust = self.trust_levels["human"].unsqueeze(-1)
         robot_trust = self.trust_levels["robot"].unsqueeze(-1)
         
-        # Normalize trust levels
-        total_trust = human_trust + robot_trust
-        human_weight = (human_trust / (total_trust + 1e-6)) * human_ratio
-        robot_weight = (robot_trust / (total_trust + 1e-6)) * robot_ratio
+        total_trust = human_trust + robot_trust + 1e-6
+        human_weight = (human_trust / total_trust) * human_ratio
+        robot_weight = (robot_trust / total_trust) * robot_ratio
         
-        # Combine forces
+        # 合成力
         combined_forces = human_weight * human_forces + robot_weight * robot_forces
         
-        # Add interaction coupling
+        # 交互耦合
         interaction_term = self.cfg.interaction_coupling * (human_forces + robot_forces) * 0.5
         combined_forces = combined_forces + interaction_term
         
-        # Store interaction forces for observation
-        self.interaction_forces = combined_forces.clone()
-        
         return combined_forces
         
-    def _apply_forces_to_scalpel(self, forces: torch.Tensor) -> None:
-        """Apply combined forces to the scalpel."""
-        # Reshape forces for RigidObject interface
-        forces_reshaped = forces.unsqueeze(1)  # [num_envs, 1, 3]
+    def _apply_forces_to_end_effector(self, forces: torch.Tensor) -> None:
+        """应用力到末端执行器"""
+        forces_reshaped = forces.unsqueeze(1)
         torques_reshaped = torch.zeros_like(forces_reshaped)
         
-        # Apply external forces
-        self._scalpel.set_external_force_and_torque(
-            forces_reshaped,
-            torques_reshaped,
-            body_ids=None
+        body_ids = torch.tensor(
+            [self.cfg.end_effector_body_id],
+            dtype=torch.long,
+            device=self.device
+        )
+        
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        
+        self._omni_robot.set_external_force_and_torque(
+            forces=forces_reshaped,
+            torques=torques_reshaped,
+            body_ids=body_ids,
+            env_ids=env_ids
         )
         
     def _update_human_simulation(self) -> None:
-        """Update simulated human behavior."""
-        scalpel_pos = self._scalpel.data.root_pos_w
-        scalpel_vel = self._scalpel.data.root_lin_vel_w
+        """更新人类行为仿真（与MBRL对齐）"""
+        end_effector_pos = self._get_end_effector_position()
         
-        # Update reaction timer
         self.human_reaction_timer += self.dt
         
-        # Update human intention at specified rate
         intention_update_period = 1.0 / self.cfg.human_dynamics["intention_update_rate"]
         update_mask = self.human_reaction_timer >= intention_update_period
         
         if update_mask.any():
-            # Calculate desired direction towards target
-            target_height = self.cfg.target_height
-            target_direction = torch.zeros_like(scalpel_pos)
-            target_direction[:, 2] = torch.sign(target_height - scalpel_pos[:, 2])
+            # 计算朝向目标的期望方向
+            target_pos = self.trajectory_manager.get_current_target()
+            target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
             
-            # Add human noise and preferences
+            target_direction = target_pos - end_effector_pos
+            target_direction = target_direction / (torch.norm(target_direction, dim=-1, keepdim=True) + 1e-6)
+            
+            # 添加人类噪声
             noise_std = self.cfg.human_dynamics["noise_std"]
             noise = torch.randn_like(target_direction) * noise_std
             
-            # Update intention with noise
             self.human_intention[update_mask] = (target_direction + noise)[update_mask]
             self.human_reaction_timer[update_mask] = 0.0
             
     def _update_collaboration_metrics(self) -> None:
-        """Update collaboration metrics between agents."""
+        """更新协作指标（MARL特有）"""
         human_forces = self.agent_actions["human"]
         robot_forces = self.agent_actions["robot"]
         
-        # Calculate force alignment
+        # 计算力对齐
         force_diff = torch.norm(human_forces - robot_forces, dim=-1)
         conflict_threshold = self.cfg.collaboration["conflict_threshold"]
         
-        # Update conflict counter
         conflicts = force_diff > conflict_threshold
         self.conflict_counter[conflicts] += 1
-        self.conflict_counter[~conflicts] *= 0.9  # Decay conflicts
+        self.conflict_counter[~conflicts] *= 0.9
         
-        # Update trust levels
+        # 更新信任水平
         trust_decay = self.cfg.collaboration["trust_decay"]
         trust_recovery = self.cfg.collaboration["trust_recovery"]
         
-        # Decay trust on conflicts
         self.trust_levels["human"][conflicts] *= trust_decay
         self.trust_levels["robot"][conflicts] *= trust_decay
         
-        # Recover trust on cooperation
         self.trust_levels["human"][~conflicts] *= trust_recovery
         self.trust_levels["robot"][~conflicts] *= trust_recovery
         
-        # Clamp trust levels
+        # 限制信任水平
         for agent in self.cfg.possible_agents:
             self.trust_levels[agent] = torch.clamp(self.trust_levels[agent], 0.1, 1.0)
             
+    def _update_safety_constraints(self):
+        """更新安全约束信息（与MBRL对齐）"""
+        end_effector_pos = self._get_end_effector_position()
+        self._compute_simplified_constraints(end_effector_pos)
+        
+    def _compute_simplified_constraints(self, current_positions: torch.Tensor):
+        """简化约束模型（与MBRL对齐）"""
+        constraint_center = torch.tensor([0.0, 0.15, 0.0], device=self.device)
+        constraint_radius = 0.05
+        
+        for i in range(current_positions.shape[0]):
+            pos = current_positions[i]
+            diff = pos - constraint_center
+            horizontal_dist = torch.norm(diff[:2])
+            vertical_dist = torch.abs(diff[2])
+            
+            distance_to_constraint = torch.sqrt(horizontal_dist**2 + (vertical_dist * 2)**2)
+            safety_distance = torch.clamp(distance_to_constraint - constraint_radius, min=0.0)
+            
+            if horizontal_dist > 1e-6:
+                normal = diff / torch.norm(diff)
+            else:
+                normal = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            
+            self.safety_distances[i] = safety_distance
+            self.constraint_normals[i] = normal
+            self.is_violating_constraint[i] = safety_distance < self.cfg.collision_threshold
+            
     def _apply_action(self) -> None:
-        """Apply processed actions to the environment."""
-        # Actions are already applied in _pre_physics_step
+        """应用处理过的动作"""
         pass
         
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Determine if episodes are terminated or truncated."""
-        scalpel_pos = self._scalpel.data.root_pos_w
+        """确定是否终止或截断（与MBRL对齐）"""
+        end_effector_pos = self._get_end_effector_position()
         
-        # Check for collision with constraint walls
-        collisions = self._check_collision_with_constraint(scalpel_pos)
+        # 终止条件
+        constraint_violated = self.is_violating_constraint.clone()
+        fell_out = end_effector_pos[:, 2] < -0.01
+        final_target_reached = torch.tensor([
+            self.trajectory_manager.is_final_target_reached(end_effector_pos[i])
+            for i in range(self.num_envs)
+        ], device=self.device, dtype=torch.bool)
         
-        # Check if scalpel fell too low
-        fell_out = scalpel_pos[:, 2] < -0.1
-        
-        # Termination conditions (same for both agents)
-        terminated_condition = collisions | fell_out
-        
-        # Truncation condition (episode length)
+        terminated_condition = constraint_violated | fell_out | final_target_reached
         truncated_condition = self.episode_length_buf >= self.max_episode_length - 1
         
-        # Return per-agent termination and truncation
         terminated = {agent: terminated_condition for agent in self.cfg.possible_agents}
         truncated = {agent: truncated_condition for agent in self.cfg.possible_agents}
         
         return terminated, truncated
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """Calculate rewards for each agent."""
-        scalpel_pos = self._scalpel.data.root_pos_w
-        scalpel_vel = self._scalpel.data.root_lin_vel_w
+        """计算每个智能体的奖励"""
+        end_effector_pos = self._get_end_effector_position()
+        end_effector_vel = self._get_end_effector_velocity()
+        
+        # 更新目标点
+        self.trajectory_manager.update_target(end_effector_pos)
+        target_pos = self.trajectory_manager.get_current_target()
+        target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
         
         rewards = {}
+        
+        # 基础奖励组件（与MBRL对齐）
+        position_error = end_effector_pos - target_pos
+        tracking_reward = -torch.sum(position_error**2, dim=-1)
+        velocity_penalty = -torch.sum(end_effector_vel**2, dim=-1)
+        safety_penalty = -self.safety_distances * 10.0
+        collision_penalty = self.is_violating_constraint.float() * (-1.0)
+        
+        # 任务完成奖励
+        distance_to_target = torch.norm(end_effector_pos - target_pos, dim=-1)
+        target_reached = distance_to_target < self.cfg.target_reach_threshold
+        completion_reward = target_reached.float()
+        
+        # 最终完成奖励
+        final_completion = torch.zeros(self.num_envs, device=self.device)
+        for i in range(self.num_envs):
+            if self.trajectory_manager.is_final_target_reached(end_effector_pos[i]):
+                final_completion[i] = 1.0
         
         for agent in self.cfg.possible_agents:
             reward_scales = self.cfg.reward_scales[agent]
             agent_reward = torch.zeros(self.num_envs, device=self.device)
             
-            # 1. Collision penalty
-            collisions = self._check_collision_with_constraint(scalpel_pos)
-            collision_penalty = collisions.float() * reward_scales["collision_penalty"]
-            agent_reward += collision_penalty
+            # 基础奖励
+            agent_reward += tracking_reward * reward_scales["tracking_reward"]
+            agent_reward += velocity_penalty * reward_scales["velocity_penalty"]
+            agent_reward += safety_penalty * reward_scales["safety_penalty"]
+            agent_reward += collision_penalty * reward_scales["collision_penalty"]
+            agent_reward += completion_reward * reward_scales["completion_reward"]
             
-            # 2. Distance-based reward
-            distance_reward = self._calculate_distance_reward(scalpel_pos)
-            agent_reward += distance_reward * reward_scales["distance_reward"]
+            # 控制平滑性惩罚
+            control_penalty = -torch.norm(self.agent_actions[agent], dim=-1) ** 2
+            agent_reward += control_penalty * reward_scales["control_penalty"]
             
-            # 3. Task completion reward
-            task_reward = self._calculate_task_completion_reward(scalpel_pos)
-            agent_reward += task_reward * reward_scales["task_completion"]
-            
-            # 4. Smoothness reward (agent-specific)
-            smoothness_penalty = torch.norm(self.agent_actions[agent], dim=-1) ** 2
-            agent_reward += smoothness_penalty * reward_scales["smoothness_penalty"]
-            
-            # 5. Collaboration reward
+            # 协作奖励（MARL特有）
             collaboration_reward = self._calculate_collaboration_reward(agent)
             agent_reward += collaboration_reward * reward_scales["collaboration_reward"]
             
-            # 6. Agent-specific rewards
+            # 智能体特有奖励
             if agent == "human":
-                # Human gets intention alignment reward
                 intention_reward = self._calculate_intention_alignment_reward()
                 agent_reward += intention_reward * reward_scales["intention_alignment"]
             else:  # robot
-                # Robot gets adaptation reward
                 adaptation_reward = self._calculate_adaptation_reward()
                 agent_reward += adaptation_reward * reward_scales["adaptation_reward"]
             
-            rewards[agent] = agent_reward
+            # 最终完成奖励
+            agent_reward += final_completion * 50.0
             
-        # Store reward components for logging
-        self.extras = {
-            agent: {
-                "collision_penalty": (collisions.float() * self.cfg.reward_scales[agent]["collision_penalty"]).mean(),
-                "distance_reward": (distance_reward * self.cfg.reward_scales[agent]["distance_reward"]).mean(),
-                "task_reward": (task_reward * self.cfg.reward_scales[agent]["task_completion"]).mean(),
-                "collaboration_reward": self._calculate_collaboration_reward(agent).mean(),
-                "total_reward": rewards[agent].mean(),
-                "trust_level": self.trust_levels[agent].mean(),
-            }
-            for agent in self.cfg.possible_agents
-        }
-        
+            rewards[agent] = torch.clamp(agent_reward, -100.0, 75.0)
+            
         return rewards
         
-    def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """Get observations for each agent."""
-        scalpel_pos = self._scalpel.data.root_pos_w
-        scalpel_vel = self._scalpel.data.root_lin_vel_w
-        
-        # Scale to real world for observations
-        scalpel_pos_real = scalpel_pos * self.inv_sim_scale
-        scalpel_vel_real = scalpel_vel * self.inv_sim_scale
-        
-        # Common observations
-        constraint_distances = self._calculate_constraint_distances(scalpel_pos) * self.inv_sim_scale
-        task_progress = self._calculate_task_progress(scalpel_pos_real)
-        
-        observations = {}
-        
-        for agent in self.cfg.possible_agents:
-            # Base observations (shared)
-            obs_components = [
-                scalpel_pos_real,      # 3D position
-                scalpel_vel_real,      # 3D velocity  
-                constraint_distances,  # 6D constraint distances
-                task_progress,         # 3D task progress info
-            ]
-            
-            # Agent-specific observations
-            if agent == "human":
-                # Human observes: own intention, robot actions, trust level
-                obs_components.extend([
-                    self.human_intention * self.inv_sim_scale,  # 3D human intention
-                ])
-            else:  # robot
-                # Robot observes: human actions, collaboration state, adaptation info
-                obs_components.extend([
-                    self.agent_actions["human"] * self.inv_sim_scale,  # 3D human forces
-                ])
-            
-            # Add trust and collaboration info for both agents
-            trust_info = torch.stack([
-                self.trust_levels["human"],
-                self.trust_levels["robot"],
-                self.conflict_counter * 0.1,  # Normalized conflict level
-            ], dim=-1)
-            obs_components.append(trust_info)
-            
-            # Concatenate all observations
-            obs = torch.cat(obs_components, dim=-1)
-            
-            # Print observation dimension for debugging
-            if not hasattr(self, '_obs_dim_printed'):
-                print(f"[DEBUG] {agent} observation components:")
-                for i, comp in enumerate(obs_components):
-                    print(f"  Component {i}: shape {comp.shape}")
-                print(f"  Total observation dim: {obs.shape[-1]}")
-                self._obs_dim_printed = True
-            
-            # Clamp observations for numerical stability
-            obs = torch.clamp(obs, -10.0, 10.0)
-            
-            observations[agent] = obs
-            
-        return observations
-        
-    def _get_states(self) -> torch.Tensor:
-        """Get global state for centralized training."""
-        scalpel_pos = self._scalpel.data.root_pos_w * self.inv_sim_scale
-        scalpel_vel = self._scalpel.data.root_lin_vel_w * self.inv_sim_scale
-        
-        # Global state includes all agent actions and system state
-        global_state = torch.cat([
-            scalpel_pos,                                    # 3D
-            scalpel_vel,                                    # 3D
-            self.agent_actions["human"] * self.inv_sim_scale,  # 3D
-            self.agent_actions["robot"] * self.inv_sim_scale,  # 3D
-            self.interaction_forces * self.inv_sim_scale,      # 3D
-            self.human_intention * self.inv_sim_scale,         # 3D
-            torch.stack([
-                self.trust_levels["human"],
-                self.trust_levels["robot"],
-                self.conflict_counter * 0.1,
-                self.steps_in_target.float() * 0.01,
-                self.task_completed.float(),
-                torch.zeros(self.num_envs, device=self.device),  # Padding to reach 24D
-            ], dim=-1)  # 6D
-        ], dim=-1)
-        
-        return global_state
-        
-    def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments."""
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-            
-        super()._reset_idx(env_ids)
-        
-        # Reset scalpel to random starting position
-        scalpel_pos = torch.zeros((len(env_ids), 3), device=self.device)
-        scalpel_pos[:, 0] = sample_uniform(-0.05, 0.05, (len(env_ids),), self.device)  # ±50mm in X
-        scalpel_pos[:, 1] = sample_uniform(-0.05, 0.05, (len(env_ids),), self.device)  # ±50mm in Y  
-        scalpel_pos[:, 2] = sample_uniform(0.15, 0.25, (len(env_ids),), self.device)   # 150-250mm in Z
-        
-        # Reset velocity
-        scalpel_vel = torch.zeros((len(env_ids), 3), device=self.device)
-        
-        # Apply reset
-        self._scalpel.write_root_pose_to_sim(
-            root_pose=torch.cat([scalpel_pos, torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(len(env_ids), 1)], dim=-1),
-            env_ids=env_ids
-        )
-        self._scalpel.write_root_velocity_to_sim(
-            root_velocity=torch.cat([scalpel_vel, torch.zeros_like(scalpel_vel)], dim=-1),
-            env_ids=env_ids
-        )
-        
-        # Reset agent tracking variables
-        for agent in self.cfg.possible_agents:
-            self.agent_actions[agent][env_ids] = 0.0
-            self.force_history[agent][env_ids] = 0.0
-            self.trust_levels[agent][env_ids] = self.cfg.collaboration["trust_factor"]
-        
-        # Reset task tracking
-        self.task_completed[env_ids] = False
-        self.steps_in_target[env_ids] = 0
-        self.partial_completion_achieved[env_ids] = False
-        self.conflict_counter[env_ids] = 0.0
-        
-        # Reset human simulation
-        self.human_intention[env_ids] = 0.0
-        self.human_reaction_timer[env_ids] = 0.0
-        self.interaction_forces[env_ids] = 0.0
-        
-    # Helper methods (same as single agent but adapted for MARL)
-    def _check_collision_with_constraint(self, scalpel_pos: torch.Tensor) -> torch.Tensor:
-        """Check if scalpel collides with constraint walls."""
-        x, y, z = scalpel_pos[:, 0], scalpel_pos[:, 1], scalpel_pos[:, 2]
-        radial_dist = torch.sqrt(x**2 + y**2)
-        
-        # Calculate inner radius at current height
-        height_ratio = torch.clamp(z / self.cfg.constraint_height, 0.0, 1.0)
-        inner_radius_at_z = (
-            self.cfg.constraint_inner_radius_min + 
-            height_ratio * (self.cfg.constraint_inner_radius_max - self.cfg.constraint_inner_radius_min)
-        )
-        
-        sphere_radius = 0.02  # 20mm sphere radius
-        
-        # Collision conditions
-        inside_collision = radial_dist < (inner_radius_at_z - sphere_radius)
-        below_collision = z < -sphere_radius
-        above_collision = z > (self.cfg.constraint_height + sphere_radius)
-        
-        return inside_collision | below_collision | above_collision
-        
-    def _calculate_distance_reward(self, scalpel_pos: torch.Tensor) -> torch.Tensor:
-        """Calculate reward based on distance to target region."""
-        target_z = self.cfg.target_height
-        z_distance = torch.abs(scalpel_pos[:, 2] - target_z)
-        distance_reward = torch.exp(-z_distance * 10.0)
-        return distance_reward
-        
-    def _calculate_task_completion_reward(self, scalpel_pos: torch.Tensor) -> torch.Tensor:
-        """Calculate reward for task completion with progressive rewards."""
-        target_z = self.cfg.target_height
-        target_radius = self.cfg.task_completion["target_radius"]
-        
-        # Check if in target region
-        in_target = torch.abs(scalpel_pos[:, 2] - target_z) < target_radius
-        
-        # Update step counter
-        self.steps_in_target[in_target] += 1
-        self.steps_in_target[~in_target] = 0
-        
-        # Progressive completion rewards
-        task_reward = torch.zeros(self.num_envs, device=self.device)
-        
-        for i, (steps, reward) in enumerate(zip(
-            self.cfg.task_completion["partial_completion_steps"],
-            self.cfg.task_completion["partial_completion_rewards"]
-        )):
-            newly_achieved = (self.steps_in_target >= steps) & (~self.partial_completion_achieved[:, i])
-            task_reward[newly_achieved] += reward
-            self.partial_completion_achieved[newly_achieved, i] = True
-        
-        # Final completion
-        completion_steps = self.cfg.task_completion["completion_time"]
-        newly_completed = (self.steps_in_target >= completion_steps) & (~self.task_completed)
-        self.task_completed |= newly_completed
-        task_reward[newly_completed] += self.cfg.task_completion["max_completion_bonus"]
-        
-        # Small continuous reward for being in target
-        task_reward[in_target] += 1.0
-        
-        return task_reward
-        
     def _calculate_collaboration_reward(self, agent: str) -> torch.Tensor:
-        """Calculate collaboration reward for specific agent."""
+        """计算协作奖励"""
         human_forces = self.agent_actions["human"]
         robot_forces = self.agent_actions["robot"]
         
-        # Force alignment reward
+        # 力对齐奖励
         force_alignment = -torch.norm(human_forces - robot_forces, dim=-1)
         alignment_reward = torch.exp(force_alignment * 0.5)
         
-        # Trust-based reward
+        # 信任奖励
         trust_reward = self.trust_levels[agent] * 2.0
         
-        # Conflict penalty
-        conflict_penalty = -self.conflict_counter * 0.1
-        
-        collaboration_reward = alignment_reward + trust_reward + conflict_penalty
-        
-        return collaboration_reward
+        return alignment_reward + trust_reward
         
     def _calculate_intention_alignment_reward(self) -> torch.Tensor:
-        """Calculate reward for human intention alignment (human agent specific)."""
-        # Measure how well robot actions align with human intentions
+        """计算意图对齐奖励（人类特有）"""
         human_intent = self.human_intention
         robot_actions = self.agent_actions["robot"]
         
-        # Normalize vectors
         intent_norm = torch.norm(human_intent, dim=-1, keepdim=True) + 1e-6
         action_norm = torch.norm(robot_actions, dim=-1, keepdim=True) + 1e-6
         
         intent_normalized = human_intent / intent_norm
         action_normalized = robot_actions / action_norm
         
-        # Calculate alignment (dot product)
         alignment = torch.sum(intent_normalized * action_normalized, dim=-1)
-        alignment_reward = torch.clamp(alignment, 0.0, 1.0) * 2.0
-        
-        return alignment_reward
+        return torch.clamp(alignment, 0.0, 1.0) * 2.0
         
     def _calculate_adaptation_reward(self) -> torch.Tensor:
-        """Calculate adaptation reward (robot agent specific)."""
-        # Reward robot for adapting to human behavior
+        """计算适应性奖励（机器人特有）"""
         human_forces = self.agent_actions["human"]
         robot_forces = self.agent_actions["robot"]
         
-        # Calculate adaptation metric based on force history
-        human_history = self.force_history["human"]
-        robot_history = self.force_history["robot"]
-        
-        # Measure how robot adjusts to human patterns
-        human_variance = torch.var(human_history, dim=1).mean(dim=-1)
         robot_adaptation = torch.norm(robot_forces - human_forces, dim=-1)
+        return torch.exp(-robot_adaptation * 0.5)
         
-        # Lower adaptation distance when human is consistent = better
-        adaptation_reward = torch.exp(-robot_adaptation * 0.5) * (1.0 + human_variance)
+    def _get_observations(self) -> Dict[str, torch.Tensor]:
+        """获取智能体观测"""
+        end_effector_pos = self._get_end_effector_position()
+        end_effector_vel = self._get_end_effector_velocity()
         
-        return adaptation_reward
+        # 更新目标点
+        self.trajectory_manager.update_target(end_effector_pos)
+        target_pos = self.trajectory_manager.get_current_target()
+        target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
         
-    def _calculate_constraint_distances(self, scalpel_pos: torch.Tensor) -> torch.Tensor:
-        """Calculate distances to constraint boundaries."""
-        x, y, z = scalpel_pos[:, 0], scalpel_pos[:, 1], scalpel_pos[:, 2]
-        radial_dist = torch.sqrt(x**2 + y**2)
+        # 约束距离（与MBRL对齐）
+        constraint_distances = self._calculate_constraint_distances(end_effector_pos)
         
-        # Calculate inner radius at current height
-        height_ratio = torch.clamp(z / self.cfg.constraint_height, 0.0, 1.0)
-        inner_radius_at_z = (
-            self.cfg.constraint_inner_radius_min + 
-            height_ratio * (self.cfg.constraint_inner_radius_max - self.cfg.constraint_inner_radius_min)
-        )
+        observations = {}
         
-        # Distance measurements
-        dist_to_inner_wall = radial_dist - inner_radius_at_z
-        dist_to_bottom = z
-        dist_to_top = self.cfg.constraint_height - z
-        dist_to_center_xy = radial_dist
-        dist_to_target_z = torch.abs(z - self.cfg.target_height)
-        dist_to_axis = radial_dist
+        for agent in self.cfg.possible_agents:
+            # 基础观测（与MBRL对齐）：12D
+            base_obs = torch.cat([
+                end_effector_pos,      # 3D 位置
+                end_effector_vel,      # 3D 速度  
+                target_pos,            # 3D 目标位置
+                constraint_distances,  # 3D 约束距离（简化）
+            ], dim=-1)
+            
+            # 智能体特有观测：6D
+            if agent == "human":
+                # 人类观测：自身意图 + 信任信息
+                trust_info = torch.stack([
+                    self.trust_levels["human"],
+                    self.trust_levels["robot"],
+                    self.conflict_counter * 0.1,
+                ], dim=-1)
+                
+                agent_specific_obs = torch.cat([
+                    self.human_intention,  # 3D 人类意图
+                    trust_info,           # 3D 信任信息
+                ], dim=-1)
+                
+            else:  # robot
+                # 机器人观测：人类动作 + 信任信息
+                trust_info = torch.stack([
+                    self.trust_levels["human"],
+                    self.trust_levels["robot"],
+                    self.conflict_counter * 0.1,
+                ], dim=-1)
+                
+                agent_specific_obs = torch.cat([
+                    self.agent_actions["human"],  # 3D 人类力
+                    trust_info,                   # 3D 信任信息
+                ], dim=-1)
+            
+            # 完整观测：基础12D + 特有6D = 18D
+            obs = torch.cat([base_obs, agent_specific_obs], dim=-1)
+            obs = torch.clamp(obs, -10.0, 10.0)
+            observations[agent] = obs
+            
+        return observations
+        
+    def _calculate_constraint_distances(self, end_effector_pos: torch.Tensor) -> torch.Tensor:
+        """计算约束距离（简化为3D）"""
+        x, y, z = end_effector_pos[:, 0], end_effector_pos[:, 1], end_effector_pos[:, 2]
+        
+        # 与约束中心的距离
+        constraint_center = torch.tensor([0.0, 0.15, 0.0], device=self.device)
+        distance_to_center = torch.norm(end_effector_pos[:, :2] - constraint_center[:2].unsqueeze(0), dim=-1)
+        
+        # 到目标高度的距离
+        target_pos = self.trajectory_manager.get_current_target()
+        distance_to_target_z = torch.abs(end_effector_pos[:, 2] - target_pos[2])
+        
+        # 安全距离
+        safety_distance = self.safety_distances
         
         return torch.stack([
-            dist_to_inner_wall,
-            dist_to_bottom, 
-            dist_to_top,
-            dist_to_center_xy,
-            dist_to_target_z,
-            dist_to_axis
+            distance_to_center,
+            distance_to_target_z,
+            safety_distance
         ], dim=-1)
         
-    def _calculate_task_progress(self, scalpel_pos_real: torch.Tensor) -> torch.Tensor:
-        """Calculate task progress information."""
-        target_height_real = self.cfg.target_height * self.inv_sim_scale
+    def _get_states(self) -> torch.Tensor:
+        """获取全局状态（用于集中式训练）"""
+        end_effector_pos = self._get_end_effector_position()
+        end_effector_vel = self._get_end_effector_velocity()
         
-        # Progress metrics
-        height_progress = 1.0 - torch.abs(scalpel_pos_real[:, 2] - target_height_real) / 0.2  # Normalized
-        height_progress = torch.clamp(height_progress, 0.0, 1.0)
+        target_pos = self.trajectory_manager.get_current_target()
+        target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
         
-        # Completion progress
-        completion_progress = self.steps_in_target.float() / self.cfg.task_completion["completion_time"]
-        completion_progress = torch.clamp(completion_progress, 0.0, 1.0)
+        # 全局状态：24D
+        global_state = torch.cat([
+            end_effector_pos,                     # 3D 位置
+            end_effector_vel,                     # 3D 速度
+            target_pos,                           # 3D 目标位置
+            self.agent_actions["human"],          # 3D 人类力
+            self.agent_actions["robot"],          # 3D 机器人力
+            self.combined_forces,                 # 3D 合成力
+            self.human_intention,                 # 3D 人类意图
+            torch.stack([
+                self.trust_levels["human"],
+                self.trust_levels["robot"],
+                self.conflict_counter * 0.1,
+            ], dim=-1)  # 3D 协作状态
+        ], dim=-1)
         
-        # Overall task status
-        task_status = self.task_completed.float()
+        return global_state
         
-        return torch.stack([height_progress, completion_progress, task_status], dim=-1)
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        """重置指定环境"""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            
+        super()._reset_idx(env_ids)
+        
+        num_resets = len(env_ids)
+        
+        # 设置初始关节位置以到达起始位置 [-0.2, 0.15, 0.03]（与MBRL对齐）
+        joint_pos = torch.zeros((num_resets, 6), device=self.device)
+        joint_pos[:, 0] = 0.0   # waist
+        joint_pos[:, 1] = 0.0   # shoulder  
+        joint_pos[:, 2] = 0.0   # elbow
+        joint_pos[:, 3] = 4.0   # yaw
+        joint_pos[:, 4] = 1.2   # pitch - stylus upright
+        joint_pos[:, 5] = 0.0   # roll
+        
+        # 添加小噪声
+        joint_noise = sample_uniform(-0.1, 0.1, (num_resets, 6), self.device)
+        joint_pos += joint_noise
+        
+        joint_vel = torch.zeros((num_resets, 6), device=self.device)
+        
+        self._omni_robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        
+        # 重置智能体跟踪变量
+        for agent in self.cfg.possible_agents:
+            self.agent_actions[agent][env_ids] = 0.0
+            self.trust_levels[agent][env_ids] = self.cfg.collaboration["trust_factor"]
+        
+        # 重置任务跟踪
+        self.task_completed[env_ids] = False
+        self.steps_in_target[env_ids] = 0
+        self.conflict_counter[env_ids] = 0.0
+        
+        # 重置人类仿真
+        self.human_intention[env_ids] = 0.0
+        self.human_reaction_timer[env_ids] = 0.0
+        self.combined_forces[env_ids] = 0.0
+        
+        # 重置约束相关
+        self.safety_distances[env_ids] = 0.0
+        self.constraint_normals[env_ids] = 0.0
+        self.is_violating_constraint[env_ids] = False
+        
+        # 重置轨迹管理器
+        self.trajectory_manager.reset_trajectory()
+        
+    def _get_end_effector_position(self):
+        """获取末端执行器位置"""
+        return self._omni_robot.data.body_link_state_w[..., self.cfg.end_effector_body_id, :3]
+        
+    def _get_end_effector_velocity(self):
+        """获取末端执行器线速度"""
+        return self._omni_robot.data.body_link_state_w[..., self.cfg.end_effector_body_id, 7:10]
