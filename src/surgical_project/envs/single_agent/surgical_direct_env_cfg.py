@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Paper-aligned surgical direct environment configuration - including Omni haptic device"""
+"""Updated surgical direct environment configuration with 21D observation space"""
 
 from __future__ import annotations
 
@@ -12,13 +12,13 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
-from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import AssetBaseCfg
 
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
-    """Simplified scene configuration containing only basic elements"""
+    """Scene configuration containing only basic elements"""
     
     # ground plane
     ground = AssetBaseCfg(
@@ -29,25 +29,27 @@ class MySceneCfg(InteractiveSceneCfg):
     # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=5000.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
 
 @configclass
 class SurgicalDirectEnvCfg(DirectRLEnvCfg):
-    """Paper-aligned surgical direct environment configuration - using Omni haptic device"""
+    """Updated surgical direct environment configuration with 21D observation space"""
     
-    # Environment settings
+    # Environment basic structure (updated observation space)
     episode_length_s = 8.0  
     decimation = 2  
-    action_space = 3  # xyz forces in Cartesian space for robot
-    observation_space = 12  # Simplified observation space: position(3) + velocity(3) + target position(3) + padding(3)
-    state_space = 9  # Paper standard state: z = [x, ẋ, f]^T ∈ R^9
+    action_space = 3  # xyz forces in Cartesian space
+    observation_space = 21  # [x, ẋ, q, q̇, f] = 21D (updated from 12D)
+    state_space = 9  # z = [x, ẋ, f]^T ∈ R^9
     
-    # Simulation settings
+    # Simulation physics settings only
     sim: SimulationCfg = SimulationCfg(
+        device="cuda:0",
         dt=1 / 120,  # 120 Hz simulation
         render_interval=decimation,
+        gravity=(0.0, 0.0, 0.0),  # Disable gravity
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply", 
@@ -60,59 +62,34 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
     # Scene settings
     scene: InteractiveSceneCfg = MySceneCfg(num_envs=1, env_spacing=4.0, replicate_physics=True)
     
-    # Omni haptic device
+    # Phantom Omni robot hardware configuration
     phantom_omni = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UrdfFileCfg(
+        spawn=sim_utils.UsdFileCfg(
+            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/omni.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
+                max_linear_velocity=50.0,
+                max_angular_velocity=50.0,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
-                solver_position_iteration_count=100,
-                solver_velocity_iteration_count=100,
-                sleep_threshold=0.01,
-                stabilization_threshold=0.01,
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=8,
+                sleep_threshold=0.0,
+                stabilization_threshold=0.0,
                 fix_root_link=True
             ),
-            scale=(1, 1, 1),
-            asset_path='/home/zzh/workspace/surgical_robot_project/assets/models/urdf/omni.urdf',
-            usd_dir='/home/zzh/workspace/surgical_robot_project/assets/models/usd',
-            joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-                gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
-                    stiffness={
-                        "waist": 1,    
-                        "shoulder": 1,
-                        "elbow": 1,
-                        "yaw": 10000,      
-                        "pitch": 10000,    
-                        "roll": 10000,     
-                    }, 
-                    damping={
-                        "waist": 0.1,
-                        "shoulder": 0.1,
-                        "elbow": 0.1,
-                        "yaw": 1000,       
-                        "pitch": 1000,     
-                        "roll": 1000,      
-                    },
-                ),
-                drive_type="acceleration",
-                target_type="position"
-            ),
-            fix_base=True,
-            root_link_name='base',
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0, 0, 0),
             rot=(1, 0.0, 0.0, 0.0),
             joint_pos={
-                "waist": 0.0,
+                "waist": -0.96,
                 "shoulder": 0.0,
-                "elbow": 0.0,
-                "yaw": 4.0,
-                "pitch": 1.2,
+                "elbow": 1.0,
+                "yaw": 0.0,
+                "pitch": 2.0944,  # 120 degrees in radians
                 "roll": 0.0,
             },
             joint_vel={
@@ -125,7 +102,7 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
             },
         ),
         actuators={
-            "arm_joints": IdealPDActuatorCfg(
+            "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=[
                     "waist", 
                     "shoulder", 
@@ -134,27 +111,32 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
                     "pitch", 
                     "roll"
                 ],
+                effort_limit_sim=5.0,
+                velocity_limit_sim=50.0,
+                # Damping ratio formula: K = m × f², D = 2 × r × f × m
+                # First 3 joints: f=50Hz, r=0.7, m=0.001 → K=0.25, D=0.07
+                # Last 3 joints: f=200Hz, r=1.0, m=0.001 → K=40.0, D=0.4
                 stiffness={
-                    "waist": 1,    
-                    "shoulder": 1,
-                    "elbow": 1,
-                    "yaw": 10000,
-                    "pitch": 10000,
-                    "roll": 10000,
+                    "waist": 0.25,      # Low stiffness for external force response
+                    "shoulder": 0.25,
+                    "elbow": 0.25,
+                    "yaw": 0.0,        # High stiffness for fixed orientation
+                    "pitch": 0.0,
+                    "roll": 0.0,
                 },
                 damping={
-                    "waist": 0.1,
-                    "shoulder": 0.1,
-                    "elbow": 0.1,
-                    "yaw": 1000,
-                    "pitch": 1000,
-                    "roll": 1000,
+                    "waist": 0.07,      # Moderate damping
+                    "shoulder": 0.07,
+                    "elbow": 0.07,
+                    "yaw": 0.4,         # High damping for stability
+                    "pitch": 0.4,
+                    "roll": 0.4,
                 },
             ),
         },
     )
 
-    # Constraint configuration
+    # Constraint geometry configuration
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
@@ -166,26 +148,14 @@ class SurgicalDirectEnvCfg(DirectRLEnvCfg):
             scale=(0.01, 0.01, 0.015),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.15, 0.0),
+            pos=(0.2, 0.0, 0.0),  # Position
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
     
-    # Force and control parameters
-    max_robot_force = 3.3
-    max_human_force = 3.3
-    force_scale = 1.0  
-    
-    # End effector parameters
-    end_effector_body_name = "stylus"
-    end_effector_body_id = 6
-    
-    # Trajectory parameters - distance-based target switching
-    target_reach_threshold = 0.01  # Target point reach threshold
-    
-    # Physics simulation parameters
-    physics_dt = 1/120
-    render_dt = 1/60
-    solver_iterations = 4
-    solver_velocity_iterations = 1
-    use_gpu_physics = True
+    # Physics simulation settings (performance only)
+    physics_dt = 1/120              # Physics time step
+    render_dt = 1/60                # Rendering time step
+    solver_iterations = 16          # Physics solver iterations
+    solver_velocity_iterations = 8  # Physics solver velocity iterations
+    use_gpu_physics = True          # Enable GPU physics acceleration

@@ -8,7 +8,7 @@
 from .actor_critic import (
     SurgicalActor,
     SurgicalCritic,
-    DynamicsIdentifierNetwork,
+    DynamicsIdentifier,
     SurgicalActorCritic,
 )
 
@@ -21,7 +21,7 @@ __all__ = [
     # Actor-Critic network components
     "SurgicalActor",
     "SurgicalCritic", 
-    "DynamicsIdentifierNetwork",
+    "DynamicsIdentifier",
     "SurgicalActorCritic",
     # Main trainer
     "SharedControlTrainer",

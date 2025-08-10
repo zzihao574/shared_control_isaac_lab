@@ -1,20 +1,15 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""Multi-Agent Reinforcement Learning algorithms for surgical robot control"""
 
-"""Multi-agent reinforcement learning algorithms for surgical training."""
-
-# Import PyTorch MADDPG components
-from .replay_buffer import ReplayBuffer
-from .maddpg_agent import MADDPGAgent, Actor, Critic
-from .maddpg_trainer import MADDPGTrainer
+from .maddpg import MADDPG
+from .ddpg_agent import DDPGAgent
+from .replay_buffer import MultiAgentReplayBuffer
+from .networks import Actor, Critic, OrnsteinUhlenbeckNoise
 
 __all__ = [
-    # Core MADDPG components
-    "ReplayBuffer",
-    "MADDPGAgent", 
-    "Actor",
-    "Critic",
-    "MADDPGTrainer",
+    'MADDPG',
+    'DDPGAgent', 
+    'MultiAgentReplayBuffer',
+    'Actor',
+    'Critic',
+    'OrnsteinUhlenbeckNoise'
 ]

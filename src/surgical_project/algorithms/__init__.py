@@ -7,16 +7,16 @@
 # Import from MBRL module
 from .mbrl import (
     SurgicalActor,
-    SurgicalCritic, 
-    DynamicsIdentifierNetwork,
+    SurgicalCritic,
+    DynamicsIdentifier,
     SurgicalActorCritic,
     SharedControlTrainer,
 )
 
 __all__ = [
     "SurgicalActor",
-    "SurgicalCritic", 
-    "DynamicsIdentifierNetwork",
+    "SurgicalCritic",
+    "DynamicsIdentifier",
     "SurgicalActorCritic",
     "SharedControlTrainer",
 ]

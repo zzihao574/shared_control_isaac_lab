@@ -1,30 +1,79 @@
-# Training parameters for Surgical Human-Robot MARL with MADDPG
-# 与MBRL环境对齐的物理参数，保持MARL特有的协作机制
+# Training parameters for Surgical Human-Robot MARL - 修复版本
 
-env_config:
-  # Environment settings (与MBRL对齐)
-  env_name: "surgical_direct_marl"
-  num_envs: 512
-  episode_length_s: 8.0  # 与MBRL统一
-  
-  # Multi-agent settings
-  agents: ["human", "robot"]
-  centralized_critic: true
-  parameter_sharing: false
-  
-  # Observation and action spaces (更新为实际维度)
-  observation_spaces:
-    human: 18  # 基础12D + 人类特有6D
-    robot: 18  # 基础12D + 机器人特有6D
-  action_spaces:
-    human: 3   # xyz forces
-    robot: 3   # xyz forces
-  state_space: 24  # 全局状态
+# Trajectory parameters
+trajectory:
+  start_point: [0.14, -0.2, 0.03]
+  end_point: [0.14, 0.2, 0.03]
+  setpoint_interval: 0.03
+  switch_threshold: 0.0075
+  total_distance: 0.4
 
-# MADDPG配置
+# Constraints
+constraints:
+  max_cartesian_velocity: 0.08
+  min_z_position: 0.0
+  max_robot_force: 3.3
+  max_human_force: 3.3
+  
+  # Joint limits
+  joint_limits:
+    waist: [-0.98, 0.98]
+    shoulder: [0.0, 1.75]
+    elbow: [-0.7854, 1.5]
+    yaw: [-1.5, 1.5]
+    pitch: [0.0, 2.5]
+    roll: [-2.58, 2.58]
+
+# Initial conditions
+initial_conditions:
+  joint_positions:
+    waist: -0.96
+    shoulder: 0.0
+    elbow: 1.0
+    yaw: 0.0
+    pitch: 2.0944
+    roll: 0.0
+
+# Constraint geometry
+constraint_geometry:
+  center: [0.14, 0.0, 0.0]
+  collision_threshold: 0.001
+  y_range_positive: [0.038, 0.048]
+  y_range_negative: [-0.048, -0.038]
+
+# Reward parameters
+reward_parameters:
+  robot_weights:
+    position_tracking: 100.0
+    velocity_regulation: 0.1
+    obstacle_distance: 50.0
+    control_input: 0.01
+    
+  human_weights:
+    position_tracking: 80.0
+    velocity_regulation: 0.2
+    obstacle_distance: 30.0
+    force_input: 0.05
+    
+  collaboration_parameters:
+    force_conflict_threshold: 2.0
+    conflict_penalty_scale: -5.0
+    
+  completion_reward: 100.0
+  collision_penalty: -1000.0
+  completion_threshold: 0.01
+  
+  cbf_parameters:
+    safety_margin: 0.01
+    gamma: 10.0
+    epsilon: 0.000001  # 修复：使用标准小数而不是科学记数法
+
+# MADDPG配置 - 修复数值格式
 maddpg_config:
-  # 网络参数
-  lr: 0.01
+  # 网络参数 - 使用标准小数格式避免字符串问题
+  lr: 0.001                # 修复：使用0.001而不是1e-3
+  lr_actor: 0.001          # 修复：使用0.001而不是1e-3
+  lr_critic: 0.001         # 修复：使用0.001而不是1e-3
   gamma: 0.95
   batch_size: 1024
   num_units: 64
@@ -33,119 +82,42 @@ maddpg_config:
   num_episodes: 25000
   max_episode_len: 500
   save_rate: 1000
+  update_interval: 100
+  min_buffer_size: 4096
   
   # 探索参数
   exploration_noise: 0.1
+  noise_decay: 0.995
+  min_noise: 0.01
   
   # 网络更新参数
-  tau: 0.01  # 软更新参数
-  max_replay_buffer_len: 25600  # batch_size * 25
+  tau: 0.01
+  max_replay_buffer_len: 25600
+  
+  # 学习率调度
+  lr_schedule:
+    enabled: false
+    decay_rate: 0.99
+    decay_steps: 1000
+
+# Environment config
+env_config:
+  num_envs: 512
+  episode_length_s: 8.0
+  agents: ["human", "robot"]
+  centralized_critic: true
+  parameter_sharing: false
 
 # Agent-specific configurations
 agent_configs:
   human:
-    # 人类智能体配置
-    local_q_func: true   # 使用局部Q函数
+    local_q_func: true
     exploration_noise: 0.1
-    
-    # 人类特有奖励权重
-    reward_weights:
-      tracking_reward: 100.0
-      velocity_penalty: -0.01
-      control_penalty: -0.001
-      safety_penalty: -10.0
-      collision_penalty: -50.0
-      completion_reward: 20.0
-      collaboration_reward: 2.0
-      intention_alignment: 1.5
       
   robot:
-    # 机器人智能体配置
-    local_q_func: false  # 使用全局Q函数
+    local_q_func: false
     exploration_noise: 0.1
-    
-    # 机器人特有奖励权重
-    reward_weights:
-      tracking_reward: 100.0
-      velocity_penalty: -0.01
-      control_penalty: -0.001
-      safety_penalty: -10.0
-      collision_penalty: -50.0
-      completion_reward: 20.0
-      collaboration_reward: 2.0
-      adaptation_reward: 1.5
 
-# Environment specific parameters (与MBRL对齐)
-env_specific:
-  # 力参数
-  max_forces:
-    human: 3.3
-    robot: 3.3
-    
-  # 协作参数 (MARL特有)
-  force_sharing_ratio:
-    human: 0.6
-    robot: 0.4
-    
-  interaction_coupling: 0.3
-  
-  # 信任和协作 (MARL特有)
-  trust_parameters:
-    initial_trust: 0.8
-    trust_decay: 0.95
-    trust_recovery: 1.02
-    conflict_threshold: 2.0
-    
-  # 人类动力学参数 (与MBRL对齐)
-  human_dynamics:
-    stiffness: 201.0
-    damping: 21.0
-    noise_std: 0.1
-    reaction_delay: 0.05
-    intention_update_rate: 10.0
-    
-  # 轨迹参数 (与MBRL对齐)
-  trajectory:
-    target_points:
-      - [-0.2, 0.15, 0.03]  # 起始平衡点
-      - [0.2, 0.15, 0.03]   # 目标平衡点
-    target_reach_threshold: 0.01
-    
-  # 约束参数 (与MBRL对齐)
-  constraints:
-    collision_threshold: 0.001
-    constraint_center: [0.0, 0.15, 0.0]
-    constraint_radius: 0.05
-    
-  # 任务完成参数 (与MBRL对齐)
-  task_completion:
-    target_radius: 0.01
-    completion_time: 50
-    max_completion_bonus: 100.0
-
-# Training schedule
-training:
-  total_episodes: 25000
-  checkpoint_interval: 1000
-  evaluation_interval: 1000
-  
-  # 课程学习 (可选)
-  curriculum:
-    enabled: false
-
-# Logging and monitoring
-logging:
-  log_frequency: 100
-  save_training_curves: true
-  
-  custom_metrics:
-    - "trust_levels"
-    - "collaboration_quality" 
-    - "task_completion_rate"
-    - "conflict_frequency"
-    - "force_alignment"
-    - "trajectory_progress"
-    
 # Hardware settings
 hardware:
   device: "cuda"

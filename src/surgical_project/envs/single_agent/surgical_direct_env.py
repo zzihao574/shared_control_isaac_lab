@@ -1,136 +1,164 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""Paper-aligned surgical direct environment - using Omni haptic device human-robot shared control, integrating CBF constraints"""
+"""Surgical direct environment - Y-axis linear movement with optimized state management"""
 
 from __future__ import annotations
 
 import torch
 import numpy as np
-from typing import Any
+import yaml
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject, Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.utils.math import sample_uniform
+from isaaclab.utils.math import sample_uniform, quat_rotate_inverse
 
 from .surgical_direct_env_cfg import SurgicalDirectEnvCfg
 
 
-class TrajectoryManager:
-    """Trajectory manager - distance-based target point switching (non-time driven)"""
-    
-    def __init__(self, device: torch.device, target_points: list, reach_threshold: float = 0.01):
-        self.device = device
-        self.target_points = [torch.tensor(point, device=device, dtype=torch.float32) for point in target_points]
-        self.reach_threshold = reach_threshold
-        self.current_target_index = 0
-        
-        print(f"[INFO] Trajectory manager initialized with {len(self.target_points)} target points")
-        print(f"  Target points: {target_points}")
-        print(f"  Reach threshold: {reach_threshold}")
-        
-    def get_current_target(self) -> torch.Tensor:
-        """Get current target point"""
-        return self.target_points[self.current_target_index]
-        
-    def update_target(self, current_pos: torch.Tensor) -> bool:
-        """Update target point based on current position, return whether target was switched"""
-        current_target = self.target_points[self.current_target_index]
-        
-        # Calculate distance to current target
-        if current_pos.dim() > 1:
-            # Batch processing case, take position of first environment
-            distance = torch.norm(current_pos[0] - current_target)
-        else:
-            distance = torch.norm(current_pos - current_target)
-        
-        # If reached current target and there's a next target
-        if distance < self.reach_threshold and self.current_target_index < len(self.target_points) - 1:
-            self.current_target_index += 1
-            print(f"[INFO] Switched to target {self.current_target_index}: {self.target_points[self.current_target_index]}")
-            return True
-        
-        return False
-        
-    def reset_trajectory(self):
-        """Reset trajectory to starting point"""
-        self.current_target_index = 0
-        
-    def get_progress(self) -> float:
-        """Get trajectory progress (0-1)"""
-        return self.current_target_index / max(1, len(self.target_points) - 1)
-        
-    def is_final_target_reached(self, current_pos: torch.Tensor) -> bool:
-        """Check if final target point is reached"""
-        if self.current_target_index < len(self.target_points) - 1:
-            return False
-            
-        final_target = self.target_points[-1]
-        if current_pos.dim() > 1:
-            distance = torch.norm(current_pos[0] - final_target)
-        else:
-            distance = torch.norm(current_pos - final_target)
-            
-        return distance < self.reach_threshold
-
-
 class SurgicalDirectEnv(DirectRLEnv):
-    """Paper-aligned surgical direct environment - human-robot shared control"""
+    """Surgical environment: Y-axis movement (0.14,-0.2,0.03) → (0.14,0.2,0.03)"""
     
     cfg: SurgicalDirectEnvCfg
     
-    def __init__(self, cfg: SurgicalDirectEnvCfg, render_mode: str | None = None, **kwargs):
-        """Initialize surgical environment"""
+    def __init__(self, cfg: SurgicalDirectEnvCfg, render_mode: str | None = None, 
+                 training_params_path: str = None, **kwargs):
+        # Initialize body indices before calling super().__init__
+        self.stylus_body_idx = None
+        
+        # Load parameters BEFORE super().__init__ since _setup_scene needs them
+        self.params = self._load_training_params(training_params_path)
+        self.dt = cfg.sim.dt * cfg.decimation
+        
+        # Initialize parameters needed by _setup_scene
+        self._load_yaml_parameters(cfg)
+        
+        # Now call super().__init__ which will call _setup_scene
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Get physics query interface (for constraint computation)
+        # Physics interfaces
         try:
             from omni.physx.bindings._physx import acquire_physx_attachment_interface, acquire_physx_scene_query_interface
-            self.physics_attachment_interface = acquire_physx_attachment_interface()
-            self.physics_scene_query_interface = acquire_physx_scene_query_interface()
+            self.physics_attachment = acquire_physx_attachment_interface()
+            self.physics_scene_query = acquire_physx_scene_query_interface()
         except ImportError:
-            print("[WARNING] Physics query interfaces not available, using simplified constraint model")
-            self.physics_attachment_interface = None
-            self.physics_scene_query_interface = None
+            self.physics_attachment = None
+            self.physics_scene_query = None
         
-        # Time step
-        self.dt = self.cfg.sim.dt * self.cfg.decimation
+        # Initialize trajectory and state variables after scene is created
+        self._init_trajectory()
+        self._init_state_variables()
         
-        # Initialize tracking variables
-        self.previous_robot_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
-        self.human_forces = torch.zeros(self.num_envs, 3, device=self.device)
-        self.robot_forces = torch.zeros(self.num_envs, 3, device=self.device)
-        self.total_interaction_forces = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        # CBF constraint related variables (renamed for better understanding)
-        self.safety_distances = torch.zeros(self.num_envs, device=self.device)
-        self.constraint_normals = torch.zeros(self.num_envs, 3, device=self.device)
-        self.closest_constraint_points = torch.zeros(self.num_envs, 3, device=self.device)
-        self.is_violating_constraint = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        
-        # Trajectory manager - using paper required two equilibrium points
-        target_points = [
-            (-0.2, 0.15, 0.03),    # First equilibrium point (start)
-            (0.2, 0.15, 0.03)      # Second equilibrium point (end)
-        ]
-        self.trajectory_manager = TrajectoryManager(
-            device=self.device,
-            target_points=target_points,
-            reach_threshold=self.cfg.target_reach_threshold
-        )
-        
-        # End effector parameters
-        self.end_effector_body_id = self.cfg.end_effector_body_id
+        # Manual call to _post_init to ensure stylus index is set
+        if hasattr(self, '_omni_robot'):
+            self._post_init()
         
         print(f"[INFO] Surgical environment initialized:")
-        print(f"  - Num envs: {self.num_envs}")
-        print(f"  - Observation space: {self.cfg.observation_space}D") 
-        print(f"  - Action space: {self.cfg.action_space}D")
-        print(f"  - End effector body ID: {self.end_effector_body_id}")
-        print(f"  - Target-based trajectory with {len(target_points)} points")
+        print(f"  - Parallel environments: {self.num_envs}")
+        print(f"  - Trajectory: Y-axis {self.start_pos.cpu().numpy()} → {self.end_pos.cpu().numpy()}")
+        print(f"  - Human equilibrium: y≤0→{self.eq_middle.cpu().numpy()}, y>0→{self.eq_end.cpu().numpy()}")
+        print(f"  - Observation: [x, ẋ, q, q̇, f] = 21D")
+    
+    def _load_training_params(self, path: str = None) -> dict:
+        """Load training parameters from YAML file"""
+        if path is None:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(current_dir, "agents", "training_params.yaml")
         
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Training params file not found: {path}")
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    
+    def _load_yaml_parameters(self, cfg):
+        """Load all parameters directly from YAML"""
+        # Get device and num_envs from config
+        device = torch.device(cfg.sim.device if torch.cuda.is_available() else "cpu")
+        num_envs = cfg.scene.num_envs
+        
+        # Trajectory parameters
+        traj = self.params['trajectory']
+        self.start_pos = torch.tensor(traj['start_point'], device=device, dtype=torch.float32)
+        self.end_pos = torch.tensor(traj['end_point'], device=device, dtype=torch.float32)
+        
+        # Human equilibrium parameters
+        eq = self.params['human_equilibrium']
+        self.eq_middle = torch.tensor(eq['middle_point'], device=device, dtype=torch.float32)
+        self.eq_end = torch.tensor(eq['end_point'], device=device, dtype=torch.float32)
+        
+        # Human dynamics parameters
+        hd = self.params['human_dynamics']
+        self.base_damping = torch.tensor(hd['base_damping'], device=device, dtype=torch.float32)
+        self.damping_var = torch.tensor(hd['damping_variation'], device=device, dtype=torch.float32)
+        self.base_stiffness = torch.tensor(hd['base_stiffness'], device=device, dtype=torch.float32)
+        self.stiffness_var = torch.tensor(hd['stiffness_variation'], device=device, dtype=torch.float32)
+        
+        # Control parameters
+        ctrl = self.params['control_parameters']
+        self.K1_gain = ctrl['K1_gain']
+        self.K2_gain = ctrl['K2_gain']
+        
+        # Constraints
+        constraints = self.params['constraints']
+        self.max_cartesian_vel = constraints['max_cartesian_velocity']
+        self.min_z_pos = constraints['min_z_position']
+        self.max_robot_force = constraints['max_robot_force']
+        self.max_human_force = constraints['max_human_force']
+        
+        # Joint limits from YAML
+        joint_limits = constraints['joint_limits']
+        self.joint_lower_limits = torch.tensor([
+            joint_limits['waist'][0],
+            joint_limits['shoulder'][0], 
+            joint_limits['elbow'][0],
+            0.0, 2.0944, 0.0  # Fixed end joints
+        ], device=device, dtype=torch.float32)
+        
+        self.joint_upper_limits = torch.tensor([
+            joint_limits['waist'][1],
+            joint_limits['shoulder'][1],
+            joint_limits['elbow'][1], 
+            0.0, 2.0944, 0.0  # Fixed end joints
+        ], device=device, dtype=torch.float32)
+        
+        # Safety parameters
+        safety = self.params['safety']
+        self.safety_margin = safety['safety_margin']
+        
+        # Initial conditions
+        init_joints = self.params['initial_conditions']['joint_positions']
+        self.fixed_end_joints = torch.tensor([
+            init_joints['yaw'], init_joints['pitch'], init_joints['roll']
+        ], device=device, dtype=torch.float32)
+        
+        # Will be determined in _post_init based on actual robot structure
+        self.end_effector_body_id = None
+    
+    def _init_trajectory(self):
+        """Initialize trajectory tracking for all environments"""
+        self.traj_direction = (self.end_pos - self.start_pos)
+        self.traj_direction = self.traj_direction / torch.norm(self.traj_direction)
+        
+        # Current trajectory state at time t (per environment)
+        self.xd_t = self.start_pos.clone().unsqueeze(0).expand(self.num_envs, -1)
+        self.xd_dot_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.tracking_speed = torch.zeros(self.num_envs, device=self.device)
+    
+    def _init_state_variables(self):
+        """Initialize state variables for all environments"""
+        # States at time t (for reward computation)
+        self.stylus_pos_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.stylus_vel_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Constraint info at time t
+        self.safety_distances_t = torch.zeros(self.num_envs, device=self.device)
+        self.is_violating_t = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # Human forces at time t+1 (for observation)
+        self.human_forces_t1 = torch.zeros(self.num_envs, 3, device=self.device)
+    
     def _setup_scene(self):
         """Setup simulation scene"""
         self._omni_robot = Articulation(self.cfg.phantom_omni)
@@ -140,329 +168,479 @@ class SurgicalDirectEnv(DirectRLEnv):
         self.scene.rigid_objects["constraint"] = self._constraint
         
         self.scene.clone_environments(copy_from_source=False)
-        
-        print(f"[INFO] Scene setup complete with {self.num_envs} environments")
-        
-    def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Apply actions before physics step - implementing paper control framework"""
-        # Robot control input u (from actor network output, processed according to paper)
-        robot_actions = torch.clamp(actions, -1.0, 1.0)# 优化！！！！怎么那么爱限制
-        self.robot_forces = robot_actions * self.cfg.max_robot_force * self.cfg.force_scale
-        self.previous_robot_actions = robot_actions.clone()
-        
-        # Simulate human input force f (from human impedance model)
-        self._simulate_human_input()
-        
-        # Apply total force to end effector: robot control u + human force f
-        self._apply_forces_to_end_effector()
-        self._update_safety_constraints()
+    
+    def _setup_post_scene_creation(self):
+        """Called after scene creation is complete"""
+        super()._setup_post_scene_creation()
+        # Now we can safely access body information
+        self._initialize_body_indices()
+    
+    def _initialize_body_indices(self):
+        """Initialize body indices after robot is fully loaded"""
+        try:
+            if not hasattr(self._omni_robot, 'body_names') or not hasattr(self._omni_robot.data, 'body_link_pos_w'):
+                return
             
-    def _simulate_human_input(self):
-        """Simulate human input force according to paper equation (6)"""
-        # Get current end effector state
-        end_effector_pos = self._get_end_effector_position()
-        end_effector_vel = self._get_end_effector_velocity()
-        
-        # Get current human equilibrium point based on trajectory
-        current_target_index = self.trajectory_manager.current_target_index
-        if current_target_index < len(self.trajectory_manager.target_points):
-            equilibrium_pos = self.trajectory_manager.target_points[current_target_index]
-            equilibrium_pos = equilibrium_pos.unsqueeze(0).expand(self.num_envs, -1)
-        else:
-            equilibrium_pos = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        # Simplified human force computation (to be enhanced with proper impedance model)
-        position_error = end_effector_pos - equilibrium_pos
-        
-        # Simple spring-damper model for human force
-        kh_simple = 50.0  # Human stiffness
-        ch_simple = 10.0  # Human damping
-        
-        self.human_forces = -(kh_simple * position_error + ch_simple * end_effector_vel)
-        self.human_forces = torch.clamp(self.human_forces, -self.cfg.max_human_force, self.cfg.max_human_force)
-        
-    def _apply_forces_to_end_effector(self):
-        """Apply total forces to end effector: u + f"""
-        # Paper control framework: total force = robot control u + human force f
-        total_forces = self.robot_forces + self.human_forces
-        self.total_interaction_forces = total_forces.clone()
-        
-        # Apply forces to end effector
-        forces_reshaped = total_forces.unsqueeze(1)
-        torques_reshaped = torch.zeros_like(forces_reshaped)
-
-        body_ids = torch.tensor(
-            [self.end_effector_body_id],
-            dtype=torch.long,
-            device=self.device
-        )
-
-        env_ids = torch.arange(self.num_envs, device=self.device)
-
-        self._omni_robot.set_external_force_and_torque(
-            forces=forces_reshaped,
-            torques=torques_reshaped,
-            body_ids=body_ids,
-            env_ids=env_ids
-        )
+            # Search for stylus body
+            stylus_found = False
+            for i, name in enumerate(self._omni_robot.body_names):
+                if 'stylus' in name.lower() or 'tip' in name.lower() or 'end' in name.lower():
+                    self.stylus_body_idx = i
+                    stylus_found = True
+                    break
+            
+            # If no stylus found, use the last body as end effector
+            num_bodies = len(self._omni_robot.body_names)
+            if not stylus_found and num_bodies > 0:
+                self.stylus_body_idx = num_bodies - 1
+            
+            # Validate the body index is within bounds of actual tensor dimensions
+            body_tensor_size = self._omni_robot.data.body_link_pos_w.shape[1]
+            if self.stylus_body_idx is not None and self.stylus_body_idx >= body_tensor_size:
+                self.stylus_body_idx = body_tensor_size - 1 if body_tensor_size > 0 else 0
+            
+            # Set end effector body id (same as stylus for simplicity)
+            self.end_effector_body_id = self.stylus_body_idx
+            
+        except Exception as e:
+            self.stylus_body_idx = 0
+            self.end_effector_body_id = 0
     
-    def _update_safety_constraints(self):
-        """Update safety constraint information"""
-        end_effector_pos = self._get_end_effector_position()
-        self._compute_safety_barrier_function(end_effector_pos)#优化！！！！！可能不需要
-
-    def _compute_safety_barrier_function(self, end_effector_positions: torch.Tensor) -> torch.Tensor:
-        """
-        Compute control barrier function Br(x) = -log(γs(x)/(γs(x)+1))
-        where s(x) is distance function to constraint boundary
-        """
-        batch_size = end_effector_positions.shape[0]
-        
-        # Initialize safety distance
-        self.safety_distances = torch.zeros(batch_size, device=self.device)
-        self.constraint_normals = torch.zeros(batch_size, 3, device=self.device)
-        self.closest_constraint_points = torch.zeros(batch_size, 3, device=self.device)
-        self.is_violating_constraint = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        
-        if self.physics_attachment_interface is not None and self.physics_scene_query_interface is not None:
-            # Use physics query interface to compute real distance
-            self._compute_physics_based_constraints(end_effector_positions)
-        else:
-            # Use simplified constraint model
-            self._compute_simplified_constraints(end_effector_positions)
-        
-        # Compute CBF value: Br(x) = -log(γs(x)/(γs(x)+1))
-        # s(x) is safety distance minus safety margin
-        s_x = self.safety_distances - 0.002  # safety_margin from config
-        
-        # Ensure s(x) has a minimum value to avoid numerical issues
-        s_x = torch.clamp(s_x, min=1e-6)
-        
-        # Compute CBF
-        gamma_s = 1.0 * s_x  # cbf_gamma from config
-        cbf_values = -torch.log(gamma_s / (gamma_s + 1))
-        
-        return cbf_values
+    def _post_init(self):
+        """Fallback method to initialize body indices if not done in setup"""
+        if self.stylus_body_idx is None or self.end_effector_body_id is None:
+            self._initialize_body_indices()
     
-    def _compute_physics_based_constraints(self, current_positions: torch.Tensor):
-        """Use physics query API to compute distance and normal to constraint surface"""
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        """Apply robot control and human forces at time t (parallel)"""
+        # DEBUG: Check environment consistency
+        if hasattr(self, '_step_counter'):
+            self._step_counter += 1
+        else:
+            self._step_counter = 0
         
-        from carb._carb import Float3
-        for i in range(current_positions.shape[0]):
-                pos = current_positions[i].cpu().numpy()
-                query_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
-                
-                # Get closest point
-                constraint_path = f"/World/envs/env_{i}/Constraint/geometry/mesh"
-                closest_point_result = self.physics_attachment_interface.get_closest_points(
-                    [query_point],
-                    constraint_path
-                )
-                
-                if closest_point_result and 'closest_points' in closest_point_result and closest_point_result['closest_points']:
-                    closest_pt = closest_point_result['closest_points'][0]
-                    closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
-                    
-                    # Compute safety distance
-                    distance = np.linalg.norm(pos - closest_pos)
-                    
-                    # Raycast to get normal vector
-                    direction = Float3(closest_pt.x - pos[0], closest_pt.y - pos[1], closest_pt.z - pos[2])
-                    raycast_result = self.physics_scene_query_interface.raycast_closest(query_point, direction, 10000)
-                    
-                    # Constraint violation detection
-                    is_violating = bool(distance < 0.002)  # safety_margin
-                    
-                    # Compute constraint surface normal
-                    if raycast_result and 'normal' in raycast_result:
-                        normal_carb = raycast_result['normal']
-                        normal_array = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-                    else:
-                        # Default normal (from constraint surface to current point)
-                        diff = pos - closest_pos
-                        normal_array = diff / (np.linalg.norm(diff) + 1e-8)
-                    
-                    # Store results
-                    self.safety_distances[i] = float(distance)
-                    self.constraint_normals[i] = torch.tensor(normal_array, device=self.device)
-                    self.closest_constraint_points[i] = torch.tensor(closest_pos, device=self.device)
-                    self.is_violating_constraint[i] = is_violating
-                    
-                else:
-                    # Unable to get constraint information, use safe default values
-                    self.safety_distances[i] = 0.004  # Assume safe (2x safety margin)
-                    self.constraint_normals[i] = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-                    self.closest_constraint_points[i] = current_positions[i]
-                    self.is_violating_constraint[i] = False    
+        if self._step_counter == 0:
+            print(f"[DEBUG] First physics step - verifying {self.num_envs} parallel environments")
+            print(f"[DEBUG] Action shape: {actions.shape}")
         
+        # Save current states at time t (before physics step) - already in local coordinates
+        self.stylus_pos_t = self._get_stylus_position()  # x(t) in local coords relative to base
+        self.stylus_vel_t = self._get_stylus_velocity()  # ẋ(t)
+        
+        # DEBUG: Verify local coordinates are consistent
+        if self._step_counter < 3:
+            print(f"[DEBUG] Step {self._step_counter} - Local stylus positions (relative to base):")
+            for i in range(min(3, self.num_envs)):
+                print(f"  Env {i}: {self.stylus_pos_t[i].cpu().numpy()}")
+        
+        # Store and limit robot forces at time t (vectorized)
+        self.robot_forces_t = torch.clamp(actions, -self.max_robot_force, self.max_robot_force)
+        
+        # Compute human forces at time t (vectorized)
+        self._compute_human_forces()
+        
+        # Analyze constraints at time t (vectorized)
+        self._analyze_constraints(self.stylus_pos_t)
+        
+        # Apply total forces (vectorized)
+        self._apply_forces_to_stylus()
+        
+        # Fix end joints (vectorized)
+        self._fix_end_joints()
+    
+    def _compute_human_forces(self):
+        """Compute human forces at time t (fully vectorized)"""
+        # Use saved states at time t (already in local coordinates)
+        x_t = self.stylus_pos_t
+        x_dot_t = self.stylus_vel_t
+        
+        # Get human equilibrium (Y-axis based switching) - vectorized
+        xH_t = torch.where(
+            x_t[:, 1:2] > 0.0,  # y > 0
+            self.eq_end.unsqueeze(0).expand(self.num_envs, -1),
+            self.eq_middle.unsqueeze(0).expand(self.num_envs, -1)
+        )
+        
+        # Dynamic impedance: CHt = diag{[0.14 - 0.133*cos(ẋi)]} - vectorized
+        vel_cos = torch.cos(x_dot_t)
+        CHt = self.base_damping.unsqueeze(0) - self.damping_var.unsqueeze(0) * vel_cos
+        KHt = self.base_stiffness.unsqueeze(0) - self.stiffness_var.unsqueeze(0) * vel_cos
+        
+        # Human force: f = -(CHt*ẋ + KHt*(x - xH)) - vectorized
+        pos_error = x_t - xH_t
+        self.human_forces_t = -(CHt * x_dot_t + KHt * pos_error)
+        self.human_forces_t = torch.clamp(self.human_forces_t, -self.max_human_force, self.max_human_force)
+    
+    def _compute_human_forces_at_t1(self):
+        """Compute human forces at time t+1 (for observation) - vectorized"""
+        # Use current physics state (after step) - in local coordinates
+        x_t1 = self._get_stylus_position()
+        x_dot_t1 = self._get_stylus_velocity()
+        
+        # Get human equilibrium (Y-axis based switching) - vectorized
+        xH_t1 = torch.where(
+            x_t1[:, 1:2] > 0.0,  # y > 0
+            self.eq_end.unsqueeze(0).expand(self.num_envs, -1),
+            self.eq_middle.unsqueeze(0).expand(self.num_envs, -1)
+        )
+        
+        # Dynamic impedance at t+1 - vectorized
+        vel_cos = torch.cos(x_dot_t1)
+        CHt1 = self.base_damping.unsqueeze(0) - self.damping_var.unsqueeze(0) * vel_cos
+        KHt1 = self.base_stiffness.unsqueeze(0) - self.stiffness_var.unsqueeze(0) * vel_cos
+        
+        # Human force at t+1 - vectorized
+        pos_error = x_t1 - xH_t1
+        self.human_forces_t1 = -(CHt1 * x_dot_t1 + KHt1 * pos_error)
+        self.human_forces_t1 = torch.clamp(self.human_forces_t1, -self.max_human_force, self.max_human_force)
+    
+    def _apply_forces_to_stylus(self):
+        """Apply total forces (robot + human) to stylus at time t (vectorized)"""
+        if self.stylus_body_idx is None or self.end_effector_body_id is None:
+            self._post_init()
+            if self.stylus_body_idx is None:
+                return
+        
+        body_idx = self.stylus_body_idx if self.stylus_body_idx is not None else self.end_effector_body_id
+        
+        # Total force: robot control + human force
+        total_forces = self.robot_forces_t + self.human_forces_t
+        
+        try:
+            # Get quaternion for the specific body - vectorized
+            stylus_quat = self._omni_robot.data.body_link_quat_w[:, body_idx, :]  # [num_envs, 4]
+            
+            # Transform to local coordinates - vectorized
+            forces_local = quat_rotate_inverse(stylus_quat, total_forces)
+            
+            # Apply forces - reshape for API
+            forces = forces_local.unsqueeze(1)  # [num_envs, 1, 3]
+            torques = torch.zeros_like(forces)
+            
+            self._omni_robot.set_external_force_and_torque(forces, torques, body_ids=[body_idx])
+        except Exception as e:
+            pass
+    
+    def _fix_end_joints(self):
+        """Fix last 3 joints for stylus orientation (vectorized)"""
+        joint_pos = self._omni_robot.data.joint_pos.clone()
+        joint_vel = self._omni_robot.data.joint_vel.clone()
+        
+        joint_pos[:, 3:6] = self.fixed_end_joints.unsqueeze(0).expand(self.num_envs, -1)
+        joint_vel[:, 3:6] = 0.0
+        
+        self._omni_robot.write_joint_state_to_sim(joint_pos, joint_vel)
+    
+    def get_complete_trajectory_state(self, x_current: torch.Tensor) -> dict:
+        """Get complete trajectory state at time t (vectorized)"""
+        # x_current is already [num_envs, 3] in local coordinates
+        
+        # Tracking error computation - vectorized
+        tracking_error = torch.norm(x_current - self.xd_t, dim=-1)  # [num_envs]
+        max_tracking_error = 0.03  # 3cm threshold
+        
+        # Speed computation based on tracking error - vectorized
+        speed = torch.where(
+            tracking_error >= max_tracking_error,
+            torch.zeros_like(tracking_error),
+            torch.where(
+                tracking_error <= 1e-6,
+                torch.full_like(tracking_error, self.max_cartesian_vel),
+                self.max_cartesian_vel * (1.0 - tracking_error / max_tracking_error)
+            )
+        )
+        
+        # Trajectory derivatives at time t - vectorized
+        xd_dot_t = self.traj_direction.unsqueeze(0) * speed.unsqueeze(-1)
+        speed_change = speed - self.tracking_speed
+        xd_ddot_t = self.traj_direction.unsqueeze(0) * (speed_change / self.dt).unsqueeze(-1)
+        
+        # Store for trajectory update
+        self.tracking_speed = speed
+        self.xd_dot_t = xd_dot_t
+        
+        return {
+            'xd': self.xd_t,  # [num_envs, 3]
+            'xd_dot': xd_dot_t,  # [num_envs, 3]
+            'xd_ddot': xd_ddot_t,  # [num_envs, 3]
+            'tracking_error': tracking_error,  # [num_envs]
+            'speed': speed  # [num_envs]
+        }
+    
+    def reset_trajectory(self):
+        """Reset trajectory to start for all environments"""
+        self.xd_t = self.start_pos.clone().unsqueeze(0).expand(self.num_envs, -1)
+        self.xd_dot_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.tracking_speed = torch.zeros(self.num_envs, device=self.device)
+    
+    def step_trajectory(self):
+        """Step trajectory from t to t+1 (vectorized)"""
+        # Update trajectory: xd(t+1) = xd(t) + ẋd(t) * dt
+        self.xd_t = self.xd_t + self.xd_dot_t * self.dt
+        
+        # Keep trajectory within bounds - vectorized
+        to_current = self.xd_t - self.start_pos.unsqueeze(0)
+        projection = torch.sum(to_current * self.traj_direction.unsqueeze(0), dim=-1)
+        max_length = torch.norm(self.end_pos - self.start_pos)
+        projection = torch.clamp(projection, 0.0, max_length)
+        self.xd_t = self.start_pos.unsqueeze(0) + self.traj_direction.unsqueeze(0) * projection.unsqueeze(-1)
+    
+    def _check_constraints(self) -> torch.Tensor:
+        """Check all constraints at time t+1 (vectorized)"""
+        violations = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # Z position: z > 0 (check at t+1) - in local coordinates
+        stylus_pos_t1 = self._get_stylus_position()
+        violations |= (stylus_pos_t1[:, 2] <= self.min_z_pos)
+        
+        # Joint limits (first 3 joints only) - vectorized
+        joint_pos_t1 = self.get_joint_positions()
+        for i in range(3):
+            violations |= (joint_pos_t1[:, i] < self.joint_lower_limits[i]) | (joint_pos_t1[:, i] > self.joint_upper_limits[i])
+        
+        # Cartesian velocity: |ẋ| ≤ 4cm/s - vectorized
+        stylus_vel_t1 = self._get_stylus_velocity()
+        violations |= torch.any(torch.abs(stylus_vel_t1) > self.max_cartesian_vel, dim=1)
+        
+        # Constraint collision - vectorized
+        self._analyze_constraints(stylus_pos_t1)
+        violations |= self.is_violating_t
+        
+        return violations
+    
+    def _analyze_constraints(self, stylus_pos: torch.Tensor):
+        """Analyze constraint violations (simplified for parallel envs)"""
+        # Simple distance check in local coordinates
+        constraint_pos = torch.tensor([0.14, 0.0, 0.0], device=self.device).unsqueeze(0)
+        self.safety_distances_t = torch.norm(stylus_pos - constraint_pos, dim=-1)
+        self.is_violating_t = self.safety_distances_t < self.safety_margin
+    
     def _apply_action(self) -> None:
-        """Apply processed actions to environment"""
-        pass
-
+        """Apply processed actions"""
+        self._omni_robot.write_data_to_sim()
+    
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        """Get simplified observations"""
-        end_effector_pos = self._get_end_effector_position()
-        end_effector_vel = self._get_end_effector_velocity()
+        """Get observations at time t+1: [x, ẋ, q, q̇, f] (21D) - vectorized"""
+        # Physical states at t+1 (after physics step) - in local coordinates
+        stylus_pos_t1 = self._get_stylus_position()
+        stylus_vel_t1 = self._get_stylus_velocity()
+        joint_pos_t1 = self.get_joint_positions()
+        joint_vel_t1 = self.get_joint_velocities()
         
-        # Update target point (distance-based)
-        self.trajectory_manager.update_target(end_effector_pos)
-        target_pos = self.trajectory_manager.get_current_target()
-        target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
+        # Apply velocity constraints for observation
+        stylus_vel_constrained = torch.clamp(stylus_vel_t1, -self.max_cartesian_vel, self.max_cartesian_vel)
         
-        # Simplified observation: position(3) + velocity(3) + target position(3) = 9D, extended to 12D for compatibility
+        # Compute human forces at t+1 (vectorized)
+        self._compute_human_forces_at_t1()
+        
+        # Ensure all components have correct dimensions
+        if joint_pos_t1.shape[-1] != 6:
+            if joint_pos_t1.shape[-1] < 6:
+                padding = torch.zeros(joint_pos_t1.shape[0], 6 - joint_pos_t1.shape[-1], device=self.device)
+                joint_pos_t1 = torch.cat([joint_pos_t1, padding], dim=-1)
+            else:
+                joint_pos_t1 = joint_pos_t1[..., :6]
+        
+        if joint_vel_t1.shape[-1] != 6:
+            if joint_vel_t1.shape[-1] < 6:
+                padding = torch.zeros(joint_vel_t1.shape[0], 6 - joint_vel_t1.shape[-1], device=self.device)
+                joint_vel_t1 = torch.cat([joint_vel_t1, padding], dim=-1)
+            else:
+                joint_vel_t1 = joint_vel_t1[..., :6]
+        
+        # Construct observation: [x(t+1), ẋ(t+1), q(t+1), q̇(t+1), f(t+1)] = 21D
         obs = torch.cat([
-            end_effector_pos,      # Current position [0:3]
-            end_effector_vel,      # Current velocity [3:6]
-            target_pos,            # Target position [6:9]
-            torch.zeros(self.num_envs, 3, device=self.device)  # Padding to 12D [9:12]
+            stylus_pos_t1,           # 3D: x(t+1) in local coords
+            stylus_vel_constrained,  # 3D: ẋ(t+1)
+            joint_pos_t1,           # 6D: q(t+1)
+            joint_vel_t1,           # 6D: q̇(t+1)
+            self.human_forces_t1    # 3D: f(t+1)
         ], dim=-1)
         
-        obs = torch.clamp(obs, -10.0, 10.0)
-        return {"policy": obs}
+        return {"policy": torch.clamp(obs, -10.0, 10.0)}
     
     def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards - paper-aligned (simplified for now, will be enhanced by trainer)"""
-        end_effector_pos = self._get_end_effector_position()
-        end_effector_vel = self._get_end_effector_velocity()
+        """Compute rewards based on time t states (vectorized)"""
+        rp = self.params['reward_parameters']
         
-        target_pos = self.trajectory_manager.get_current_target()
-        target_pos = target_pos.unsqueeze(0).expand(self.num_envs, -1)
+        # All reward computation based on saved time t states - in local coordinates
+        target = self.end_pos.unsqueeze(0).expand(self.num_envs, -1)
+        pos_error = self.stylus_pos_t - target
+        tracking_reward = -torch.sum(pos_error**2, dim=-1) * rp['position_tracking_scale']
         
-        # Basic reward components (detailed cost function will be handled by trainer)
+        # Velocity regulation - vectorized
+        vel_penalty = -torch.sum(self.stylus_vel_t**2, dim=-1) * rp['velocity_regulation_scale']
         
-        # 1. Position tracking reward
-        position_error = end_effector_pos - target_pos
-        tracking_reward = -torch.sum(position_error**2, dim=-1) * 100.0
+        # Force regulation - vectorized
+        force_penalty = -torch.sum(self.human_forces_t**2, dim=-1) * rp['force_regulation_scale']
         
-        # 2. Velocity penalty
-        velocity_penalty = -torch.sum(end_effector_vel**2, dim=-1) * 0.01
+        # Control penalty - vectorized
+        control_penalty = -torch.sum(self.robot_forces_t**2, dim=-1) * rp['control_penalty_scale']
         
-        # 3. Control effort penalty
-        control_penalty = -torch.sum(self.previous_robot_actions**2, dim=-1) * 0.001
+        # Safety penalty - vectorized
+        safety_penalty = -self.safety_distances_t * rp['safety_penalty_scale']
         
-        # 4. Safety constraint penalty
-        cbf_values = self._compute_safety_barrier_function(end_effector_pos)                  #优化！！！！少了f项，多了到xd项
-        safety_penalty = -cbf_values * 10.0
+        # Constraint violation penalty - vectorized
+        violation_penalty = self.is_violating_t.float() * rp['constraint_violation_penalty']
         
-        # 5. Hard constraint violation penalty
-        constraint_violation_penalty = self.is_violating_constraint.float() * (-50.0)
+        # Completion reward - vectorized
+        distance_to_target = torch.norm(pos_error, dim=-1)
+        completion_reward = torch.where(
+            distance_to_target < rp['completion_threshold'],
+            torch.full_like(distance_to_target, rp['completion_reward']),
+            torch.zeros_like(distance_to_target)
+        )
         
-        # 6. Target reaching reward
-        distance_to_target = torch.norm(end_effector_pos - target_pos, dim=-1)
-        target_reached = distance_to_target < self.cfg.target_reach_threshold
-        completion_reward = target_reached.float() * 20.0
+        total_reward = (tracking_reward + vel_penalty + force_penalty + 
+                       control_penalty + safety_penalty + violation_penalty + completion_reward)
         
-        # 7. Final target completion reward
-        final_completion = torch.zeros(self.num_envs, device=self.device)
-        for i in range(self.num_envs):
-            if self.trajectory_manager.is_final_target_reached(end_effector_pos[i]):
-                final_completion[i] = 50.0  # Large reward for completing entire trajectory
-
-        total_reward = (tracking_reward + velocity_penalty + control_penalty + 
-                       safety_penalty + constraint_violation_penalty + 
-                       completion_reward + final_completion)
-        total_reward = torch.clamp(total_reward, -100.0, 75.0)
-        
-        # Store reward components for logging
+        # Store logs
         self.extras["log"] = {
             "tracking_reward": tracking_reward.mean().item(),
-            "velocity_penalty": velocity_penalty.mean().item(),
+            "vel_penalty": vel_penalty.mean().item(),
+            "force_penalty": force_penalty.mean().item(),
             "control_penalty": control_penalty.mean().item(),
             "safety_penalty": safety_penalty.mean().item(),
-            "constraint_violation_penalty": constraint_violation_penalty.mean().item(),
+            "violation_penalty": violation_penalty.mean().item(),
             "completion_reward": completion_reward.mean().item(),
-            "final_completion_reward": final_completion.mean().item(),
             "total_reward": total_reward.mean().item(),
-            "trajectory_progress": self.trajectory_manager.get_progress(),
-            "current_target_index": self.trajectory_manager.current_target_index,
             "distance_to_target": distance_to_target.mean().item(),
-            "safety_distance": self.safety_distances.mean().item(),
-            "cbf_value": cbf_values.mean().item(),
-            "constraint_violation_rate": self.is_violating_constraint.float().mean().item(),
-            "robot_force_norm": torch.norm(self.robot_forces, dim=-1).mean().item(),
-            "human_force_norm": torch.norm(self.human_forces, dim=-1).mean().item(),
-            "total_force_norm": torch.norm(self.total_interaction_forces, dim=-1).mean().item(),
+            "safety_distance": self.safety_distances_t.mean().item(),
+            "violation_rate": self.is_violating_t.float().mean().item(),
+            "robot_force_norm": torch.norm(self.robot_forces_t, dim=-1).mean().item(),
+            "human_force_norm": torch.norm(self.human_forces_t, dim=-1).mean().item(),
         }
         
-        return total_reward
-        
+        return torch.clamp(total_reward, rp.get('reward_min', -100.0), rp.get('reward_max', 75.0))
+    
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Determine if episodes should terminate or truncate"""
-        end_effector_pos = self._get_end_effector_position()
+        """Check termination conditions (vectorized)"""
+        # Check all constraints (at t+1) - vectorized
+        constraint_violations = self._check_constraints()
         
-        # Termination conditions: constraint violation, falling out or completing final target
-        constraint_violated = self.is_violating_constraint.clone()
-        fell_out = end_effector_pos[..., 2] < -0.01
-        final_target_reached = torch.tensor([
-            self.trajectory_manager.is_final_target_reached(end_effector_pos[i])
-            for i in range(self.num_envs)
-        ], device=self.device, dtype=torch.bool)
+        # Check target reached (at t+1) - vectorized
+        stylus_pos = self._get_stylus_position()
+        target_distance = torch.norm(stylus_pos - self.end_pos.unsqueeze(0).expand(self.num_envs, -1), dim=-1)
+        target_reached = target_distance < self.params['reward_parameters']['completion_threshold']
         
-        terminated = constraint_violated | fell_out | final_target_reached
-        
-        # Truncation condition: timeout
+        terminated = constraint_violations | target_reached
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         
         return terminated, truncated
-        
+    
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments"""
+        """Reset environments (vectorized)"""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
-            
+        
+        # DEBUG: Print reset information
+        print(f"[DEBUG] Resetting environments: {env_ids.cpu().numpy()}")
+        
         super()._reset_idx(env_ids)
+        
+        # Ensure body indices are set after reset
+        if self.stylus_body_idx is None or self.end_effector_body_id is None:
+            self._post_init()
         
         num_resets = len(env_ids)
         
-        # Set initial joint positions to reach stylus position [-0.2, 0.15, 0.03]
+        # Set initial joint positions from YAML
+        init_joints = self.params['initial_conditions']['joint_positions']
         joint_pos = torch.zeros((num_resets, 6), device=self.device)
-        joint_pos[:, 0] = 0.0   # waist
-        joint_pos[:, 1] = 0.0   # shoulder  
-        joint_pos[:, 2] = 0.0   # elbow
-        joint_pos[:, 3] = 4.0   # yaw
-        joint_pos[:, 4] = 1.2   # pitch - stylus upright
-        joint_pos[:, 5] = 0.0   # roll
+        joint_pos[:, 0] = init_joints['waist']
+        joint_pos[:, 1] = init_joints['shoulder']
+        joint_pos[:, 2] = init_joints['elbow']
+        joint_pos[:, 3] = init_joints['yaw']
+        joint_pos[:, 4] = init_joints['pitch']
+        joint_pos[:, 5] = init_joints['roll']
         
-        joint_noise = sample_uniform(-0.1, 0.1, (num_resets, 6), self.device)
-        joint_pos += joint_noise
+        # Add noise
+        noise = sample_uniform(-0.05, 0.05, (num_resets, 6), self.device)
+        joint_pos += noise
         
         joint_vel = torch.zeros((num_resets, 6), device=self.device)
-        
         self._omni_robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         
-        # Reset tracking variables
-        self.previous_robot_actions[env_ids] = 0.0
-        self.human_forces[env_ids] = 0.0
-        self.robot_forces[env_ids] = 0.0
-        self.total_interaction_forces[env_ids] = 0.0
+        # Reset all states for specified environments
+        self.stylus_pos_t[env_ids] = 0.0
+        self.stylus_vel_t[env_ids] = 0.0
+        self.robot_forces_t[env_ids] = 0.0
+        self.human_forces_t[env_ids] = 0.0
+        self.human_forces_t1[env_ids] = 0.0
+        self.safety_distances_t[env_ids] = 0.0
+        self.is_violating_t[env_ids] = False
         
-        # Reset constraint related variables
-        self.safety_distances[env_ids] = 0.0
-        self.constraint_normals[env_ids] = 0.0
-        self.closest_constraint_points[env_ids] = 0.0
-        self.is_violating_constraint[env_ids] = False
+        # Reset trajectory for specified environments
+        self.xd_t[env_ids] = self.start_pos.clone()
+        self.xd_dot_t[env_ids] = 0.0
+        self.tracking_speed[env_ids] = 0.0
         
-        # Reset trajectory manager
-        self.trajectory_manager.reset_trajectory()
-
-    def _get_end_effector_position(self):
-        """Get end effector position"""
-        return self._omni_robot.data.body_link_state_w[..., self.end_effector_body_id, :3]
+        # DEBUG: Verify reset positions
+        reset_pos = self._get_stylus_position()
+        print(f"[DEBUG] After reset - Local stylus positions:")
+        for i in env_ids[:min(3, len(env_ids))]:
+            print(f"  Env {i}: {reset_pos[i].cpu().numpy()}")
+    
+    # Getter methods
+    def _get_stylus_position(self):
+        """Get stylus position relative to robot base frame"""
+        if self.end_effector_body_id is None:
+            self._post_init()
+            if self.end_effector_body_id is None:
+                return torch.zeros(self.num_envs, 3, device=self.device)
         
-    def _get_end_effector_velocity(self):
-        """Get end effector linear velocity"""
-        return self._omni_robot.data.body_link_state_w[..., self.end_effector_body_id, 7:10]
+        try:
+            # Get robot base position (root link)
+            base_pos = self._omni_robot.data.root_link_pos_w  # [num_envs, 3]
+            
+            # Get end effector position in world frame
+            ee_pos_world = self._omni_robot.data.body_link_pos_w[:, self.end_effector_body_id, :]
+            
+            # Calculate relative position (end effector relative to base)
+            position_local = ee_pos_world - base_pos
+            
+            # DEBUG: Print position (only first few steps)
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 0
+            
+            if self._debug_counter < 5:
+                print(f"[DEBUG] Stylus position relative to base (step {self._debug_counter}):")
+                for i in range(min(2, self.num_envs)):
+                    print(f"  Env {i}: Base {base_pos[i].cpu().numpy()}, EE {ee_pos_world[i].cpu().numpy()}, Relative {position_local[i].cpu().numpy()}")
+            
+            return position_local
+        except Exception as e:
+            print(f"[ERROR] Failed to get stylus position: {e}")
+            return torch.zeros(self.num_envs, 3, device=self.device)
+    
+    def _get_stylus_velocity(self):
+        """Get stylus velocity in robot frame"""
+        if self.end_effector_body_id is None:
+            self._post_init()
+            if self.end_effector_body_id is None:
+                return torch.zeros(self.num_envs, 3, device=self.device)
+        
+        try:
+            # Use body_link_lin_vel_w property which gives velocities
+            velocity = self._omni_robot.data.body_link_lin_vel_w[:, self.end_effector_body_id, :]
+            return velocity
+        except Exception as e:
+            return torch.zeros(self.num_envs, 3, device=self.device)
     
     def get_joint_positions(self):
-        """Get joint positions q"""
+        """Get joint positions (vectorized)"""
         return self._omni_robot.data.joint_pos
     
     def get_joint_velocities(self):
-        """Get joint velocities q̇"""
+        """Get joint velocities (vectorized)"""
         return self._omni_robot.data.joint_vel
     
-    # Add unwrapped property for gym compatibility
-    @property 
+    def get_training_params(self):
+        """Return loaded training parameters"""
+        return self.params
+    
+    @property
     def unwrapped(self):
-        """Return self for unwrapped access"""
         return self
