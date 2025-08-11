@@ -1,9 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""Configuration for Surgical Direct MARL Environment with Human-Robot Collaboration."""
+# surgical_direct_marl_env_cfg.py
 
 from __future__ import annotations
 
@@ -18,15 +13,13 @@ from isaaclab.utils import configclass
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
-    """Scene configuration containing only basic elements"""
+    """Scene configuration"""
     
-    # ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
     )
 
-    # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
@@ -35,35 +28,30 @@ class MySceneCfg(InteractiveSceneCfg):
 
 @configclass
 class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
-    """Configuration for Surgical Direct MARL Environment - 与Single Agent完全对齐"""
+    """Configuration for Surgical Direct MARL Environment"""
     
-    # Environment settings (与Single Agent对齐)
     episode_length_s = 15.0
     decimation = 2
     
-    # Multi-agent settings
     possible_agents = ["human", "robot"]
     
-    # Agent-specific action and observation spaces (相同观测)
     action_spaces = {
-        "human": 3,   # xyz forces in Cartesian space
-        "robot": 3,   # xyz forces in Cartesian space
+        "human": 3,
+        "robot": 3,
     }
     
     observation_spaces = {
-        "human": 21,   # [x, ẋ, q, q̇, f, constraint_distances] (相同观测)
-        "robot": 21,   # [x, ẋ, q, q̇, f, constraint_distances] (相同观测)
+        "human": 21,
+        "robot": 21,
     }
     
-    # Global state space
-    state_space = 24  # 全局状态信息
+    state_space = 24
     
-    # Simulation settings (与Single Agent完全对齐)
     sim: SimulationCfg = SimulationCfg(
         device="cuda:0",
-        dt=1 / 120,  # 120 Hz simulation
+        dt=1 / 120,
         render_interval=decimation,
-        gravity=(0.0, 0.0, 0.0),  # Disable gravity
+        gravity=(0.0, 0.0, 0.0),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply", 
@@ -73,10 +61,9 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         ),
     )
     
-    # Scene settings (与Single Agent对齐)
     scene: InteractiveSceneCfg = MySceneCfg(num_envs=512, env_spacing=4.0, replicate_physics=True)
     
-    # Phantom Omni (与Single Agent完全对齐)
+    # 每个关节单独配置执行器
     phantom_omni = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -103,7 +90,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
                 "shoulder": 0.0,
                 "elbow": 1.0,
                 "yaw": 0.0,
-                "pitch": 2.0944,  # 120 degrees in radians
+                "pitch": 2.0944,
                 "roll": 0.0,
             },
             joint_vel={
@@ -116,38 +103,45 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             },
         ),
         actuators={
-            "arm_joints": ImplicitActuatorCfg(
-                joint_names_expr=[
-                    "waist", 
-                    "shoulder", 
-                    "elbow", 
-                    "yaw", 
-                    "pitch", 
-                    "roll"
-                ],
-                effort_limit_sim=5.0,
-                velocity_limit_sim=50.0,
-                stiffness={
-                    "waist": 0.25,
-                    "shoulder": 0.25,
-                    "elbow": 0.25,
-                    "yaw": 0.0,
-                    "pitch": 0.0,
-                    "roll": 0.0,
-                },
-                damping={
-                    "waist": 0.07,
-                    "shoulder": 0.07,
-                    "elbow": 0.07,
-                    "yaw": 0.4,
-                    "pitch": 0.4,
-                    "roll": 0.4,
-                },
+            "waist_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["waist"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "shoulder_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["shoulder"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "elbow_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["elbow"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "yaw_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["yaw"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "pitch_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["pitch"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
+            "roll_actuator": ImplicitActuatorCfg(
+                joint_names_expr=["roll"],
+                effort_limit=5.0,
+                stiffness=0.0,
+                damping=0.0,
             ),
         },
     )
     
-    # Constraint geometry (与Single Agent完全对齐)
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
@@ -159,12 +153,11 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             scale=(0.01, 0.01, 0.015),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.14, 0.0, 0.0),  # 约束位置修正到 0.14 0.0 0.0
+            pos=(0.14, 0.0, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
     
-    # Physics simulation settings (与Single Agent对齐)
     physics_dt = 1/120
     render_dt = 1/60
     solver_iterations = 16
