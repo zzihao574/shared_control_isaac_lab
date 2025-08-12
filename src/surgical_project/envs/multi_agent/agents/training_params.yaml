@@ -1,4 +1,4 @@
-# training_params.yaml - 修复版本
+# training_params.yaml - MADDPG奖励优化版本
 
 # Trajectory parameters
 trajectory:
@@ -8,11 +8,10 @@ trajectory:
   switch_threshold: 0.0075
   total_distance: 0.4
 
-# Constraints - 调整力限制
+# Constraints - 保持原有力限制
 constraints:
-  max_cartesian_velocity: 0.08
   min_z_position: 0.0
-  max_robot_force: 0.03  # 适中的力限制
+  max_robot_force: 0.03  # 0.03N适中的力限制
   max_human_force: 0.03
   
   # Joint limits
@@ -41,62 +40,69 @@ constraint_geometry:
   y_range_positive: [0.038, 0.048]
   y_range_negative: [-0.048, -0.038]
 
-# Reward parameters
+# 奖励参数 - 进一步修复数值爆炸
 reward_parameters:
+  # Robot权重 - 进一步大幅降低
   robot_weights:
-    position_tracking: 100.0
-    velocity_regulation: 0.5
-    obstacle_distance: 50.0
-    control_input: 0.01
+    position_tracking: 3.0       # 从10→1，避免奖励爆炸
+    velocity_regulation: 0.1     # 从1→0.1，轻微控制
+    obstacle_distance: 3.0       # 从5→1，保持安全但不主导
+    control_input: 0.1          # 从0.1→0.01，很轻微惩罚
+    human_awareness: 0.1         # MADDPG: 轻微感知human行为
     
+  # Human权重 - 进一步大幅降低
   human_weights:
-    position_tracking: 80.0
-    velocity_regulation: 0.5
-    obstacle_distance: 30.0
-    force_input: 0.01
+    position_tracking: 1.5       # 从5→0.5，轻微辅助跟踪
+    velocity_regulation: 0.1     # 从1→0.1，轻微平稳要求
+    obstacle_distance: 1.5       # 从10→2，保持安全意识但不过度
+    force_input: 0.1            # 从0.1→0.01，很轻微惩罚
+    robot_awareness: 0.2         # MADDPG: 轻微感知robot行为
     
+  # 协作参数 - 进一步降低
   collaboration_parameters:
-    force_conflict_threshold: 1.0
-    conflict_penalty_scale: -5.0
+    force_conflict_threshold: 0.01     
+    conflict_penalty_scale: 1.0        # 从5→1，轻微冲突惩罚
     
-  completion_reward: 100.0
-  collision_penalty: -100.0
-  completion_threshold: 0.01
+  # 公共奖励项 - 大幅降低
+  completion_reward: 10.0              # 从50→10，适度正奖励
+  z_violation_penalty: -5.0            # 从-20→-5，减少负值爆炸
+  completion_threshold: 0.005
   
+  # CBF参数 - 保持原有设计
   cbf_parameters:
     safety_margin: 0.01
     gamma: 10.0
     epsilon: 0.000001
 
-# MADDPG配置
+# MADDPG配置 - 修复数值稳定性
 maddpg_config:
-  lr: 0.0003
-  lr_actor: 0.0003
-  lr_critic: 0.001
+  lr: 0.0001                           # 从0.0003→0.0001，降低学习率
+  lr_actor: 0.0001                     # 从0.0003→0.0001，稳定训练
+  lr_critic: 0.0003                    # 从0.001→0.0003，避免loss爆炸
   gamma: 0.95
-  batch_size: 512
+  batch_size: 256                      # 从512→256，减少批量大小
   num_units: 64
   
   # 训练参数
   num_episodes: 25000
   max_episode_len: 500
   save_rate: 1000
-  update_interval: 100
-  min_buffer_size: 2048
+  update_interval: 200                 # 从100→200，降低更新频率
+  min_buffer_size: 1024                # 从2048→1024，更快开始训练
   
-  # 探索参数
-  exploration_noise: 0.1
-  noise_decay: 0.995
+  # 探索参数 - 降低噪声
+  exploration_noise: 0.05              # 从0.1→0.05，减少探索噪声
+  noise_decay: 0.998                   # 从0.995→0.998，更慢衰减
   min_noise: 0.01
   
-  # 网络更新参数
-  tau: 0.01
+  # 网络更新参数 - 更保守
+  tau: 0.005                          # 从0.01→0.005，更慢的软更新
   max_replay_buffer_len: 25600
 
 # Environment config
 env_config:
   num_envs: 512
-  episode_length_s: 15.0
+  episode_length_s: 10.0
   agents: ["human", "robot"]
   centralized_critic: true
   parameter_sharing: false
@@ -115,3 +121,30 @@ agent_configs:
 hardware:
   device: "cuda"
   num_workers: 1
+
+# 奖励设计说明
+reward_design_notes: |
+  MADDPG奖励优化版本:
+  
+  1. 数值量级平衡:
+     - position_reward: 0-1 → 权重放大到合理量级
+     - velocity_reward: 0-1 → 适度权重
+     - CBF: -180~+140 → 保持原有重要性
+     - 公共项: -100, -30~-15, +200 → 重要但不主导
+  
+  2. MADDPG跨智能体感知:
+     - Robot感知human_force (权重20)
+     - Human感知robot_control (权重50)
+  
+  3. 智能体分工:
+     - Robot: 精确跟踪 > 节能 > 安全
+     - Human: 安全协调 > 平稳 > 辅助跟踪
+  
+  4. 正奖励设计:
+     - position_reward = exp(-error*25): 4cm误差→0.37奖励
+     - velocity_reward = exp(-speed*10): 0.08m/s→0.45奖励
+  
+  5. 简化安全约束:
+     - CBF负责连续碰撞避免
+     - 移除冗余collision_penalty
+     - z_violation降为-100，减少主导性

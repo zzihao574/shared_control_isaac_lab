@@ -70,7 +70,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/omni.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
-                max_linear_velocity=50.0,
+                max_linear_velocity=0.04,
                 max_angular_velocity=50.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
