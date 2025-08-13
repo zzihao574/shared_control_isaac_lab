@@ -1,15 +1,19 @@
-"""Multi-Agent Reinforcement Learning algorithms for surgical robot control"""
+# algorithms/marl/__init__.py - 修复导入，移除已删除的OrnsteinUhlenbeckNoise
 
+"""Multi-Agent Reinforcement Learning algorithms"""
+
+from .networks import Actor, Critic
+from .ddpg_agent import DDPGAgent  
 from .maddpg import MADDPG
-from .ddpg_agent import DDPGAgent
 from .replay_buffer import MultiAgentReplayBuffer
-from .networks import Actor, Critic, OrnsteinUhlenbeckNoise
+
+# 删除这行：from .networks import Actor, Critic, OrnsteinUhlenbeckNoise
+# 因为我们已经删除了OrnsteinUhlenbeckNoise类
 
 __all__ = [
-    'MADDPG',
-    'DDPGAgent', 
-    'MultiAgentReplayBuffer',
-    'Actor',
-    'Critic',
-    'OrnsteinUhlenbeckNoise'
+    "Actor",
+    "Critic", 
+    "DDPGAgent",
+    "MADDPG",
+    "MultiAgentReplayBuffer"
 ]

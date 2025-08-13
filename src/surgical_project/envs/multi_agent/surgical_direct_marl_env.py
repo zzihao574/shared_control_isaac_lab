@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - MADDPG奖励优化版本
+# surgical_direct_marl_env.py - 完整修复版
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
 
 
 class CompleteConstraintChecker:
-    """完整的约束状态检测类 - 支持多环境批量处理"""
+    """约束状态检测类"""
     
     def __init__(self, device, collision_threshold=0.001):
         self.device = device
@@ -33,18 +33,13 @@ class CompleteConstraintChecker:
             print("[ERROR] Physics query interfaces not available")
             self.physics_attachment_interface = None
             self.physics_scene_query_interface = None
-            
-        self.debug_constraint_paths = set()
-        self.debug_count = 0
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """批量分析约束状态"""
         num_envs = stylus_positions.shape[0]
         
-        # 获取实时的环境base位置
         current_base_positions = self._omni_robot.data.root_link_pos_w if hasattr(self, '_omni_robot') else env_base_positions
         
-        # 初始化结果
         batch_results = {
             'distances_constraint': torch.ones(num_envs, device=self.device) * 0.02,
             'closest_points': torch.zeros(num_envs, 3, device=self.device),
@@ -56,12 +51,10 @@ class CompleteConstraintChecker:
         if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
             return batch_results
         
-        # 逐环境处理
         for env_id in range(num_envs):
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/mesh"
             
-            result = None
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
                 if result is not None and result['distance'] > 0:
@@ -71,20 +64,18 @@ class CompleteConstraintChecker:
                     batch_results['is_overlapping'][env_id] = result['is_overlapping']
                     batch_results['is_inside'][env_id] = result['is_inside']
             except Exception as e:
-                pass  # 使用默认安全值
+                pass
         
-        self.debug_count += 1
         return batch_results
     
     def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str):
-        """分析单个环境的约束状态"""
+        """分析单个约束状态"""
         try:
             from carb._carb import Float3
             
             pos = stylus_position.cpu().numpy()
             current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
             
-            # 获取最近点
             result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
             
             if not (result and 'closest_points' in result and result['closest_points']):
@@ -92,27 +83,16 @@ class CompleteConstraintChecker:
             
             closest_pt = result['closest_points'][0]
             closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
-            
-            # 计算距离
             distance = float(np.linalg.norm(pos - closest_pos))
             
-            # 检查重叠
-            direction_to_closest = Float3(
-                closest_pt.x - pos[0], 
-                closest_pt.y - pos[1], 
-                closest_pt.z - pos[2]
-            )
-            
-            raycast_result = self.physics_scene_query_interface.raycast_closest(
-                current_point, direction_to_closest, 10000
-            )
+            direction_to_closest = Float3(closest_pt.x - pos[0], closest_pt.y - pos[1], closest_pt.z - pos[2])
+            raycast_result = self.physics_scene_query_interface.raycast_closest(current_point, direction_to_closest, 10000)
             
             is_overlapping = False
             if (('faceIndex' not in raycast_result) and distance < 0.5) or \
                ('faceIndex' in raycast_result and raycast_result.get('faceIndex', -1) == 0 and distance < 0.5):
                 is_overlapping = True
             
-            # 检查是否在内部
             direction_is_inside_1 = Float3(closest_pt.x - pos[0], closest_pt.y - pos[1], 0)
             direction_is_inside_2 = Float3(-closest_pt.x + pos[0], -closest_pt.y + pos[1], 0)
             
@@ -129,31 +109,17 @@ class CompleteConstraintChecker:
             else:
                 direction_is_inside_2 = Float3(-1.0, 0.0, 0.0)
             
-            is_inside_1 = self.physics_scene_query_interface.raycast_any(
-                current_point, direction_is_inside_1, 10000
-            )
-            is_inside_2 = self.physics_scene_query_interface.raycast_any(
-                current_point, direction_is_inside_2, 10000
-            )
-            
+            is_inside_1 = self.physics_scene_query_interface.raycast_any(current_point, direction_is_inside_1, 10000)
+            is_inside_2 = self.physics_scene_query_interface.raycast_any(current_point, direction_is_inside_2, 10000)
             is_inside = bool(is_inside_1) and bool(is_inside_2)
             
-            # 获取法向量
             normal_vector = np.array([1.0, 0.0, 0.0])
             
             if is_overlapping:
                 mirror_point_pos = 2 * closest_pos - pos
                 mirror_point = Float3(float(mirror_point_pos[0]), float(mirror_point_pos[1]), float(mirror_point_pos[2]))
-                
-                direction_mirror_to_current = Float3(
-                    pos[0] - mirror_point_pos[0],
-                    pos[1] - mirror_point_pos[1], 
-                    pos[2] - mirror_point_pos[2]
-                )
-                
-                mirror_raycast = self.physics_scene_query_interface.raycast_closest(
-                    mirror_point, direction_mirror_to_current, 10000
-                )
+                direction_mirror_to_current = Float3(pos[0] - mirror_point_pos[0], pos[1] - mirror_point_pos[1], pos[2] - mirror_point_pos[2])
+                mirror_raycast = self.physics_scene_query_interface.raycast_closest(mirror_point, direction_mirror_to_current, 10000)
                 
                 if mirror_raycast and 'normal' in mirror_raycast:
                     normal_carb = mirror_raycast['normal']
@@ -182,7 +148,7 @@ class CompleteConstraintChecker:
 
 
 class TrajectoryManager:
-    """轨迹管理器 - 简化版，无历史记录"""
+    """轨迹管理器"""
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
         self.device = device
@@ -224,7 +190,7 @@ class TrajectoryManager:
         print(f"[TRAJECTORY] 生成了 {len(self.setpoints_local)} 个轨迹点")
         
     def get_current_setpoint_local(self) -> torch.Tensor:
-        """获取当前设置点（局部坐标）"""
+        """获取当前设置点"""
         indices = torch.clamp(self.current_setpoint_idx, 0, self.num_setpoints - 1)
         return self.setpoints_tensor[indices]
         
@@ -238,7 +204,6 @@ class TrajectoryManager:
         should_update = (distances < self.switch_threshold) & (current_indices < self.num_setpoints - 1)
         
         self.current_setpoint_idx[should_update] += 1
-        
         return should_update
         
     def reset_trajectory(self, env_ids: torch.Tensor = None):
@@ -254,23 +219,139 @@ class TrajectoryManager:
         final_setpoint = self.setpoints_local[-1]
         distances_to_final = torch.norm(current_pos_local - final_setpoint.unsqueeze(0), dim=-1)
         return at_final & (distances_to_final < self.switch_threshold)
+
+
+class RewardLogger:
+    """奖励记录器 - 每环境独立文件"""
     
-    def get_trajectory_info(self) -> Dict:
-        """获取轨迹详细信息"""
-        return {
-            'num_setpoints': self.num_setpoints,
-            'setpoints': self.setpoints_local,
-            'current_indices': self.current_setpoint_idx,
-            'current_setpoints': self.get_current_setpoint_local(),
-            'start_pos': self.start_pos_local,
-            'end_pos': self.end_pos_local,
-            'switch_threshold': self.switch_threshold,
-            'setpoint_interval': self.setpoint_interval
-        }
+    def __init__(self, num_envs, device):
+        self.num_envs = num_envs
+        self.device = device
+        self.target_episodes = [1, 50, 100, 150, 200]
+        
+        # 每个环境独立的计数器
+        self.env_episode_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.env_log_files = {}
+        
+        # 创建日志目录
+        self.log_dir = "logs/env_details"
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        import datetime
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        print(f"[INFO] 环境详细日志目录: {self.log_dir}")
+    
+    def should_log_episode(self, env_id):
+        """判断是否应该记录该环境的当前episode"""
+        episode_num = self.env_episode_counts[env_id].item()
+        return episode_num in self.target_episodes
+    
+    def get_or_create_log_file(self, env_id):
+        """获取或创建环境的日志文件"""
+        if env_id not in self.env_log_files:
+            log_file_path = os.path.join(self.log_dir, f"env_{env_id}_{self.timestamp}.txt")
+            try:
+                self.env_log_files[env_id] = open(log_file_path, 'w')
+                self.env_log_files[env_id].write(f"ENV {env_id} REWARD DETAILS\n")
+                self.env_log_files[env_id].write("="*80 + "\n")
+                self.env_log_files[env_id].write("记录Episode: 1, 50, 100, 150, 200\n")
+                self.env_log_files[env_id].write("="*80 + "\n\n")
+            except Exception as e:
+                print(f"[WARNING] 无法创建环境{env_id}的日志文件: {e}")
+                self.env_log_files[env_id] = None
+        
+        return self.env_log_files[env_id]
+    
+    def log_step_details(self, step_count, reward_components, robot_weights, human_weights, final_rewards):
+        """记录步骤详细信息 - 使用传入的final_rewards"""
+        for env_id in range(self.num_envs):
+            if not self.should_log_episode(env_id):
+                continue
+                
+            log_file = self.get_or_create_log_file(env_id)
+            if log_file is None:
+                continue
+            
+            try:
+                episode_num = self.env_episode_counts[env_id].item()
+                env_step = self.env_step_counts[env_id].item()
+                
+                log_file.write(f"\n[Episode {episode_num} - Step {env_step}]\n")
+                log_file.write("-" * 50 + "\n")
+                
+                # 直接使用传入的总奖励
+                robot_total = final_rewards["robot"][env_id].item()
+                human_total = final_rewards["human"][env_id].item()
+                
+                # Robot奖励详情
+                log_file.write(f"ROBOT (总奖励: {robot_total:.4f}):\n")
+                log_file.write(f"  position_reward: {reward_components['position_reward'][env_id]:.4f} -> {reward_components['position_reward'][env_id] * robot_weights['position_tracking']:.4f} ({'正' if reward_components['position_reward'][env_id] >= 0 else '负'}) [权重: {robot_weights['position_tracking']}]\n")
+                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} -> {reward_components['velocity_reward'][env_id] * robot_weights['velocity_regulation']:.4f} ({'正' if reward_components['velocity_reward'][env_id] >= 0 else '负'}) [权重: {robot_weights['velocity_regulation']}]\n")
+                log_file.write(f"  cbf_values: {reward_components['cbf_values'][env_id]:.4f} -> {reward_components['cbf_values'][env_id] * robot_weights['obstacle_distance']:.4f} ({'正' if reward_components['cbf_values'][env_id] >= 0 else '负'}) [权重: {robot_weights['obstacle_distance']}]\n")
+                log_file.write(f"  control_penalty: {reward_components['robot_control_penalty'][env_id]:.4f} -> {reward_components['robot_control_penalty'][env_id] * robot_weights['control_input']:.4f} ({'正' if reward_components['robot_control_penalty'][env_id] >= 0 else '负'}) [权重: {robot_weights['control_input']}]\n")
+                log_file.write(f"  human_awareness: {reward_components['human_force_penalty'][env_id]:.4f} -> {reward_components['human_force_penalty'][env_id] * robot_weights.get('human_awareness', 0.1):.4f} ({'正' if reward_components['human_force_penalty'][env_id] >= 0 else '负'}) [权重: {robot_weights.get('human_awareness', 0.1)}]\n")
+                
+                # Human奖励详情
+                log_file.write(f"HUMAN (总奖励: {human_total:.4f}):\n")
+                log_file.write(f"  position_reward: {reward_components['position_reward'][env_id]:.4f} -> {reward_components['position_reward'][env_id] * human_weights['position_tracking']:.4f} ({'正' if reward_components['position_reward'][env_id] >= 0 else '负'}) [权重: {human_weights['position_tracking']}]\n")
+                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} -> {reward_components['velocity_reward'][env_id] * human_weights['velocity_regulation']:.4f} ({'正' if reward_components['velocity_reward'][env_id] >= 0 else '负'}) [权重: {human_weights['velocity_regulation']}]\n")
+                log_file.write(f"  cbf_values: {reward_components['cbf_values'][env_id]:.4f} -> {reward_components['cbf_values'][env_id] * human_weights['obstacle_distance']:.4f} ({'正' if reward_components['cbf_values'][env_id] >= 0 else '负'}) [权重: {human_weights['obstacle_distance']}]\n")
+                log_file.write(f"  force_penalty: {reward_components['human_force_penalty'][env_id]:.4f} -> {reward_components['human_force_penalty'][env_id] * human_weights['force_input']:.4f} ({'正' if reward_components['human_force_penalty'][env_id] >= 0 else '负'}) [权重: {human_weights['force_input']}]\n")
+                log_file.write(f"  robot_awareness: {reward_components['robot_control_penalty'][env_id]:.4f} -> {reward_components['robot_control_penalty'][env_id] * human_weights.get('robot_awareness', 0.2):.4f} ({'正' if reward_components['robot_control_penalty'][env_id] >= 0 else '负'}) [权重: {human_weights.get('robot_awareness', 0.2)}]\n")
+                
+                # 公共奖励
+                log_file.write(f"COMMON:\n")
+                log_file.write(f"  force_conflict: {reward_components['force_conflict'][env_id]:.4f} ({'正' if reward_components['force_conflict'][env_id] >= 0 else '负'})\n")
+                log_file.write(f"  completion_reward: {reward_components['completion_reward'][env_id]:.4f} ({'正' if reward_components['completion_reward'][env_id] >= 0 else '负'})\n")
+                
+                log_file.flush()
+                
+            except Exception as e:
+                print(f"[WARNING] 记录环境{env_id}详情失败: {e}")
+    
+    def log_termination(self, env_id, reasons):
+        """记录终止原因"""
+        if not self.should_log_episode(env_id):
+            return
+            
+        log_file = self.get_or_create_log_file(env_id)
+        if log_file is None:
+            return
+        
+        try:
+            episode_num = self.env_episode_counts[env_id].item()
+            log_file.write(f"\n[TERMINATION] Episode {episode_num}: {', '.join(reasons)}\n")
+            log_file.write("="*80 + "\n\n")
+            log_file.flush()
+        except Exception as e:
+            print(f"[WARNING] 记录环境{env_id}终止原因失败: {e}")
+    
+    def on_episode_end(self, env_ids):
+        """Episode结束时更新计数"""
+        self.env_episode_counts[env_ids] += 1
+        self.env_step_counts[env_ids] = 0  # 重置该环境的步数
+    
+    def on_step(self, env_ids=None):
+        """每步更新步数计数"""
+        if env_ids is None:
+            self.env_step_counts += 1
+        else:
+            self.env_step_counts[env_ids] += 1
+    
+    def close_all_files(self):
+        """关闭所有文件"""
+        for env_id, log_file in self.env_log_files.items():
+            if log_file:
+                try:
+                    log_file.close()
+                except:
+                    pass
 
 
 class SurgicalDirectMARLEnv(DirectMARLEnv):
-    """人机协作手术MARL环境 - MADDPG奖励优化版"""
+    """人机协作手术MARL环境"""
     
     cfg: SurgicalDirectMARLEnvCfg
     
@@ -289,6 +370,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             num_envs=self.num_envs,
             env_base_positions=self.env_base_positions
         )
+        
+        # 奖励记录器
+        self.reward_logger = RewardLogger(self.num_envs, self.device)
         
         self.agent_actions = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
@@ -314,6 +398,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self.stylus_body_idx = None
         self.constraint_checker = CompleteConstraintChecker(self.device, self.collision_threshold)
+        
+        # 计数器
+        self.step_count = 0
         
         # 当前状态跟踪
         self.last_constraint_results = None
@@ -365,6 +452,15 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.cbf_gamma = self.params['reward_parameters']['cbf_parameters']['gamma']
         self.cbf_epsilon = self.params['reward_parameters']['cbf_parameters']['epsilon']
         
+        # 终止条件参数
+        term_config = self.params.get('termination_conditions', {})
+        self.enable_z_termination = term_config.get('z_below_zero', True)
+        self.enable_edge_termination = term_config.get('edge_collision', True)
+        self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.005)
+        
+        # Episode长度由cfg控制
+        print(f"[INFO] Episode长度由cfg.episode_length_s控制: {self.cfg.episode_length_s}s")
+        
     def _setup_scene(self):
         """设置场景"""
         self._omni_robot = Articulation(self.cfg.phantom_omni)
@@ -410,8 +506,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             self.stylus_body_idx = len(self._omni_robot.body_names) - 1
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
-        """物理步骤前处理"""
-        # 处理动作
+        """物理步骤前处理 - 删除不必要的clamp"""
         for agent, action in actions.items():
             if agent in self.cfg.possible_agents:
                 if action.dim() == 1:
@@ -421,6 +516,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                         action = action.unsqueeze(-1).expand(-1, 3)
                 
                 max_force = self.max_robot_force if agent == "robot" else self.max_human_force
+                # 官方没有clamp，但考虑到物理约束，保留这个
                 self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
         
         self.robot_forces_t = self.agent_actions["robot"]
@@ -455,6 +551,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     def _apply_action(self) -> None:
         """应用动作并更新状态缓存"""
         self._omni_robot.write_data_to_sim()
+        
+        # 更新计数器
+        self.step_count += 1
+        
+        # 每步更新所有环境的步数
+        self.reward_logger.on_step()
         
         # 更新状态缓存
         self.stylus_pos_t1 = self._get_stylus_position()
@@ -499,12 +601,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         observations = {}
         for agent in self.cfg.possible_agents:
-            observations[agent] = torch.clamp(obs, -10.0, 10.0)
+            observations[agent] = torch.clamp(obs, -20.0, 20.0)
             
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """计算奖励 - MADDPG优化版本"""
+        """计算奖励 - 删除不必要的clamp，与官方对齐"""
         # 轨迹跟踪
         self.trajectory_manager.update_setpoint(self.stylus_pos_t1)
         current_setpoints = self.trajectory_manager.get_current_setpoint_local()
@@ -513,36 +615,20 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         pos_error_norm = torch.norm(pos_error, dim=-1)
         velocity_norm = torch.norm(self.stylus_vel_t1, dim=-1)
         
-        # 新的正奖励形式
-        position_reward = torch.exp(-pos_error_norm * 25.0)  # [0, 1]范围
-        velocity_reward = torch.exp(-velocity_norm * 10.0)   # [0, 1]范围
+        # 奖励组件 - 官方风格，不使用clamp
+        position_reward = torch.exp(-pos_error_norm * 10.0)
+        velocity_reward = torch.exp(-velocity_norm * 10.0)
         
-        # CBF障碍函数 (修复数值稳定性)
-        s = torch.clamp(self.safety_distances_t, min=self.cbf_epsilon, max=10.0)  # 限制最大值
-        gamma_s = self.cbf_gamma * s
+        # CBF计算 - 简化，删除复杂的clamp
+        normalized_distance = torch.clamp(self.safety_distances_t / self.safety_margin, min=0.1, max=10.0)
+        cbf_values = torch.log(normalized_distance)
+        # 删除过度的clamp - 官方没有
         
-        # 计算CBF值并裁剪避免爆炸
-        cbf_ratio = gamma_s / (gamma_s + 1.0)
-        cbf_ratio = torch.clamp(cbf_ratio, min=self.cbf_epsilon, max=1.0 - self.cbf_epsilon)
-        cbf_values = -torch.log(cbf_ratio)
-        
-        # 裁剪CBF值避免极端情况
-        cbf_values = torch.clamp(cbf_values, min=-10.0, max=10.0)
-        
-        # 控制输入惩罚
+        # 控制输入惩罚 - 官方风格
         robot_control_penalty = -torch.sum(self.robot_forces_t**2, dim=-1)
         human_force_penalty = -torch.sum(self.human_forces_t**2, dim=-1)
         
-        # === 公共奖励项 ===
-        
-        # 1. Z轴违规 (调整为-100)
-        z_violation = torch.where(
-            self.stylus_pos_t1[:, 2] < self.min_z_pos,
-            torch.full_like(self.stylus_pos_t1[:, 2], -100.0),  # 从-500改为-100
-            torch.zeros_like(self.stylus_pos_t1[:, 2])
-        )
-        
-        # 2. 协作冲突 (优化冲突检测)
+        # 协作冲突
         dot_product = torch.sum(self.human_forces_t * self.robot_forces_t, dim=-1)
         human_norm = torch.norm(self.human_forces_t, dim=-1)
         robot_norm = torch.norm(self.robot_forces_t, dim=-1)
@@ -554,11 +640,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         force_conflict = torch.where(
             (cos_angle < -0.5) & (force_magnitude > conflict_threshold),
-            cos_angle * conflict_penalty_scale,  # 使用yaml中的scale
+            cos_angle * conflict_penalty_scale,
             torch.zeros_like(cos_angle)
         )
         
-        # 3. 完成奖励
+        # 完成奖励
         final_setpoint = self.trajectory_manager.setpoints_local[-1].unsqueeze(0).expand(self.num_envs, -1)
         distance_to_final = torch.norm(self.stylus_pos_t1 - final_setpoint, dim=-1)
         completion_reward = torch.where(
@@ -567,35 +653,32 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             torch.zeros_like(distance_to_final)
         )
         
-        # === MADDPG智能体奖励组合 ===
-        
-        rewards = {}
+        # 获取权重
         robot_weights = self.params['reward_parameters']['robot_weights']
         human_weights = self.params['reward_parameters']['human_weights']
         
-        # Robot奖励 (包含对human行为的感知)
-        rewards["robot"] = (
-            position_reward * robot_weights['position_tracking'] +           # 强调精确跟踪
-            velocity_reward * robot_weights['velocity_regulation'] +         # 适度平稳
-            cbf_values * robot_weights['obstacle_distance'] +               # CBF安全约束
-            robot_control_penalty * robot_weights['control_input'] +        # 自己的节能
-            human_force_penalty * robot_weights.get('human_awareness', 20.0) +  # 感知human行为 (MADDPG)
-            # 公共项
-            force_conflict + z_violation + completion_reward
-        )
+        # 计算加权后的奖励
+        robot_pos_weighted = position_reward * robot_weights['position_tracking']
+        robot_vel_weighted = velocity_reward * robot_weights['velocity_regulation']
+        robot_cbf_weighted = cbf_values * robot_weights['obstacle_distance']
+        robot_control_weighted = robot_control_penalty * robot_weights['control_input']
+        robot_human_aware_weighted = human_force_penalty * robot_weights.get('human_awareness', 0.1)
         
-        # Human奖励 (包含对robot行为的感知)
-        rewards["human"] = (
-            position_reward * human_weights['position_tracking'] +          # 辅助跟踪
-            velocity_reward * human_weights['velocity_regulation'] +        # 更强调平稳
-            cbf_values * human_weights['obstacle_distance'] +              # CBF安全约束
-            human_force_penalty * human_weights['force_input'] +           # 自己的柔和操作
-            robot_control_penalty * human_weights.get('robot_awareness', 50.0) +  # 感知robot行为 (MADDPG)
-            # 公共项
-            force_conflict + z_violation + completion_reward
-        )
+        human_pos_weighted = position_reward * human_weights['position_tracking']
+        human_vel_weighted = velocity_reward * human_weights['velocity_regulation']
+        human_cbf_weighted = cbf_values * human_weights['obstacle_distance']
+        human_force_weighted = human_force_penalty * human_weights['force_input']
+        human_robot_aware_weighted = robot_control_penalty * human_weights.get('robot_awareness', 0.2)
         
-        # 存储当前奖励组件
+        # 最终奖励 - 删除clamp，官方风格
+        rewards = {}
+        rewards["robot"] = (robot_pos_weighted + robot_vel_weighted + robot_cbf_weighted + 
+                           robot_control_weighted + robot_human_aware_weighted + force_conflict + completion_reward)
+        
+        rewards["human"] = (human_pos_weighted + human_vel_weighted + human_cbf_weighted + 
+                           human_force_weighted + human_robot_aware_weighted + force_conflict + completion_reward)
+        
+        # 存储组件
         self.reward_components = {
             'position_reward': position_reward,
             'velocity_reward': velocity_reward,
@@ -603,33 +686,19 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'robot_control_penalty': robot_control_penalty,
             'human_force_penalty': human_force_penalty,
             'force_conflict': force_conflict,
-            'z_violation': z_violation,
             'completion_reward': completion_reward,
             'distance_to_setpoint': pos_error_norm,
             'distance_to_final': distance_to_final
         }
         
-        # 调试信息 - 定期输出奖励分解
-        if hasattr(self, '_debug_step_count'):
-            self._debug_step_count += 1
-        else:
-            self._debug_step_count = 0
-            
-        if self._debug_step_count % 500 == 0:  # 每500步输出一次调试信息
-            env_id = 0  # 只看第一个环境
-            print(f"\n[REWARD DEBUG] Step {self._debug_step_count}, Env {env_id}:")
-            print(f"  position_reward: {position_reward[env_id]:.4f}")
-            print(f"  velocity_reward: {velocity_reward[env_id]:.4f}")
-            print(f"  cbf_values: {cbf_values[env_id]:.4f}")
-            print(f"  robot_control_penalty: {robot_control_penalty[env_id]:.4f}")
-            print(f"  human_force_penalty: {human_force_penalty[env_id]:.4f}")
-            print(f"  force_conflict: {force_conflict[env_id]:.4f}")
-            print(f"  z_violation: {z_violation[env_id]:.4f}")
-            print(f"  completion_reward: {completion_reward[env_id]:.4f}")
-            print(f"  => Robot total: {rewards['robot'][env_id]:.4f}")
-            print(f"  => Human total: {rewards['human'][env_id]:.4f}")
-            print(f"  Stylus pos: {self.stylus_pos_t1[env_id]}")
-            print(f"  Safety dist: {self.safety_distances_t[env_id]:.4f}")
+        # 记录详细信息
+        self.reward_logger.log_step_details(
+            step_count=self.step_count, 
+            reward_components=self.reward_components, 
+            robot_weights=robot_weights, 
+            human_weights=human_weights,
+            final_rewards=rewards
+        )
         
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
@@ -638,27 +707,53 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             "position_reward": position_reward.mean().item(),
             "velocity_reward": velocity_reward.mean().item(),
             "cbf_penalty": cbf_values.mean().item(),
-            "z_violation_count": (z_violation < 0).sum().item(),
         }
         
         return rewards
         
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """确定终止条件 - 只保留joint_violated和final_reached"""
+        """确定终止条件"""
         
-        # 关节限制违规
-        joint_violated = torch.any(
-            (self.joint_pos_t1[:, :3] < self.joint_lower_limits[:3] - 0.01) |
-            (self.joint_pos_t1[:, :3] > self.joint_upper_limits[:3] + 0.01),
-            dim=1
-        )
+        # Z轴低于0终止
+        z_below_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.enable_z_termination:
+            z_below_zero = self.stylus_pos_t1[:, 2] < self.min_z_pos
+        
+        # 边缘碰撞终止
+        edge_collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.enable_edge_termination:
+            edge_collision = self.safety_distances_t < self.safety_distance_threshold
         
         # 到达终点
         final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         
-        # 简化终止条件 - 只保留两个条件
-        terminated_condition = joint_violated | final_reached
+        # 合并终止条件
+        terminated_condition = z_below_zero | edge_collision | final_reached
+
+        # 时间截断 - 使用父类的episode_length_buf（由cfg.episode_length_s控制）
         truncated_condition = self.episode_length_buf >= self.max_episode_length - 1
+        
+        # 记录终止原因
+        if terminated_condition.any():
+            terminated_envs = torch.where(terminated_condition)[0]
+            for env_id in terminated_envs:
+                env_id_item = env_id.item()
+                reasons = []
+                if z_below_zero[env_id_item]:
+                    reasons.append("Z轴低于0")
+                if edge_collision[env_id_item]:
+                    reasons.append("边缘碰撞")
+                if final_reached[env_id_item]:
+                    reasons.append("到达终点")
+                
+                if reasons:
+                    self.reward_logger.log_termination(env_id_item, reasons)
+        
+        # 记录时间截断
+        if truncated_condition.any():
+            truncated_envs = torch.where(truncated_condition)[0]
+            for env_id in truncated_envs:
+                self.reward_logger.log_termination(env_id.item(), ["时间截断"])
         
         terminated = {agent: terminated_condition for agent in self.cfg.possible_agents}
         truncated = {agent: truncated_condition for agent in self.cfg.possible_agents}
@@ -671,6 +766,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             env_ids = torch.arange(self.num_envs, device=self.device)
         
         super()._reset_idx(env_ids)
+        
+        # 更新episode计数，重置步数计数
+        self.reward_logger.on_episode_end(env_ids)
         
         if self.stylus_body_idx is None:
             self._initialize_body_indices()
@@ -717,14 +815,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         return self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
     
-    # ========== 公共接口方法 ==========
+    def __del__(self):
+        """析构函数"""
+        if hasattr(self, 'reward_logger'):
+            self.reward_logger.close_all_files()
     
+    # 公共接口方法
     def get_trajectory_info(self) -> Dict:
-        """获取轨迹信息"""
         return self.trajectory_manager.get_trajectory_info()
     
     def get_constraint_state(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """获取约束状态"""
         if self.last_constraint_results is None:
             return {}
         
@@ -740,7 +840,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         }
     
     def get_reward_details(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """获取当前奖励详情"""
         if not self.reward_components:
             return {}
         
@@ -750,52 +849,4 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return {
             key: value[env_ids] if torch.is_tensor(value) else value
             for key, value in self.reward_components.items()
-        }
-    
-    def get_env_state(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """获取环境当前状态"""
-        if env_ids is None:
-            env_ids = list(range(min(2, self.num_envs)))
-        
-        env_ids_tensor = torch.tensor(env_ids, device=self.device)
-        
-        return {
-            'stylus_position': self.stylus_pos_t1[env_ids_tensor],
-            'stylus_velocity': self.stylus_vel_t1[env_ids_tensor],
-            'joint_positions': self.joint_pos_t1[env_ids_tensor],
-            'joint_velocities': self.joint_vel_t1[env_ids_tensor],
-            'robot_forces': self.robot_forces_t[env_ids_tensor],
-            'human_forces': self.human_forces_t[env_ids_tensor],
-            'safety_distances': self.safety_distances_t[env_ids_tensor],
-            'is_violating': self.is_violating_t[env_ids_tensor],
-            'trajectory_indices': self.trajectory_manager.current_setpoint_idx[env_ids_tensor],
-            'current_setpoints': self.trajectory_manager.get_current_setpoint_local()[env_ids_tensor]
-        }
-    
-    def calculate_weighted_rewards(self) -> Dict:
-        """计算当前加权奖励分解"""
-        if not self.reward_components:
-            return {}
-        
-        robot_weights = self.params['reward_parameters']['robot_weights']
-        human_weights = self.params['reward_parameters']['human_weights']
-        
-        return {
-            'robot': {
-                'position_tracking': self.reward_components['position_reward'] * robot_weights['position_tracking'],
-                'velocity_regulation': self.reward_components['velocity_reward'] * robot_weights['velocity_regulation'],
-                'cbf_obstacle': self.reward_components['cbf_values'] * robot_weights['obstacle_distance'],
-                'control_penalty': self.reward_components['robot_control_penalty'] * robot_weights['control_input'],
-            },
-            'human': {
-                'position_tracking': self.reward_components['position_reward'] * human_weights['position_tracking'],
-                'velocity_regulation': self.reward_components['velocity_reward'] * human_weights['velocity_regulation'],
-                'cbf_obstacle': self.reward_components['cbf_values'] * human_weights['obstacle_distance'],
-                'force_penalty': self.reward_components['human_force_penalty'] * human_weights['force_input'],
-            },
-            'common': {
-                'force_conflict': self.reward_components['force_conflict'],
-                'z_violation': self.reward_components['z_violation'],
-                'completion_reward': self.reward_components['completion_reward']
-            }
         }

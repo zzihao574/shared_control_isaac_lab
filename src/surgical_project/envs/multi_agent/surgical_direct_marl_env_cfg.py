@@ -29,8 +29,7 @@ class MySceneCfg(InteractiveSceneCfg):
 @configclass
 class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     """Configuration for Surgical Direct MARL Environment"""
-    
-    episode_length_s = 15.0
+    episode_length_s = 20  
     decimation = 2
     
     possible_agents = ["human", "robot"]
@@ -55,8 +54,8 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply", 
-            static_friction=0.8,
-            dynamic_friction=0.6,
+            static_friction=0.001,
+            dynamic_friction=0.001,
             restitution=0.1,
         ),
     )
@@ -70,7 +69,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/omni.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
-                max_linear_velocity=0.04,
+                max_linear_velocity=0.06,
                 max_angular_velocity=50.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
