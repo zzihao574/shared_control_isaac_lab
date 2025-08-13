@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - 完整修复版
+# surgical_direct_marl_env.py - 完整修改版（改进障碍物跨越）
 
 from __future__ import annotations
 
@@ -148,7 +148,7 @@ class CompleteConstraintChecker:
 
 
 class TrajectoryManager:
-    """轨迹管理器"""
+    """轨迹管理器 - 简化版，用于进度跟踪"""
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
         self.device = device
@@ -158,8 +158,14 @@ class TrajectoryManager:
         traj = params['trajectory']
         self.start_pos_local = torch.tensor(traj['start_point'], device=device, dtype=torch.float32)
         self.end_pos_local = torch.tensor(traj['end_point'], device=device, dtype=torch.float32)
-        self.setpoint_interval = traj['setpoint_interval']
-        self.switch_threshold = traj['switch_threshold']
+        self.total_distance = torch.norm(self.end_pos_local - self.start_pos_local).item()
+        
+        # 直线方向单位向量
+        self.line_direction = (self.end_pos_local - self.start_pos_local) / self.total_distance
+        
+        # 10cm设置一个checkpoint，1cm切换
+        self.checkpoint_interval = traj.get('checkpoint_interval', 0.1)  # 10cm
+        self.switch_threshold = traj.get('switch_threshold', 0.01)      # 1cm
         
         self._generate_setpoints(params)
         self.current_setpoint_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
@@ -168,32 +174,23 @@ class TrajectoryManager:
         
     def _generate_setpoints(self, params):
         """生成轨迹设置点"""
-        constraint = params['constraint_geometry']
-        y_pos_range = constraint['y_range_positive']
-        y_neg_range = constraint['y_range_negative']
-        
-        total_distance = torch.norm(self.end_pos_local - self.start_pos_local).item()
-        num_setpoints = int(total_distance / self.setpoint_interval) + 1
-        
+        num_checkpoints = int(self.total_distance / self.checkpoint_interval)
         self.setpoints_local = []
-        direction = (self.end_pos_local - self.start_pos_local) / torch.norm(self.end_pos_local - self.start_pos_local)
         
-        for i in range(num_setpoints + 1):
-            setpoint = self.end_pos_local.clone() if i == num_setpoints else self.start_pos_local + direction * (i * self.setpoint_interval)
-            
-            y_coord = setpoint[1].item()
-            in_constraint = (y_pos_range[0] <= y_coord <= y_pos_range[1]) or (y_neg_range[0] <= y_coord <= y_neg_range[1])
-            
-            if not in_constraint:
-                self.setpoints_local.append(setpoint)
+        for i in range(num_checkpoints + 1):
+            if i == num_checkpoints:
+                checkpoint = self.end_pos_local.clone()
+            else:
+                checkpoint = self.start_pos_local + self.line_direction * (i * self.checkpoint_interval)
+            self.setpoints_local.append(checkpoint)
         
-        print(f"[TRAJECTORY] 生成了 {len(self.setpoints_local)} 个轨迹点")
-        
+        print(f"[TRAJECTORY] 生成了 {len(self.setpoints_local)} 个轨迹点（10cm间隔）")
+    
     def get_current_setpoint_local(self) -> torch.Tensor:
         """获取当前设置点"""
         indices = torch.clamp(self.current_setpoint_idx, 0, self.num_setpoints - 1)
         return self.setpoints_tensor[indices]
-        
+    
     def update_setpoint(self, current_pos_local: torch.Tensor) -> torch.Tensor:
         """更新设置点"""
         current_indices = self.current_setpoint_idx
@@ -205,43 +202,68 @@ class TrajectoryManager:
         
         self.current_setpoint_idx[should_update] += 1
         return should_update
+    
+    def get_progress(self, current_pos_local: torch.Tensor) -> torch.Tensor:
+        """计算沿轨迹的进度（0到1）"""
+        vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
+        progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
+        progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
+        return progress_distance / self.total_distance
+    
+    def get_deviation(self, current_pos_local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """计算到直线的垂直距离和最近点"""
+        vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
+        progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
+        progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
         
+        # 最近点（投影点）
+        closest_points = self.start_pos_local.unsqueeze(0) + progress_distance.unsqueeze(-1) * self.line_direction.unsqueeze(0)
+        
+        # 垂直距离
+        deviations = torch.norm(current_pos_local - closest_points, dim=-1)
+        
+        return deviations, closest_points
+    
+    def is_final_setpoint_reached(self, current_pos_local: torch.Tensor) -> torch.Tensor:
+        """检查是否到达终点"""
+        distances_to_final = torch.norm(current_pos_local - self.end_pos_local.unsqueeze(0), dim=-1)
+        return distances_to_final < self.switch_threshold
+    
     def reset_trajectory(self, env_ids: torch.Tensor = None):
         """重置轨迹"""
         if env_ids is None:
             self.current_setpoint_idx.fill_(0)
         else:
             self.current_setpoint_idx[env_ids] = 0
-        
-    def is_final_setpoint_reached(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """检查是否到达终点"""
-        at_final = (self.current_setpoint_idx >= self.num_setpoints - 1)
-        final_setpoint = self.setpoints_local[-1]
-        distances_to_final = torch.norm(current_pos_local - final_setpoint.unsqueeze(0), dim=-1)
-        return at_final & (distances_to_final < self.switch_threshold)
+    
+    def get_trajectory_info(self) -> Dict:
+        """获取轨迹信息"""
+        return {
+            'start_point': self.start_pos_local.cpu().numpy(),
+            'end_point': self.end_pos_local.cpu().numpy(),
+            'total_distance': self.total_distance,
+            'num_checkpoints': self.num_setpoints,
+            'checkpoint_interval': self.checkpoint_interval
+        }
 
 
 class RewardLogger:
-    """奖励记录器 - 每环境独立文件"""
+    """奖励记录器 - 简化版"""
     
     def __init__(self, num_envs, device):
         self.num_envs = num_envs
         self.device = device
         self.target_episodes = [1, 50, 100, 150, 200]
         
-        # 每个环境独立的计数器
         self.env_episode_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.env_log_files = {}
         
-        # 创建日志目录
         self.log_dir = "logs/env_details"
         os.makedirs(self.log_dir, exist_ok=True)
         
         import datetime
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        print(f"[INFO] 环境详细日志目录: {self.log_dir}")
     
     def should_log_episode(self, env_id):
         """判断是否应该记录该环境的当前episode"""
@@ -265,7 +287,7 @@ class RewardLogger:
         return self.env_log_files[env_id]
     
     def log_step_details(self, step_count, reward_components, robot_weights, human_weights, final_rewards):
-        """记录步骤详细信息 - 使用传入的final_rewards"""
+        """记录步骤详细信息"""
         for env_id in range(self.num_envs):
             if not self.should_log_episode(env_id):
                 continue
@@ -281,30 +303,35 @@ class RewardLogger:
                 log_file.write(f"\n[Episode {episode_num} - Step {env_step}]\n")
                 log_file.write("-" * 50 + "\n")
                 
-                # 直接使用传入的总奖励
+                # 总奖励
                 robot_total = final_rewards["robot"][env_id].item()
                 human_total = final_rewards["human"][env_id].item()
                 
                 # Robot奖励详情
                 log_file.write(f"ROBOT (总奖励: {robot_total:.4f}):\n")
-                log_file.write(f"  position_reward: {reward_components['position_reward'][env_id]:.4f} -> {reward_components['position_reward'][env_id] * robot_weights['position_tracking']:.4f} ({'正' if reward_components['position_reward'][env_id] >= 0 else '负'}) [权重: {robot_weights['position_tracking']}]\n")
-                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} -> {reward_components['velocity_reward'][env_id] * robot_weights['velocity_regulation']:.4f} ({'正' if reward_components['velocity_reward'][env_id] >= 0 else '负'}) [权重: {robot_weights['velocity_regulation']}]\n")
-                log_file.write(f"  cbf_values: {reward_components['cbf_values'][env_id]:.4f} -> {reward_components['cbf_values'][env_id] * robot_weights['obstacle_distance']:.4f} ({'正' if reward_components['cbf_values'][env_id] >= 0 else '负'}) [权重: {robot_weights['obstacle_distance']}]\n")
-                log_file.write(f"  control_penalty: {reward_components['robot_control_penalty'][env_id]:.4f} -> {reward_components['robot_control_penalty'][env_id] * robot_weights['control_input']:.4f} ({'正' if reward_components['robot_control_penalty'][env_id] >= 0 else '负'}) [权重: {robot_weights['control_input']}]\n")
-                log_file.write(f"  human_awareness: {reward_components['human_force_penalty'][env_id]:.4f} -> {reward_components['human_force_penalty'][env_id] * robot_weights.get('human_awareness', 0.1):.4f} ({'正' if reward_components['human_force_penalty'][env_id] >= 0 else '负'}) [权重: {robot_weights.get('human_awareness', 0.1)}]\n")
+                log_file.write(f"  trajectory_reward: {reward_components['trajectory_reward'][env_id]:.4f} * {robot_weights['trajectory_tracking']}\n")
+                log_file.write(f"  progress_reward: {reward_components['progress_reward'][env_id]:.4f} * {robot_weights['progress']}\n")
+                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} * {robot_weights['velocity']}\n")
+                log_file.write(f"  cbf_reward: {reward_components['cbf_reward'][env_id]:.4f} * {robot_weights['obstacle_cbf']}\n")
+                log_file.write(f"  crossing_reward: {reward_components['crossing_reward'][env_id]:.4f} * {robot_weights['crossing']}\n")
+                log_file.write(f"  robot_force_penalty: {reward_components['robot_force_penalty'][env_id]:.4f} * {robot_weights['force_efficiency']}\n")
+                log_file.write(f"  human_force_awareness: {reward_components['human_force_penalty'][env_id]:.4f} * {robot_weights['human_awareness']}\n")
                 
                 # Human奖励详情
                 log_file.write(f"HUMAN (总奖励: {human_total:.4f}):\n")
-                log_file.write(f"  position_reward: {reward_components['position_reward'][env_id]:.4f} -> {reward_components['position_reward'][env_id] * human_weights['position_tracking']:.4f} ({'正' if reward_components['position_reward'][env_id] >= 0 else '负'}) [权重: {human_weights['position_tracking']}]\n")
-                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} -> {reward_components['velocity_reward'][env_id] * human_weights['velocity_regulation']:.4f} ({'正' if reward_components['velocity_reward'][env_id] >= 0 else '负'}) [权重: {human_weights['velocity_regulation']}]\n")
-                log_file.write(f"  cbf_values: {reward_components['cbf_values'][env_id]:.4f} -> {reward_components['cbf_values'][env_id] * human_weights['obstacle_distance']:.4f} ({'正' if reward_components['cbf_values'][env_id] >= 0 else '负'}) [权重: {human_weights['obstacle_distance']}]\n")
-                log_file.write(f"  force_penalty: {reward_components['human_force_penalty'][env_id]:.4f} -> {reward_components['human_force_penalty'][env_id] * human_weights['force_input']:.4f} ({'正' if reward_components['human_force_penalty'][env_id] >= 0 else '负'}) [权重: {human_weights['force_input']}]\n")
-                log_file.write(f"  robot_awareness: {reward_components['robot_control_penalty'][env_id]:.4f} -> {reward_components['robot_control_penalty'][env_id] * human_weights.get('robot_awareness', 0.2):.4f} ({'正' if reward_components['robot_control_penalty'][env_id] >= 0 else '负'}) [权重: {human_weights.get('robot_awareness', 0.2)}]\n")
+                log_file.write(f"  trajectory_reward: {reward_components['trajectory_reward'][env_id]:.4f} * {human_weights['trajectory_tracking']}\n")
+                log_file.write(f"  progress_reward: {reward_components['progress_reward'][env_id]:.4f} * {human_weights['progress']}\n")
+                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} * {human_weights['velocity']}\n")
+                log_file.write(f"  cbf_reward: {reward_components['cbf_reward'][env_id]:.4f} * {human_weights['obstacle_cbf']}\n")
+                log_file.write(f"  crossing_reward: {reward_components['crossing_reward'][env_id]:.4f} * {human_weights['crossing']}\n")
+                log_file.write(f"  human_force_penalty: {reward_components['human_force_penalty'][env_id]:.4f} * {human_weights['force_efficiency']}\n")
+                log_file.write(f"  robot_force_awareness: {reward_components['robot_force_penalty'][env_id]:.4f} * {human_weights['robot_awareness']}\n")
                 
-                # 公共奖励
-                log_file.write(f"COMMON:\n")
-                log_file.write(f"  force_conflict: {reward_components['force_conflict'][env_id]:.4f} ({'正' if reward_components['force_conflict'][env_id] >= 0 else '负'})\n")
-                log_file.write(f"  completion_reward: {reward_components['completion_reward'][env_id]:.4f} ({'正' if reward_components['completion_reward'][env_id] >= 0 else '负'})\n")
+                # 附加信息
+                log_file.write(f"EXTRA:\n")
+                log_file.write(f"  deviation: {reward_components['deviation'][env_id]:.4f}m\n")
+                log_file.write(f"  progress: {reward_components['progress_ratio'][env_id]:.2%}\n")
+                log_file.write(f"  completion_reward: {reward_components['completion_reward'][env_id]:.4f}\n")
                 
                 log_file.flush()
                 
@@ -331,7 +358,7 @@ class RewardLogger:
     def on_episode_end(self, env_ids):
         """Episode结束时更新计数"""
         self.env_episode_counts[env_ids] += 1
-        self.env_step_counts[env_ids] = 0  # 重置该环境的步数
+        self.env_step_counts[env_ids] = 0
     
     def on_step(self, env_ids=None):
         """每步更新步数计数"""
@@ -371,7 +398,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             env_base_positions=self.env_base_positions
         )
         
-        # 奖励记录器
         self.reward_logger = RewardLogger(self.num_envs, self.device)
         
         self.agent_actions = {
@@ -399,10 +425,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.stylus_body_idx = None
         self.constraint_checker = CompleteConstraintChecker(self.device, self.collision_threshold)
         
-        # 计数器
         self.step_count = 0
         
-        # 当前状态跟踪
         self.last_constraint_results = None
         self.reward_components = {}
         
@@ -452,13 +476,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.cbf_gamma = self.params['reward_parameters']['cbf_parameters']['gamma']
         self.cbf_epsilon = self.params['reward_parameters']['cbf_parameters']['epsilon']
         
-        # 终止条件参数
         term_config = self.params.get('termination_conditions', {})
         self.enable_z_termination = term_config.get('z_below_zero', True)
         self.enable_edge_termination = term_config.get('edge_collision', True)
-        self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.005)
+        self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.001)  # 修改为0.001
         
-        # Episode长度由cfg控制
         print(f"[INFO] Episode长度由cfg.episode_length_s控制: {self.cfg.episode_length_s}s")
         
     def _setup_scene(self):
@@ -506,7 +528,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             self.stylus_body_idx = len(self._omni_robot.body_names) - 1
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
-        """物理步骤前处理 - 删除不必要的clamp"""
+        """物理步骤前处理"""
         for agent, action in actions.items():
             if agent in self.cfg.possible_agents:
                 if action.dim() == 1:
@@ -516,7 +538,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                         action = action.unsqueeze(-1).expand(-1, 3)
                 
                 max_force = self.max_robot_force if agent == "robot" else self.max_human_force
-                # 官方没有clamp，但考虑到物理约束，保留这个
                 self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
         
         self.robot_forces_t = self.agent_actions["robot"]
@@ -552,10 +573,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """应用动作并更新状态缓存"""
         self._omni_robot.write_data_to_sim()
         
-        # 更新计数器
         self.step_count += 1
-        
-        # 每步更新所有环境的步数
         self.reward_logger.on_step()
         
         # 更新状态缓存
@@ -606,88 +624,125 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """计算奖励 - 删除不必要的clamp，与官方对齐"""
-        # 轨迹跟踪
-        self.trajectory_manager.update_setpoint(self.stylus_pos_t1)
-        current_setpoints = self.trajectory_manager.get_current_setpoint_local()
+        """计算奖励 - 改进的障碍物跨越系统"""
+        # 1. 轨迹偏差奖励
+        deviations, closest_points = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         
-        pos_error = self.stylus_pos_t1 - current_setpoints
-        pos_error_norm = torch.norm(pos_error, dim=-1)
-        velocity_norm = torch.norm(self.stylus_vel_t1, dim=-1)
-        
-        # 奖励组件 - 官方风格，不使用clamp
-        position_reward = torch.exp(-pos_error_norm * 10.0)
-        velocity_reward = torch.exp(-velocity_norm * 10.0)
-        
-        # CBF计算 - 简化，删除复杂的clamp
-        normalized_distance = torch.clamp(self.safety_distances_t / self.safety_margin, min=0.1, max=10.0)
-        cbf_values = torch.log(normalized_distance)
-        # 删除过度的clamp - 官方没有
-        
-        # 控制输入惩罚 - 官方风格
-        robot_control_penalty = -torch.sum(self.robot_forces_t**2, dim=-1)
-        human_force_penalty = -torch.sum(self.human_forces_t**2, dim=-1)
-        
-        # 协作冲突
-        dot_product = torch.sum(self.human_forces_t * self.robot_forces_t, dim=-1)
-        human_norm = torch.norm(self.human_forces_t, dim=-1)
-        robot_norm = torch.norm(self.robot_forces_t, dim=-1)
-        cos_angle = dot_product / (human_norm * robot_norm + 1e-6)
-        
-        force_magnitude = human_norm + robot_norm
-        conflict_threshold = self.params['reward_parameters']['collaboration_parameters']['force_conflict_threshold']
-        conflict_penalty_scale = self.params['reward_parameters']['collaboration_parameters']['conflict_penalty_scale']
-        
-        force_conflict = torch.where(
-            (cos_angle < -0.5) & (force_magnitude > conflict_threshold),
-            cos_angle * conflict_penalty_scale,
-            torch.zeros_like(cos_angle)
+        trajectory_reward = torch.where(
+            deviations < 0.01,
+            torch.ones_like(deviations),
+            torch.where(
+                deviations < 0.025,
+                1.0 - (deviations - 0.01) / 0.015,
+                -10.0 * (deviations - 0.025)
+            )
         )
         
-        # 完成奖励
-        final_setpoint = self.trajectory_manager.setpoints_local[-1].unsqueeze(0).expand(self.num_envs, -1)
-        distance_to_final = torch.norm(self.stylus_pos_t1 - final_setpoint, dim=-1)
+        # 2. 进度奖励
+        progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+        progress_reward = progress_ratio * 5.0
+        
+        # 3. 速度奖励
+        velocity_along_line = torch.abs(
+            torch.sum(self.stylus_vel_t1 * self.trajectory_manager.line_direction.unsqueeze(0), dim=-1)
+        )
+        target_velocity = 0.025  # 2.5cm/s
+        velocity_error = torch.abs(velocity_along_line - target_velocity)
+        velocity_reward = torch.exp(-velocity_error * 20.0)
+        
+        # 4. 改进的CBF障碍物奖励
+        obstacle_y_pos = 0.0  # 障碍物在y=0位置
+        crossing_zone = torch.abs(self.stylus_pos_t1[:, 1] - obstacle_y_pos) < 0.05  # 5cm跨越区
+        
+        cbf_reward = torch.where(
+            crossing_zone,  # 在跨越区域
+            torch.where(
+                self.safety_distances_t < 0.001,  # 非常近，强惩罚
+                torch.full_like(self.safety_distances_t, -30.0),
+                torch.where(
+                    self.safety_distances_t < 0.01,  # 0.1-1cm，中等惩罚
+                    torch.full_like(self.safety_distances_t, -5.0),
+                    torch.full_like(self.safety_distances_t, 0.2)  # >1cm，小奖励
+                )
+            ),
+            # 不在跨越区域，正常CBF
+            torch.where(
+                self.safety_distances_t < 0.01,
+                -10.0 * (0.01 - self.safety_distances_t) / 0.01,
+                torch.full_like(self.safety_distances_t, 0.1)
+            )
+        )
+        
+        # 5. 添加跨越进度奖励
+        near_obstacle = torch.abs(self.stylus_pos_t1[:, 1] - obstacle_y_pos) < 0.1  # 10cm范围
+        moving_forward = self.stylus_vel_t1[:, 1] > 0.01  # y方向正速度
+        safe_distance = self.safety_distances_t > 0.001  # 保持安全距离
+        
+        crossing_reward = torch.where(
+            near_obstacle & moving_forward & safe_distance,
+            torch.full_like(progress_ratio, 2.0),  # 鼓励跨越
+            torch.zeros_like(progress_ratio)
+        )
+        
+        # 6. 力惩罚（二次型）
+        robot_force_penalty = -50.0 * torch.sum(self.robot_forces_t**2, dim=-1)
+        human_force_penalty = -50.0 * torch.sum(self.human_forces_t**2, dim=-1)
+        
+        # 7. 完成奖励
+        distance_to_final = torch.norm(
+            self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), 
+            dim=-1
+        )
         completion_reward = torch.where(
-            distance_to_final < self.params['reward_parameters']['completion_threshold'],
-            torch.full_like(distance_to_final, self.params['reward_parameters']['completion_reward']),
+            distance_to_final < 0.01,
+            torch.full_like(distance_to_final, 50.0),
             torch.zeros_like(distance_to_final)
         )
+        
+        # 更新检查点（仅用于进度跟踪）
+        self.trajectory_manager.update_setpoint(self.stylus_pos_t1)
         
         # 获取权重
         robot_weights = self.params['reward_parameters']['robot_weights']
         human_weights = self.params['reward_parameters']['human_weights']
         
-        # 计算加权后的奖励
-        robot_pos_weighted = position_reward * robot_weights['position_tracking']
-        robot_vel_weighted = velocity_reward * robot_weights['velocity_regulation']
-        robot_cbf_weighted = cbf_values * robot_weights['obstacle_distance']
-        robot_control_weighted = robot_control_penalty * robot_weights['control_input']
-        robot_human_aware_weighted = human_force_penalty * robot_weights.get('human_awareness', 0.1)
-        
-        human_pos_weighted = position_reward * human_weights['position_tracking']
-        human_vel_weighted = velocity_reward * human_weights['velocity_regulation']
-        human_cbf_weighted = cbf_values * human_weights['obstacle_distance']
-        human_force_weighted = human_force_penalty * human_weights['force_input']
-        human_robot_aware_weighted = robot_control_penalty * human_weights.get('robot_awareness', 0.2)
-        
-        # 最终奖励 - 删除clamp，官方风格
+        # 计算最终奖励
         rewards = {}
-        rewards["robot"] = (robot_pos_weighted + robot_vel_weighted + robot_cbf_weighted + 
-                           robot_control_weighted + robot_human_aware_weighted + force_conflict + completion_reward)
+        rewards["robot"] = (
+            trajectory_reward * robot_weights['trajectory_tracking'] +
+            progress_reward * robot_weights['progress'] +
+            velocity_reward * robot_weights['velocity'] +
+            cbf_reward * robot_weights['obstacle_cbf'] +
+            crossing_reward * robot_weights.get('crossing', 1.0) +
+            robot_force_penalty * robot_weights['force_efficiency'] +
+            human_force_penalty * robot_weights['human_awareness'] +
+            completion_reward
+        )
         
-        rewards["human"] = (human_pos_weighted + human_vel_weighted + human_cbf_weighted + 
-                           human_force_weighted + human_robot_aware_weighted + force_conflict + completion_reward)
+        rewards["human"] = (
+            trajectory_reward * human_weights['trajectory_tracking'] +
+            progress_reward * human_weights['progress'] +
+            velocity_reward * human_weights['velocity'] +
+            cbf_reward * human_weights['obstacle_cbf'] +
+            crossing_reward * human_weights.get('crossing', 0.8) +
+            human_force_penalty * human_weights['force_efficiency'] +
+            robot_force_penalty * human_weights['robot_awareness'] +
+            completion_reward
+        )
         
         # 存储组件
         self.reward_components = {
-            'position_reward': position_reward,
+            'trajectory_reward': trajectory_reward,
+            'progress_reward': progress_reward,
             'velocity_reward': velocity_reward,
-            'cbf_values': cbf_values,
-            'robot_control_penalty': robot_control_penalty,
+            'cbf_reward': cbf_reward,
+            'crossing_reward': crossing_reward,
+            'robot_force_penalty': robot_force_penalty,
             'human_force_penalty': human_force_penalty,
-            'force_conflict': force_conflict,
             'completion_reward': completion_reward,
-            'distance_to_setpoint': pos_error_norm,
+            'deviation': deviations,
+            'progress_ratio': progress_ratio,
+            'distance_to_setpoint': torch.norm(self.stylus_pos_t1 - self.trajectory_manager.get_current_setpoint_local(), dim=-1),
             'distance_to_final': distance_to_final
         }
         
@@ -703,10 +758,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
             "human_reward": rewards["human"].mean().item(),
+            "deviation": deviations.mean().item(),
+            "progress": progress_ratio.mean().item(),
             "safety_distance": self.safety_distances_t.mean().item(),
-            "position_reward": position_reward.mean().item(),
-            "velocity_reward": velocity_reward.mean().item(),
-            "cbf_penalty": cbf_values.mean().item(),
+            "crossing_reward": crossing_reward.mean().item(),
         }
         
         return rewards
@@ -719,7 +774,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if self.enable_z_termination:
             z_below_zero = self.stylus_pos_t1[:, 2] < self.min_z_pos
         
-        # 边缘碰撞终止
+        # 边缘碰撞终止 - 使用0.001
         edge_collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.enable_edge_termination:
             edge_collision = self.safety_distances_t < self.safety_distance_threshold
@@ -730,7 +785,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # 合并终止条件
         terminated_condition = z_below_zero | edge_collision | final_reached
 
-        # 时间截断 - 使用父类的episode_length_buf（由cfg.episode_length_s控制）
+        # 时间截断
         truncated_condition = self.episode_length_buf >= self.max_episode_length - 1
         
         # 记录终止原因
@@ -749,7 +804,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 if reasons:
                     self.reward_logger.log_termination(env_id_item, reasons)
         
-        # 记录时间截断
         if truncated_condition.any():
             truncated_envs = torch.where(truncated_condition)[0]
             for env_id in truncated_envs:
@@ -767,7 +821,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         super()._reset_idx(env_ids)
         
-        # 更新episode计数，重置步数计数
         self.reward_logger.on_episode_end(env_ids)
         
         if self.stylus_body_idx is None:

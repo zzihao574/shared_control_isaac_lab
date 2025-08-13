@@ -1,23 +1,22 @@
-# training_params.yaml - 官方MADDPG参数对齐版
+# training_params.yaml - 新奖励系统完整配置
 
 # Global settings
-seed: 42                              # 全局随机种子
+seed: 42
 
-# Trajectory parameters
+# Trajectory parameters - 简化版
 trajectory:
   start_point: [0.14, -0.2, 0.03]
   end_point: [0.14, 0.2, 0.03]
-  setpoint_interval: 0.03
-  switch_threshold: 0.0075
+  checkpoint_interval: 0.1  # 10cm设置一个检查点
+  switch_threshold: 0.01    # 1cm切换距离
   total_distance: 0.4
 
-# Constraints - 根据你的任务调整
+# Constraints
 constraints:
   min_z_position: 0.0
-  max_robot_force: 0.02    # 根据你的0.005-0.02N范围调整
-  max_human_force: 0.02    # 根据你的0.005-0.02N范围调整
+  max_robot_force: 0.02    # 0.005-0.02N范围
+  max_human_force: 0.02    # 0.005-0.02N范围
   
-  # Joint limits
   joint_limits:
     waist: [-0.98, 0.98]
     shoulder: [0.0, 1.75]
@@ -43,32 +42,29 @@ constraint_geometry:
   y_range_positive: [0.038, 0.048]
   y_range_negative: [-0.048, -0.038]
 
-# 奖励参数 - 根据40cm移动和精细控制调整
+# 新奖励参数系统
 reward_parameters:
-  # Robot权重 - 增加位置跟踪，降低控制惩罚
+  # Robot权重
   robot_weights:
-    position_tracking: 8.0       # 增加，因为需要精确跟踪40cm轨迹
-    velocity_regulation: 0.2     # 适中，允许1-4cm/s速度
-    obstacle_distance: 3.0       # CBF约束权重
-    control_input: 0.02          # 降低，因为力范围很小(0.005-0.02N)
-    human_awareness: 0.1         # 人机协作感知
+    trajectory_tracking: 5.0    # 轨迹偏差权重
+    progress: 3.0               # 进度奖励权重  
+    velocity: 1.0               # 速度调节权重
+    obstacle_cbf: 4.0           # CBF障碍物权重
+    force_efficiency: 0.5       # 自身力效率
+    human_awareness: 0.3        # 人类力感知
     
   # Human权重
   human_weights:
-    position_tracking: 6.0       # 人类也需要跟踪轨迹
-    velocity_regulation: 0.2     # 速度正则化
-    obstacle_distance: 2.0       # CBF约束权重
-    force_input: 0.02           # 力输入惩罚，对应小力值
-    robot_awareness: 0.15        # 对机器人的感知
+    trajectory_tracking: 4.0    # 轨迹偏差权重
+    progress: 2.5               # 进度奖励权重
+    velocity: 0.8               # 速度调节权重
+    obstacle_cbf: 3.5           # CBF障碍物权重
+    force_efficiency: 0.4       # 自身力效率
+    robot_awareness: 0.25       # 机器人力感知
     
-  # 协作参数
-  collaboration_parameters:
-    force_conflict_threshold: 0.005  # 降低，对应小力值范围      
-    conflict_penalty_scale: 2.0     # 冲突惩罚
-    
-  # 公共奖励项
-  completion_reward: 20.0             # 增加完成奖励，因为40cm是长距离
-  completion_threshold: 0.01          # 完成阈值
+  # 完成奖励（不需要权重，直接加）
+  completion_reward: 50.0
+  completion_threshold: 0.01
   
   # CBF参数
   cbf_parameters:
@@ -82,37 +78,37 @@ termination_conditions:
   edge_collision: true
   safety_distance_threshold: 0.001
 
-# MADDPG配置 - 严格按官方参数，移除非官方参数
+# MADDPG配置 - 官方参数
 maddpg_config:
-  # 官方学习参数
-  lr_actor: 0.01                      # 官方默认学习率
-  lr_critic: 0.01                     # 官方默认学习率  
-  gamma: 0.9                          # 官方折扣因子
-  batch_size: 256                     # 官方批量大小
-  num_units: 64                       # 官方隐藏层单元数
+  # 学习参数
+  lr_actor: 0.01                # 官方默认学习率
+  lr_critic: 0.01               # 官方默认学习率
+  gamma: 0.9                    # 折扣因子
+  batch_size: 256               # 批量大小
+  num_units: 64                 # 隐藏层单元数
   
-  # 官方训练参数
-  num_episodes: 600                   # 官方episode数量
-  update_interval: 50                 # 官方更新间隔
-  min_buffer_size: 1024               # 最小buffer大小
+  # 训练参数
+  num_episodes: 600             # episode数量
+  update_interval: 50           # 更新间隔
+  min_buffer_size: 1024         # 最小buffer大小
   
-  # 网络更新参数 - 官方参数
-  tau: 0.01                           # 官方polyak系数
-  max_replay_buffer_len: 10000        # Buffer容量
+  # 网络更新参数
+  tau: 0.01                     # polyak系数
+  max_replay_buffer_len: 10000  # Buffer容量
 
-# 智能体和环境配置 - 消除硬编码
+# 智能体配置
 agent_config:
-  agent_names: ["human", "robot"]     # 智能体名称列表
-  num_agents: 2                       # 智能体数量
-  observation_dims: [21, 21]          # 各智能体观测维度
-  action_dims: [3, 3]                 # 各智能体动作维度
-  total_observation_dim: 42           # 总观测维度
-  total_action_dim: 6                 # 总动作维度
+  agent_names: ["human", "robot"]
+  num_agents: 2
+  observation_dims: [21, 21]
+  action_dims: [3, 3]
+  total_observation_dim: 42
+  total_action_dim: 6
 
-# 训练监控参数 - 消除硬编码  
+# 训练监控参数
 training_monitor:
-  eval_episode_steps: 500             # 评估时每个episode的步数
-  milestone_episodes: [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000]  # 里程碑episode列表
+  eval_episode_steps: 500
+  milestone_episodes: [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000]
 
 # Environment config
 env_config:
