@@ -1,21 +1,33 @@
-# training_params.yaml - 新奖励系统完整配置
+# training_params.yaml - 简化版
 
-# Global settings
+# ==============================================================================
+# 全局设置
+# ==============================================================================
 seed: 42
 
-# Trajectory parameters - 简化版
+# ==============================================================================
+# 日志配置
+# ==============================================================================
+logging:
+  enable_text_logging: false  # 是否记录详细文本日志
+
+# ==============================================================================
+# 轨迹参数
+# ==============================================================================
 trajectory:
   start_point: [0.14, -0.2, 0.03]
   end_point: [0.14, 0.2, 0.03]
-  checkpoint_interval: 0.1  # 10cm设置一个检查点
-  switch_threshold: 0.01    # 1cm切换距离
+  checkpoint_interval: 0.1
+  switch_threshold: 0.01
   total_distance: 0.4
 
-# Constraints
+# ==============================================================================
+# 约束参数
+# ==============================================================================
 constraints:
   min_z_position: 0.0
-  max_robot_force: 0.02    # 0.005-0.02N范围
-  max_human_force: 0.02    # 0.005-0.02N范围
+  max_robot_force: 0.02
+  max_human_force: 0.02
   
   joint_limits:
     waist: [-0.98, 0.98]
@@ -25,7 +37,9 @@ constraints:
     pitch: [0.0, 2.5]
     roll: [-2.58, 2.58]
 
-# Initial conditions
+# ==============================================================================
+# 初始条件
+# ==============================================================================
 initial_conditions:
   joint_positions:
     waist: -0.96
@@ -35,68 +49,71 @@ initial_conditions:
     pitch: 2.0944
     roll: 0.0
 
-# Constraint geometry
+# ==============================================================================
+# 约束几何
+# ==============================================================================
 constraint_geometry:
   center: [0.14, 0.0, 0.0]
   collision_threshold: 0.001
   y_range_positive: [0.038, 0.048]
   y_range_negative: [-0.048, -0.038]
 
-# 新奖励参数系统
+# ==============================================================================
+# 奖励参数
+# ==============================================================================
 reward_parameters:
-  # Robot权重
   robot_weights:
-    trajectory_tracking: 5.0    # 轨迹偏差权重
-    progress: 3.0               # 进度奖励权重  
-    velocity: 1.0               # 速度调节权重
-    obstacle_cbf: 4.0           # CBF障碍物权重
-    force_efficiency: 0.5       # 自身力效率
-    human_awareness: 0.3        # 人类力感知
+    trajectory_tracking: 10.0
+    progress: 8.0
+    velocity: 1.0
+    obstacle_cbf: 4.0
+    crossing: 1.0
+    force_efficiency: 0.5
+    human_awareness: 0.3
     
-  # Human权重
   human_weights:
-    trajectory_tracking: 4.0    # 轨迹偏差权重
-    progress: 2.5               # 进度奖励权重
-    velocity: 0.8               # 速度调节权重
-    obstacle_cbf: 3.5           # CBF障碍物权重
-    force_efficiency: 0.4       # 自身力效率
-    robot_awareness: 0.25       # 机器人力感知
+    trajectory_tracking: 8.0
+    progress: 7.0
+    velocity: 0.8
+    obstacle_cbf: 4.0
+    crossing: 0.8
+    force_efficiency: 0.4
+    robot_awareness: 0.25
     
-  # 完成奖励（不需要权重，直接加）
   completion_reward: 50.0
   completion_threshold: 0.01
   
-  # CBF参数
   cbf_parameters:
     safety_margin: 0.01
     gamma: 10.0
     epsilon: 0.000001
 
-# 终止条件参数
+# ==============================================================================
+# 终止条件
+# ==============================================================================
 termination_conditions:
-  z_below_zero: true
-  edge_collision: true
+  z_below_zero: false
+  edge_collision: false
   safety_distance_threshold: 0.001
 
-# MADDPG配置 - 官方参数
+# ==============================================================================
+# MADDPG配置
+# ==============================================================================
 maddpg_config:
-  # 学习参数
-  lr_actor: 0.01                # 官方默认学习率
-  lr_critic: 0.01               # 官方默认学习率
-  gamma: 0.9                    # 折扣因子
-  batch_size: 256               # 批量大小
-  num_units: 64                 # 隐藏层单元数
-  
-  # 训练参数
-  num_episodes: 600             # episode数量
-  update_interval: 50           # 更新间隔
-  min_buffer_size: 1024         # 最小buffer大小
-  
-  # 网络更新参数
-  tau: 0.01                     # polyak系数
-  max_replay_buffer_len: 10000  # Buffer容量
+  lr_actor: 0.01
+  lr_critic: 0.01
+  gamma: 0.9
+  batch_size: 512
+  num_units: 64
+  num_episodes: 600
+  update_interval: 100
+  min_buffer_size: 1024
+  tau: 0.01
+  max_replay_buffer_len: 10000
 
+# ==============================================================================
 # 智能体配置
+# ==============================================================================
 agent_config:
   agent_names: ["human", "robot"]
   num_agents: 2
@@ -105,19 +122,21 @@ agent_config:
   total_observation_dim: 42
   total_action_dim: 6
 
-# 训练监控参数
+# ==============================================================================
+# 训练监控
+# ==============================================================================
 training_monitor:
-  eval_episode_steps: 500
-  milestone_episodes: [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000]
+  milestone_episodes: [2, 10, 20, 30, 50, 75, 90, 100, 125, 150, 175, 200, 300, 500]
 
-# Environment config
+# ==============================================================================
+# 环境配置
+# ==============================================================================
 env_config:
   num_envs: 512
   agents: ["human", "robot"]
-  centralized_critic: true
-  parameter_sharing: false
 
-# Hardware settings
+# ==============================================================================
+# 硬件配置
+# ==============================================================================
 hardware:
   device: "cuda"
-  num_workers: 1

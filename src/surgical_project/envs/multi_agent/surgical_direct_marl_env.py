@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - 完整修改版（改进障碍物跨越）
+# surgical_direct_marl_env.py - 修复版，禁用RewardLogger调试输出
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import yaml
 import os
 import gymnasium as gym
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
@@ -246,136 +247,350 @@ class TrajectoryManager:
             'checkpoint_interval': self.checkpoint_interval
         }
 
-
 class RewardLogger:
-    """奖励记录器 - 简化版"""
+    """简化版奖励记录器 - 修复版，支持YAML配置"""
     
     def __init__(self, num_envs, device):
         self.num_envs = num_envs
         self.device = device
-        self.target_episodes = [1, 50, 100, 150, 200]
         
-        self.env_episode_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
-        self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
+        # Episode计数（已完成的episode数，从0开始）
+        self.episode_count = torch.zeros(num_envs, dtype=torch.long, device=device)
+        
+        # 当前episode的详细数据
+        self.current_episode_metrics = {
+            env_id: {
+                'steps': 0,
+                'rewards': [],
+                'deviations': [],
+                'safety_distances': [],
+                'progress_ratios': [],
+                'completed': False,
+                'collision': False,
+                'final_progress': 0.0,
+                'min_safety_distance': float('inf'),
+                'total_deviation': 0.0,
+                'total_reward': 0.0,
+            } for env_id in range(num_envs)
+        }
+        
+        # 保存最后一个episode的数据，用于最终评估
+        self.last_episode_metrics = {
+            env_id: None for env_id in range(num_envs)
+        }
+        
+        # 🔧 修复：milestone配置将在configure_logging中设置
+        self.milestones = []  # 先设为空
+        self.milestone_performances = {}
+        self.reported_milestones = set()
+        
+        # 文本日志（可选）
+        self.enable_text_logging = False
+        self.log_dir = None
         self.env_log_files = {}
         
-        self.log_dir = "logs/env_details"
-        os.makedirs(self.log_dir, exist_ok=True)
+        # 兼容性别名
+        self.env_episode_counts = self.episode_count
+        self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
         
-        import datetime
-        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    def should_log_episode(self, env_id):
-        """判断是否应该记录该环境的当前episode"""
-        episode_num = self.env_episode_counts[env_id].item()
-        return episode_num in self.target_episodes
-    
-    def get_or_create_log_file(self, env_id):
-        """获取或创建环境的日志文件"""
-        if env_id not in self.env_log_files:
-            log_file_path = os.path.join(self.log_dir, f"env_{env_id}_{self.timestamp}.txt")
-            try:
-                self.env_log_files[env_id] = open(log_file_path, 'w')
-                self.env_log_files[env_id].write(f"ENV {env_id} REWARD DETAILS\n")
-                self.env_log_files[env_id].write("="*80 + "\n")
-                self.env_log_files[env_id].write("记录Episode: 1, 50, 100, 150, 200\n")
-                self.env_log_files[env_id].write("="*80 + "\n\n")
-            except Exception as e:
-                print(f"[WARNING] 无法创建环境{env_id}的日志文件: {e}")
-                self.env_log_files[env_id] = None
+    def configure_logging(self, params):
+        """配置日志 - 修复版，从YAML读取milestone"""
+        logging_config = params.get('logging', {})
+        self.enable_text_logging = logging_config.get('enable_text_logging', False)
         
-        return self.env_log_files[env_id]
-    
-    def log_step_details(self, step_count, reward_components, robot_weights, human_weights, final_rewards):
-        """记录步骤详细信息"""
-        for env_id in range(self.num_envs):
-            if not self.should_log_episode(env_id):
-                continue
-                
-            log_file = self.get_or_create_log_file(env_id)
-            if log_file is None:
-                continue
-            
-            try:
-                episode_num = self.env_episode_counts[env_id].item()
-                env_step = self.env_step_counts[env_id].item()
-                
-                log_file.write(f"\n[Episode {episode_num} - Step {env_step}]\n")
-                log_file.write("-" * 50 + "\n")
-                
-                # 总奖励
-                robot_total = final_rewards["robot"][env_id].item()
-                human_total = final_rewards["human"][env_id].item()
-                
-                # Robot奖励详情
-                log_file.write(f"ROBOT (总奖励: {robot_total:.4f}):\n")
-                log_file.write(f"  trajectory_reward: {reward_components['trajectory_reward'][env_id]:.4f} * {robot_weights['trajectory_tracking']}\n")
-                log_file.write(f"  progress_reward: {reward_components['progress_reward'][env_id]:.4f} * {robot_weights['progress']}\n")
-                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} * {robot_weights['velocity']}\n")
-                log_file.write(f"  cbf_reward: {reward_components['cbf_reward'][env_id]:.4f} * {robot_weights['obstacle_cbf']}\n")
-                log_file.write(f"  crossing_reward: {reward_components['crossing_reward'][env_id]:.4f} * {robot_weights['crossing']}\n")
-                log_file.write(f"  robot_force_penalty: {reward_components['robot_force_penalty'][env_id]:.4f} * {robot_weights['force_efficiency']}\n")
-                log_file.write(f"  human_force_awareness: {reward_components['human_force_penalty'][env_id]:.4f} * {robot_weights['human_awareness']}\n")
-                
-                # Human奖励详情
-                log_file.write(f"HUMAN (总奖励: {human_total:.4f}):\n")
-                log_file.write(f"  trajectory_reward: {reward_components['trajectory_reward'][env_id]:.4f} * {human_weights['trajectory_tracking']}\n")
-                log_file.write(f"  progress_reward: {reward_components['progress_reward'][env_id]:.4f} * {human_weights['progress']}\n")
-                log_file.write(f"  velocity_reward: {reward_components['velocity_reward'][env_id]:.4f} * {human_weights['velocity']}\n")
-                log_file.write(f"  cbf_reward: {reward_components['cbf_reward'][env_id]:.4f} * {human_weights['obstacle_cbf']}\n")
-                log_file.write(f"  crossing_reward: {reward_components['crossing_reward'][env_id]:.4f} * {human_weights['crossing']}\n")
-                log_file.write(f"  human_force_penalty: {reward_components['human_force_penalty'][env_id]:.4f} * {human_weights['force_efficiency']}\n")
-                log_file.write(f"  robot_force_awareness: {reward_components['robot_force_penalty'][env_id]:.4f} * {human_weights['robot_awareness']}\n")
-                
-                # 附加信息
-                log_file.write(f"EXTRA:\n")
-                log_file.write(f"  deviation: {reward_components['deviation'][env_id]:.4f}m\n")
-                log_file.write(f"  progress: {reward_components['progress_ratio'][env_id]:.2%}\n")
-                log_file.write(f"  completion_reward: {reward_components['completion_reward'][env_id]:.4f}\n")
-                
-                log_file.flush()
-                
-            except Exception as e:
-                print(f"[WARNING] 记录环境{env_id}详情失败: {e}")
-    
-    def log_termination(self, env_id, reasons):
-        """记录终止原因"""
-        if not self.should_log_episode(env_id):
-            return
-            
-        log_file = self.get_or_create_log_file(env_id)
-        if log_file is None:
-            return
+        # 🔧 修复：从YAML读取milestone配置
+        training_monitor = params.get('training_monitor', {})
+        yaml_milestones = training_monitor.get('milestone_episodes', None)
         
-        try:
-            episode_num = self.env_episode_counts[env_id].item()
-            log_file.write(f"\n[TERMINATION] Episode {episode_num}: {', '.join(reasons)}\n")
-            log_file.write("="*80 + "\n\n")
-            log_file.flush()
-        except Exception as e:
-            print(f"[WARNING] 记录环境{env_id}终止原因失败: {e}")
-    
-    def on_episode_end(self, env_ids):
-        """Episode结束时更新计数"""
-        self.env_episode_counts[env_ids] += 1
-        self.env_step_counts[env_ids] = 0
+        if yaml_milestones:
+            self.milestones = yaml_milestones
+            print(f"[INFO] 使用YAML配置的Milestones: {self.milestones}")
+        else:
+            # 如果YAML中没有配置，使用默认值
+            self.milestones = [2, 10, 20, 30, 50, 100]
+            print(f"[INFO] 使用默认Milestones: {self.milestones}")
+        
+        # 🔧 修复：基于实际milestone列表初始化性能字典
+        self.milestone_performances = {m: {} for m in self.milestones}
+        
+        if self.enable_text_logging:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.log_dir = f"logs/env_details/{timestamp}"
+            os.makedirs(self.log_dir, exist_ok=True)
+            print(f"[INFO] 文本日志已启用，保存到: {self.log_dir}")
+        else:
+            print(f"[INFO] 文本日志已禁用")
+        
+        print(f"[INFO] RewardLogger初始化: {self.num_envs}个环境")
+        print(f"[INFO] 将在以下Episodes进行性能评估: {self.milestones}")
     
     def on_step(self, env_ids=None):
-        """每步更新步数计数"""
+        """每步更新步数"""
         if env_ids is None:
-            self.env_step_counts += 1
+            for env_id in range(self.num_envs):
+                self.current_episode_metrics[env_id]['steps'] += 1
+                self.env_step_counts[env_id] += 1
         else:
-            self.env_step_counts[env_ids] += 1
+            if torch.is_tensor(env_ids):
+                env_ids_list = env_ids.cpu().numpy().tolist()
+            elif isinstance(env_ids, int):
+                env_ids_list = [env_ids]
+            else:
+                env_ids_list = env_ids
+                
+            for env_id in env_ids_list:
+                self.current_episode_metrics[env_id]['steps'] += 1
+                self.env_step_counts[env_id] += 1
+    
+    def update_step_metrics(self, env_id, reward_components, safety_distance, rewards):
+        """记录每步的详细数据"""
+        metrics = self.current_episode_metrics[env_id]
+        
+        robot_reward = rewards["robot"][env_id].item() if "robot" in rewards else 0
+        human_reward = rewards["human"][env_id].item() if "human" in rewards else 0
+        total_reward = robot_reward + human_reward
+        
+        metrics['rewards'].append(total_reward)
+        metrics['total_reward'] += total_reward
+        
+        deviation = reward_components['deviation'][env_id].item()
+        metrics['deviations'].append(deviation)
+        metrics['total_deviation'] += deviation
+        
+        safety_dist = safety_distance[env_id].item()
+        metrics['safety_distances'].append(safety_dist)
+        metrics['min_safety_distance'] = min(metrics['min_safety_distance'], safety_dist)
+        
+        progress = reward_components['progress_ratio'][env_id].item()
+        metrics['progress_ratios'].append(progress)
+        metrics['final_progress'] = progress
+        
+        if reward_components['completion_reward'][env_id].item() > 0:
+            metrics['completed'] = True
+            
+        if safety_dist < 0.001:
+            metrics['collision'] = True
+    
+    def calculate_performance_score(self, env_id, metrics=None):
+        """计算性能分数"""
+        if metrics is None:
+            metrics = self.current_episode_metrics[env_id]
+        
+        if metrics is None or metrics['steps'] == 0:
+            return 0.0
+        
+        # 1. 完成分数 (40分)
+        completion_score = 40.0 if metrics['completed'] else 0.0
+        
+        # 2. 进度分数 (20分)
+        progress_score = 20.0 * min(1.0, metrics['final_progress'])
+        
+        # 3. 轨迹精度 (20分)
+        trajectory_score = 0.0
+        if metrics['deviations']:
+            avg_deviation = np.mean(metrics['deviations'])
+            trajectory_score = 20.0 * max(0, min(1.0, (0.05 - avg_deviation) / 0.04))
+        
+        # 4. 安全性 (20分)
+        min_safety = metrics.get('min_safety_distance', float('inf'))
+        
+        if metrics['collision']:
+            safety_score = 0.0
+        else:
+            if min_safety == float('inf'):
+                safety_score = 10.0
+            else:
+                safety_score = 20.0 * max(0, min(1.0, (min_safety - 0.001) / 0.009))
+        
+        total_score = completion_score + progress_score + trajectory_score + safety_score
+        return np.clip(total_score, 0, 100)
+    
+    def on_episode_end(self, env_ids):
+        """Episode结束时的处理"""
+        if not torch.is_tensor(env_ids):
+            env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
+        
+        for env_id in env_ids:
+            env_id_item = env_id.item()
+            metrics = self.current_episode_metrics[env_id_item]
+            
+            # 当前正在结束的episode编号（从1开始显示）
+            current_episode_num = self.episode_count[env_id_item].item() + 1
+            
+            # 打印Episode摘要
+            print(f"[EPISODE {current_episode_num}] Env {env_id_item}: "
+                  f"Steps={metrics['steps']}, "
+                  f"Progress={metrics['final_progress']:.1%}, "
+                  f"Completed={metrics['completed']}, "
+                  f"Collision={metrics['collision']}")
+            
+            # 保存数据副本（在重置前）
+            import copy
+            self.last_episode_metrics[env_id_item] = copy.deepcopy(metrics)
+            
+            # 🔧 修复：检查是否是YAML配置的milestone
+            if current_episode_num in self.milestones:
+                score = self.calculate_performance_score(env_id_item, metrics)
+                self.milestone_performances[current_episode_num][env_id_item] = {
+                    'score': score,
+                    'completed': metrics['completed'],
+                    'steps': metrics['steps'],
+                    'collision': metrics['collision'],
+                    'final_progress': metrics['final_progress'],
+                    'avg_reward': np.mean(metrics['rewards']) if metrics['rewards'] else 0.0
+                }
+                print(f"[MILESTONE] Env {env_id_item} Episode {current_episode_num}: Score={score:.2f}/100")
+            
+            # 关闭日志文件（如果有）
+            if self.enable_text_logging and env_id_item in self.env_log_files:
+                self.env_log_files[env_id_item].close()
+                del self.env_log_files[env_id_item]
+            
+            # 更新episode计数（现在是已完成的episode数）
+            self.episode_count[env_id_item] += 1
+            self.env_step_counts[env_id_item] = 0
+            
+            # 重置当前episode数据
+            self.current_episode_metrics[env_id_item] = {
+                'steps': 0,
+                'rewards': [],
+                'deviations': [],
+                'safety_distances': [],
+                'progress_ratios': [],
+                'completed': False,
+                'collision': False,
+                'final_progress': 0.0,
+                'min_safety_distance': float('inf'),
+                'total_deviation': 0.0,
+                'total_reward': 0.0,
+            }
+        
+        self.check_and_report_milestones()
+    
+    def check_and_report_milestones(self):
+        """检查并报告milestone - 使用YAML配置的milestone"""
+        min_episodes = self.episode_count.min().item()
+        
+        for milestone in self.milestones:
+            if milestone in self.reported_milestones:
+                continue
+            
+            if min_episodes >= milestone:
+                self.report_milestone(milestone)
+                self.reported_milestones.add(milestone)
+    
+    def report_milestone(self, milestone):
+        """报告milestone性能"""
+        performances = self.milestone_performances[milestone]
+        
+        if len(performances) != self.num_envs:
+            print(f"[WARNING] Milestone {milestone}: 只有{len(performances)}/{self.num_envs}个环境数据")
+            return
+        
+        scores = [p['score'] for p in performances.values()]
+        avg_score = np.mean(scores)
+        std_score = np.std(scores)
+        
+        completion_rate = sum(1 for p in performances.values() if p['completed']) / len(performances)
+        avg_steps = np.mean([p['steps'] for p in performances.values()])
+        collision_rate = sum(1 for p in performances.values() if p['collision']) / len(performances)
+        avg_progress = np.mean([p['final_progress'] for p in performances.values()])
+        
+        print(f"\n{'='*70}")
+        print(f"[MILESTONE {milestone}] 所有{self.num_envs}个环境完成")
+        print(f"{'='*70}")
+        print(f"  平均分: {avg_score:.2f} ± {std_score:.2f} / 100")
+        print(f"  完成率: {completion_rate:.1%}")
+        print(f"  碰撞率: {collision_rate:.1%}")
+        print(f"  平均进度: {avg_progress:.1%}")
+        print(f"  平均步数: {avg_steps:.1f}")
+        print(f"{'='*70}\n")
+    
+    def get_final_evaluation(self, env_id, target_episodes):
+        """获取最终评估分数"""
+        print(f"\n[FINAL EVAL] Env {env_id}:")
+        print(f"  已完成Episodes: {self.episode_count[env_id].item()}")
+        print(f"  当前Episode步数: {self.current_episode_metrics[env_id]['steps']}")
+        
+        # 使用最近的milestone分数
+        recent_milestones = [m for m in self.milestones if m <= target_episodes][-3:]
+        scores = []
+        
+        for milestone in recent_milestones:
+            if milestone in self.milestone_performances:
+                if env_id in self.milestone_performances[milestone]:
+                    score = self.milestone_performances[milestone][env_id]['score']
+                    scores.append(score)
+                    print(f"  Milestone {milestone}: {score:.2f}")
+        
+        if scores:
+            final_score = np.mean(scores)
+            print(f"  基于{len(scores)}个milestone的平均分: {final_score:.2f}")
+        else:
+            # 使用保存的最后一个episode数据
+            if self.last_episode_metrics[env_id] is not None:
+                final_score = self.calculate_performance_score(env_id, self.last_episode_metrics[env_id])
+                print(f"  基于最后Episode数据: {final_score:.2f}")
+            else:
+                # 如果连最后的数据都没有，使用当前数据
+                final_score = self.calculate_performance_score(env_id)
+                print(f"  基于当前数据: {final_score:.2f}")
+        
+        return np.clip(final_score, 0, 100)
+    
+    def get_next_milestone_progress(self):
+        """获取下一个milestone进度"""
+        min_episodes = self.episode_count.min().item()
+        for milestone in self.milestones:
+            if milestone > min_episodes:
+                reached = (self.episode_count >= milestone).sum().item()
+                return milestone, reached, self.num_envs - reached
+        return None, 0, 0
+    
+    def log_step_details(self, env_id, reward_components, rewards, safety_distance):
+        """记录详细步骤信息到文件（如果启用）"""
+        if not self.enable_text_logging:
+            return
+        
+        episode_num = self.episode_count[env_id].item() + 1
+        
+        if episode_num not in self.milestones:
+            return
+        
+        if env_id not in self.env_log_files:
+            log_file_path = os.path.join(self.log_dir, f"env_{env_id}_episode_{episode_num}.txt")
+            self.env_log_files[env_id] = open(log_file_path, 'w')
+            self.env_log_files[env_id].write(f"Environment {env_id} - Episode {episode_num}\n")
+            self.env_log_files[env_id].write("="*60 + "\n")
+        
+        log_file = self.env_log_files[env_id]
+        step = self.current_episode_metrics[env_id]['steps']
+        
+        if step <= 10 or step % 50 == 0:
+            log_file.write(f"\n[Step {step}]\n")
+            log_file.write("-" * 40 + "\n")
+            
+            robot_reward = rewards["robot"][env_id].item() if "robot" in rewards else 0
+            human_reward = rewards["human"][env_id].item() if "human" in rewards else 0
+            
+            log_file.write(f"Robot reward: {robot_reward:.4f}\n")
+            log_file.write(f"Human reward: {human_reward:.4f}\n")
+            log_file.write(f"Total reward: {robot_reward + human_reward:.4f}\n")
+            
+            for key, value in reward_components.items():
+                if torch.is_tensor(value):
+                    log_file.write(f"{key}: {value[env_id].item():.4f}\n")
+            
+            log_file.write(f"Safety distance: {safety_distance[env_id]:.4f}m\n")
+            log_file.flush()
     
     def close_all_files(self):
-        """关闭所有文件"""
-        for env_id, log_file in self.env_log_files.items():
-            if log_file:
-                try:
-                    log_file.close()
-                except:
-                    pass
-
+        """关闭所有日志文件"""
+        for f in self.env_log_files.values():
+            if f and not f.closed:
+                f.close()
+        self.env_log_files.clear()
 
 class SurgicalDirectMARLEnv(DirectMARLEnv):
     """人机协作手术MARL环境"""
@@ -399,6 +614,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         
         self.reward_logger = RewardLogger(self.num_envs, self.device)
+        self.reward_logger.configure_logging(self.params)
         
         self.agent_actions = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
@@ -424,8 +640,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self.stylus_body_idx = None
         self.constraint_checker = CompleteConstraintChecker(self.device, self.collision_threshold)
-        
-        self.step_count = 0
         
         self.last_constraint_results = None
         self.reward_components = {}
@@ -479,7 +693,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         term_config = self.params.get('termination_conditions', {})
         self.enable_z_termination = term_config.get('z_below_zero', True)
         self.enable_edge_termination = term_config.get('edge_collision', True)
-        self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.001)  # 修改为0.001
+        self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.001)
         
         print(f"[INFO] Episode长度由cfg.episode_length_s控制: {self.cfg.episode_length_s}s")
         
@@ -573,9 +787,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """应用动作并更新状态缓存"""
         self._omni_robot.write_data_to_sim()
         
-        self.step_count += 1
-        self.reward_logger.on_step()
-        
         # 更新状态缓存
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
@@ -598,6 +809,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         self.safety_distances_t = self.last_constraint_results['distances_constraint']
         self.is_violating_t = self.last_constraint_results['is_overlapping']
+        
+        # 更新步数
+        self.reward_logger.on_step()
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """获取观测"""
@@ -624,7 +838,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """计算奖励 - 改进的障碍物跨越系统"""
+        """计算奖励"""
         # 1. 轨迹偏差奖励
         deviations, closest_points = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         
@@ -646,49 +860,31 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         velocity_along_line = torch.abs(
             torch.sum(self.stylus_vel_t1 * self.trajectory_manager.line_direction.unsqueeze(0), dim=-1)
         )
-        target_velocity = 0.025  # 2.5cm/s
-        velocity_error = torch.abs(velocity_along_line - target_velocity)
-        velocity_reward = torch.exp(-velocity_error * 20.0)
+        velocity_reward = torch.exp(-velocity_along_line * 20.0)
         
-        # 4. 改进的CBF障碍物奖励
-        obstacle_y_pos = 0.0  # 障碍物在y=0位置
-        crossing_zone = torch.abs(self.stylus_pos_t1[:, 1] - obstacle_y_pos) < 0.05  # 5cm跨越区
-        
+        # 4. CBF障碍物奖励
         cbf_reward = torch.where(
-            crossing_zone,  # 在跨越区域
+            self.safety_distances_t < 0.001,
+            torch.full_like(self.safety_distances_t, -500.0),
             torch.where(
-                self.safety_distances_t < 0.001,  # 非常近，强惩罚
-                torch.full_like(self.safety_distances_t, -30.0),
-                torch.where(
-                    self.safety_distances_t < 0.01,  # 0.1-1cm，中等惩罚
-                    torch.full_like(self.safety_distances_t, -5.0),
-                    torch.full_like(self.safety_distances_t, 0.2)  # >1cm，小奖励
-                )
-            ),
-            # 不在跨越区域，正常CBF
-            torch.where(
-                self.safety_distances_t < 0.01,
-                -10.0 * (0.01 - self.safety_distances_t) / 0.01,
-                torch.full_like(self.safety_distances_t, 0.1)
+                self.safety_distances_t < 0.008,
+                torch.full_like(self.safety_distances_t, -200.0),
+                0.5 + 10.0 * torch.clamp(self.safety_distances_t, max=0.05)
             )
         )
         
-        # 5. 添加跨越进度奖励
-        near_obstacle = torch.abs(self.stylus_pos_t1[:, 1] - obstacle_y_pos) < 0.1  # 10cm范围
-        moving_forward = self.stylus_vel_t1[:, 1] > 0.01  # y方向正速度
-        safe_distance = self.safety_distances_t > 0.001  # 保持安全距离
-        
-        crossing_reward = torch.where(
-            near_obstacle & moving_forward & safe_distance,
-            torch.full_like(progress_ratio, 2.0),  # 鼓励跨越
-            torch.zeros_like(progress_ratio)
-        )
-        
-        # 6. 力惩罚（二次型）
+        # 6. 力惩罚
         robot_force_penalty = -50.0 * torch.sum(self.robot_forces_t**2, dim=-1)
         human_force_penalty = -50.0 * torch.sum(self.human_forces_t**2, dim=-1)
         
-        # 7. 完成奖励
+        # 7. Z轴软约束
+        z_penalty = torch.where(
+            self.stylus_pos_t1[:, 2] < 0.0,
+            -500.0 * torch.abs(self.stylus_pos_t1[:, 2]),
+            torch.zeros_like(self.stylus_pos_t1[:, 2])
+        )
+        
+        # 8. 完成奖励
         distance_to_final = torch.norm(
             self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), 
             dim=-1
@@ -699,7 +895,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             torch.zeros_like(distance_to_final)
         )
         
-        # 更新检查点（仅用于进度跟踪）
+        # 更新检查点
         self.trajectory_manager.update_setpoint(self.stylus_pos_t1)
         
         # 获取权重
@@ -713,9 +909,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             progress_reward * robot_weights['progress'] +
             velocity_reward * robot_weights['velocity'] +
             cbf_reward * robot_weights['obstacle_cbf'] +
-            crossing_reward * robot_weights.get('crossing', 1.0) +
             robot_force_penalty * robot_weights['force_efficiency'] +
             human_force_penalty * robot_weights['human_awareness'] +
+            z_penalty +
             completion_reward
         )
         
@@ -724,9 +920,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             progress_reward * human_weights['progress'] +
             velocity_reward * human_weights['velocity'] +
             cbf_reward * human_weights['obstacle_cbf'] +
-            crossing_reward * human_weights.get('crossing', 0.8) +
             human_force_penalty * human_weights['force_efficiency'] +
             robot_force_penalty * human_weights['robot_awareness'] +
+            z_penalty +
             completion_reward
         )
         
@@ -736,9 +932,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'progress_reward': progress_reward,
             'velocity_reward': velocity_reward,
             'cbf_reward': cbf_reward,
-            'crossing_reward': crossing_reward,
             'robot_force_penalty': robot_force_penalty,
             'human_force_penalty': human_force_penalty,
+            'z_penalty': z_penalty,
             'completion_reward': completion_reward,
             'deviation': deviations,
             'progress_ratio': progress_ratio,
@@ -746,14 +942,23 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'distance_to_final': distance_to_final
         }
         
-        # 记录详细信息
-        self.reward_logger.log_step_details(
-            step_count=self.step_count, 
-            reward_components=self.reward_components, 
-            robot_weights=robot_weights, 
-            human_weights=human_weights,
-            final_rewards=rewards
-        )
+        # 更新每个环境的指标
+        for env_id in range(self.num_envs):
+            self.reward_logger.update_step_metrics(
+                env_id, 
+                self.reward_components, 
+                self.safety_distances_t,
+                rewards
+            )
+            
+            # 兼容性：保留log_step_details调用
+            if self.reward_logger.enable_text_logging:
+                self.reward_logger.log_step_details(
+                    env_id,
+                    self.reward_components,
+                    rewards,
+                    self.safety_distances_t
+                )
         
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
@@ -761,7 +966,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             "deviation": deviations.mean().item(),
             "progress": progress_ratio.mean().item(),
             "safety_distance": self.safety_distances_t.mean().item(),
-            "crossing_reward": crossing_reward.mean().item(),
+            "z_penalty": z_penalty.mean().item(),
         }
         
         return rewards
@@ -774,7 +979,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if self.enable_z_termination:
             z_below_zero = self.stylus_pos_t1[:, 2] < self.min_z_pos
         
-        # 边缘碰撞终止 - 使用0.001
+        # 边缘碰撞终止
         edge_collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.enable_edge_termination:
             edge_collision = self.safety_distances_t < self.safety_distance_threshold
@@ -785,29 +990,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # 合并终止条件
         terminated_condition = z_below_zero | edge_collision | final_reached
 
-        # 时间截断
+        # 时间截断 - IsaacLab会管理每个环境的独立episode_length_buf
         truncated_condition = self.episode_length_buf >= self.max_episode_length - 1
-        
-        # 记录终止原因
-        if terminated_condition.any():
-            terminated_envs = torch.where(terminated_condition)[0]
-            for env_id in terminated_envs:
-                env_id_item = env_id.item()
-                reasons = []
-                if z_below_zero[env_id_item]:
-                    reasons.append("Z轴低于0")
-                if edge_collision[env_id_item]:
-                    reasons.append("边缘碰撞")
-                if final_reached[env_id_item]:
-                    reasons.append("到达终点")
-                
-                if reasons:
-                    self.reward_logger.log_termination(env_id_item, reasons)
-        
-        if truncated_condition.any():
-            truncated_envs = torch.where(truncated_condition)[0]
-            for env_id in truncated_envs:
-                self.reward_logger.log_termination(env_id.item(), ["时间截断"])
         
         terminated = {agent: terminated_condition for agent in self.cfg.possible_agents}
         truncated = {agent: truncated_condition for agent in self.cfg.possible_agents}
@@ -819,9 +1003,24 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         
-        super()._reset_idx(env_ids)
+        # 只在episode实际运行后才记录结束
+        if torch.is_tensor(env_ids):
+            env_ids_list = env_ids.cpu().numpy().tolist()
+        else:
+            env_ids_list = [env_ids] if isinstance(env_ids, int) else env_ids
         
-        self.reward_logger.on_episode_end(env_ids)
+        # 过滤出实际运行过的环境
+        valid_env_ids = []
+        for env_id in env_ids_list:
+            if self.reward_logger.current_episode_metrics[env_id]['steps'] > 0:
+                valid_env_ids.append(env_id)
+        
+        # 只记录实际运行过的episodes
+        if valid_env_ids:
+            self.reward_logger.on_episode_end(torch.tensor(valid_env_ids, device=self.device))
+        
+        # 调用父类重置
+        super()._reset_idx(env_ids)
         
         if self.stylus_body_idx is None:
             self._initialize_body_indices()
