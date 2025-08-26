@@ -4,7 +4,8 @@
 # 保留这三个路径
 !/assets/
 !/scripts/train_surgical.py
-!/scripts/train_surgical_maddpg.py
+!/scripts/train_maddpg.py
+!/scripts/utils/training_helpers.py
 !/src/surgical_project/
 
 # 忽略所有层级下的 __pycache__ 文件夹

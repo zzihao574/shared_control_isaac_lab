@@ -1,34 +1,34 @@
-# training_params.yaml - 简化版
+# training_params.yaml - Optimized English version
 
 # ==============================================================================
-# 全局设置
+# Global Settings
 # ==============================================================================
 seed: 42
 
 # ==============================================================================
-# 日志配置
+# Logging Configuration
 # ==============================================================================
 logging:
-  enable_text_logging: false  # 是否记录详细文本日志
+  enable_text_logging: false  # Enable detailed text logging for milestone episodes
 
 # ==============================================================================
-# 轨迹参数
+# Trajectory Parameters
 # ==============================================================================
 trajectory:
-  start_point: [0.14, -0.2, 0.03]
-  end_point: [0.14, 0.2, 0.03]
-  switch_threshold: 0.01
-  total_distance: 0.4
+  start_point: [0.14, -0.2, 0.03]    # Starting position in 3D space (meters)
+  end_point: [0.14, 0.2, 0.03]       # Target end position in 3D space (meters)
+  switch_threshold: 0.01              # Distance threshold for completion (1cm)
+  total_distance: 0.4                 # Total trajectory distance (meters)
 
 # ==============================================================================
-# 约束参数
+# Constraint Parameters
 # ==============================================================================
 constraints:
-  min_z_position: 0.0
-  max_robot_force: 0.02
-  max_human_force: 0.02
+  min_z_position: 0.0                 # Minimum Z position for safety
+  max_robot_force: 0.02               # Maximum robot force output (Newtons)
+  max_human_force: 0.02               # Maximum human force output (Newtons)
   
-  joint_limits:
+  joint_limits:                       # Joint angle limits (radians)
     waist: [-0.98, 0.98]
     shoulder: [0.0, 1.75]
     elbow: [-0.7854, 1.5]
@@ -37,103 +37,107 @@ constraints:
     roll: [-2.58, 2.58]
 
 # ==============================================================================
-# 初始条件
+# Initial Conditions
 # ==============================================================================
 initial_conditions:
-  joint_positions:
+  joint_positions:                    # Initial joint positions (radians)
     waist: -0.96
     shoulder: 0.0
     elbow: 1.0
     yaw: 0.0
-    pitch: 2.0944
+    pitch: 2.0944                     # ~120 degrees
     roll: 0.0
 
 # ==============================================================================
-# 约束几何
+# Constraint Geometry
 # ==============================================================================
 constraint_geometry:
-  center: [0.14, 0.0, 0.0]
-  collision_threshold: 0.001
-  y_range_positive: [0.038, 0.048]
-  y_range_negative: [-0.048, -0.038]
+  center: [0.14, 0.0, 0.0]           # Constraint center position (meters)
+  collision_threshold: 0.001          # Collision detection threshold (meters)
+  y_range_positive: [0.038, 0.048]   # Positive Y constraint boundaries
+  y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# 奖励参数
+# Reward Parameters
 # ==============================================================================
 reward_parameters:
+  # Robot agent reward weights
   robot_weights:
-    trajectory_tracking: 10.0
-    progress: 8.0
-    velocity: 1.0
-    obstacle_cbf: 4.0
-    force_efficiency: 0.5
-    human_awareness: 0.3
+    trajectory_tracking: 10.0         # Weight for trajectory following accuracy
+    progress: 8.0                     # Weight for forward progress
+    velocity: 1.0                     # Weight for appropriate velocity control
+    obstacle_cbf: 4.0                 # Weight for obstacle avoidance (CBF)
+    force_efficiency: 0.5             # Weight for energy efficiency
+    human_awareness: 0.3              # Weight for human collaboration
     
+  # Human agent reward weights  
   human_weights:
-    trajectory_tracking: 8.0
-    progress: 7.0
-    velocity: 0.8
-    obstacle_cbf: 4.0
-    force_efficiency: 0.4
-    robot_awareness: 0.25
+    trajectory_tracking: 8.0          # Weight for trajectory following accuracy
+    progress: 7.0                     # Weight for forward progress
+    velocity: 0.8                     # Weight for appropriate velocity control
+    obstacle_cbf: 4.0                 # Weight for obstacle avoidance (CBF)
+    force_efficiency: 0.4             # Weight for energy efficiency
+    robot_awareness: 0.25             # Weight for robot collaboration
     
-  completion_reward: 50.0
-  completion_threshold: 0.01
+  completion_reward: 50.0             # Bonus for task completion
+  completion_threshold: 0.01          # Distance threshold for completion (meters)
   
+  # Control Barrier Function (CBF) parameters
   cbf_parameters:
-    safety_margin: 0.01
-    gamma: 10.0
-    epsilon: 0.000001
+    safety_margin: 0.01               # Safety margin for constraints (meters)
+    gamma: 10.0                       # CBF aggressiveness parameter
+    epsilon: 0.000001                 # CBF numerical stability parameter
 
 # ==============================================================================
-# 终止条件
+# Termination Conditions
 # ==============================================================================
 termination_conditions:
-  z_below_zero: false
-  edge_collision: false
-  safety_distance_threshold: 0.001
+  z_below_zero: false                 # Terminate if Z position < 0
+  edge_collision: false               # Terminate on constraint edge collision
+  safety_distance_threshold: 0.001   # Safety distance termination threshold
 
 # ==============================================================================
-# MADDPG配置
+# MADDPG Algorithm Configuration
 # ==============================================================================
 maddpg_config:
-  lr_actor: 0.01
-  lr_critic: 0.01
-  gamma: 0.9
-  batch_size: 512
-  num_units: 64
-  num_episodes: 600
-  update_interval: 100
-  min_buffer_size: 1024
-  tau: 0.01
-  max_replay_buffer_len: 10000
+  lr_actor: 0.01                      # Actor learning rate
+  lr_critic: 0.01                     # Critic learning rate
+  gamma: 0.9                          # Discount factor
+  batch_size: 512                     # Training batch size
+  num_units: 64                       # Hidden layer units
+  num_episodes: 600                   # Target episodes per environment
+  update_interval: 100                # Updates every N steps
+  min_buffer_size: 1024               # Minimum buffer size to start training
+  tau: 0.01                           # Target network update rate
+  max_replay_buffer_len: 10000        # Maximum replay buffer size
 
 # ==============================================================================
-# 智能体配置
+# Agent Configuration
 # ==============================================================================
 agent_config:
-  agent_names: ["human", "robot"]
-  num_agents: 2
-  observation_dims: [21, 21]
-  action_dims: [3, 3]
-  total_observation_dim: 42
-  total_action_dim: 6
+  agent_names: ["human", "robot"]     # Agent identifiers
+  num_agents: 2                       # Total number of agents
+  observation_dims: [21, 21]         # Observation dimensions per agent
+  action_dims: [3, 3]                 # Action dimensions per agent
+  total_observation_dim: 42           # Combined observation dimension
+  total_action_dim: 6                 # Combined action dimension
 
 # ==============================================================================
-# 训练监控
+# Training Monitoring
 # ==============================================================================
 training_monitor:
+  # Milestone episodes for performance evaluation and TopK model selection
   milestone_episodes: [2, 10, 20, 30, 50, 75, 90, 100, 125, 150, 175, 200, 300, 500]
 
 # ==============================================================================
-# 环境配置
+# Environment Configuration
 # ==============================================================================
 env_config:
-  num_envs: 512
-  agents: ["human", "robot"]
+  num_envs: 512                       # Number of parallel environments
+  agents: ["human", "robot"]          # Agent types in environment
 
 # ==============================================================================
-# 硬件配置
+# Hardware Configuration
 # ==============================================================================
 hardware:
-  device: "cuda"
+  device: "cuda"                      # Compute device (cuda/cpu)

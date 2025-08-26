@@ -19,12 +19,12 @@ gym.register(
     },
 )
 
-print(f"[INFO] 成功注册 Isaac-Surgical-MARL-Direct-v0")
-print(f"[INFO] 环境特性:")
-print(f"  - 人机协作双智能体控制")
-print(f"  - 与MBRL环境物理参数对齐")
-print(f"  - 距离驱动的轨迹切换")
-print(f"  - 信任机制和协作奖励")
-print(f"  - 差异化智能体观测和奖励")
+print(f"[INFO] Successfully registered Isaac-Surgical-MARL-Direct-v0")
+print(f"[INFO] Environment features:")
+print(f"  - Human-robot collaborative dual-agent control")
+print(f"  - Physics parameters aligned with MBRL environment")
+print(f"  - Distance-driven trajectory switching")
+print(f"  - Trust mechanism and collaborative rewards")
+print(f"  - Differentiated agent observations and rewards")
 
 __all__ = ["SurgicalDirectMARLEnv", "SurgicalDirectMARLEnvCfg"]
