@@ -48,7 +48,7 @@ control_parameters:
   K2_gain: 20.0
   Kid_gain: 4.0
   kΓ_gain: 3.5
-  psi: 1.0
+  psi: 2.5
 
 # Physical constraints
 constraints:

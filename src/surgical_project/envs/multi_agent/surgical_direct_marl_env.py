@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - 修复版，禁用RewardLogger调试输出
+# surgical_direct_marl_env.py - 优化版，简化RewardLogger
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class CompleteConstraintChecker:
         """批量分析约束状态"""
         num_envs = stylus_positions.shape[0]
         
-        current_base_positions = self._omni_robot.data.root_link_pos_w if hasattr(self, '_omni_robot') else env_base_positions
+        current_base_positions = self._omni_robot.data.root_link_pos_w if hasattr(self, '_omni_robot') else env_base_positions #备用
         
         batch_results = {
             'distances_constraint': torch.ones(num_envs, device=self.device) * 0.02,
@@ -163,46 +163,7 @@ class TrajectoryManager:
         
         # 直线方向单位向量
         self.line_direction = (self.end_pos_local - self.start_pos_local) / self.total_distance
-        
-        # 10cm设置一个checkpoint，1cm切换
-        self.checkpoint_interval = traj.get('checkpoint_interval', 0.1)  # 10cm
         self.switch_threshold = traj.get('switch_threshold', 0.01)      # 1cm
-        
-        self._generate_setpoints(params)
-        self.current_setpoint_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
-        self.setpoints_tensor = torch.stack(self.setpoints_local)
-        self.num_setpoints = len(self.setpoints_local)
-        
-    def _generate_setpoints(self, params):
-        """生成轨迹设置点"""
-        num_checkpoints = int(self.total_distance / self.checkpoint_interval)
-        self.setpoints_local = []
-        
-        for i in range(num_checkpoints + 1):
-            if i == num_checkpoints:
-                checkpoint = self.end_pos_local.clone()
-            else:
-                checkpoint = self.start_pos_local + self.line_direction * (i * self.checkpoint_interval)
-            self.setpoints_local.append(checkpoint)
-        
-        print(f"[TRAJECTORY] 生成了 {len(self.setpoints_local)} 个轨迹点（10cm间隔）")
-    
-    def get_current_setpoint_local(self) -> torch.Tensor:
-        """获取当前设置点"""
-        indices = torch.clamp(self.current_setpoint_idx, 0, self.num_setpoints - 1)
-        return self.setpoints_tensor[indices]
-    
-    def update_setpoint(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """更新设置点"""
-        current_indices = self.current_setpoint_idx
-        indices_clamped = torch.clamp(current_indices, 0, self.num_setpoints - 1)
-        current_setpoints = self.setpoints_tensor[indices_clamped]
-        
-        distances = torch.norm(current_pos_local - current_setpoints, dim=-1)
-        should_update = (distances < self.switch_threshold) & (current_indices < self.num_setpoints - 1)
-        
-        self.current_setpoint_idx[should_update] += 1
-        return should_update
     
     def get_progress(self, current_pos_local: torch.Tensor) -> torch.Tensor:
         """计算沿轨迹的进度（0到1）"""
@@ -230,26 +191,17 @@ class TrajectoryManager:
         distances_to_final = torch.norm(current_pos_local - self.end_pos_local.unsqueeze(0), dim=-1)
         return distances_to_final < self.switch_threshold
     
-    def reset_trajectory(self, env_ids: torch.Tensor = None):
-        """重置轨迹"""
-        if env_ids is None:
-            self.current_setpoint_idx.fill_(0)
-        else:
-            self.current_setpoint_idx[env_ids] = 0
-    
     def get_trajectory_info(self) -> Dict:
         """获取轨迹信息"""
         return {
             'start_point': self.start_pos_local.cpu().numpy(),
             'end_point': self.end_pos_local.cpu().numpy(),
-            'total_distance': self.total_distance,
-            'num_checkpoints': self.num_setpoints,
-            'checkpoint_interval': self.checkpoint_interval
+            'total_distance': self.total_distance
         }
 
 class RewardLogger:
-    """简化版奖励记录器 - 修复版，支持YAML配置"""
-    
+    """优化版奖励记录器 - 只在milestone时记录详细数据"""
+
     def __init__(self, num_envs, device):
         self.num_envs = num_envs
         self.device = device
@@ -257,32 +209,36 @@ class RewardLogger:
         # Episode计数（已完成的episode数，从0开始）
         self.episode_count = torch.zeros(num_envs, dtype=torch.long, device=device)
         
-        # 当前episode的详细数据
-        self.current_episode_metrics = {
+        # 基本统计数据（始终记录）
+        self.basic_stats = {
             env_id: {
-                'steps': 0,
-                'rewards': [],
-                'deviations': [],
-                'safety_distances': [],
-                'progress_ratios': [],
-                'completed': False,
-                'collision': False,
-                'final_progress': 0.0,
-                'min_safety_distance': float('inf'),
-                'total_deviation': 0.0,
+                'total_episodes': 0,
+                'total_steps': 0,
                 'total_reward': 0.0,
+                'completed_episodes': 0,
+                'collision_episodes': 0,
             } for env_id in range(num_envs)
         }
         
-        # 保存最后一个episode的数据，用于最终评估
-        self.last_episode_metrics = {
-            env_id: None for env_id in range(num_envs)
+        # 当前episode的基本数据（始终记录）
+        self.current_episode_basic = {
+            env_id: {
+                'steps': 0,
+                'total_reward': 0.0,
+                'final_progress': 0.0,
+                'completed': False,
+                'collision': False,
+                'min_safety_distance': float('inf'),
+            } for env_id in range(num_envs)
         }
         
-        # 🔧 修复：milestone配置将在configure_logging中设置
-        self.milestones = []  # 先设为空
+        # 详细数据（只在milestone episode时记录）
+        self.milestone_detailed_data = {}
+        
+        # milestone配置
+        self.milestones = []
         self.milestone_performances = {}
-        self.reported_milestones = set()
+        self.milestone_completion_status = {}  # 追踪每个milestone的完成情况
         
         # 文本日志（可选）
         self.enable_text_logging = False
@@ -293,12 +249,20 @@ class RewardLogger:
         self.env_episode_counts = self.episode_count
         self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
         
+        # 新增：用于存储回调函数的变量
+        self.topk_update_callback = None
+
+    # 新增：设置回调函数的方法
+    def set_topk_update_callback(self, callback_fn):
+        """Sets a callback function to be triggered at milestones for Top-K updates."""
+        self.topk_update_callback = callback_fn
+
     def configure_logging(self, params):
-        """配置日志 - 修复版，从YAML读取milestone"""
+        """配置日志"""
         logging_config = params.get('logging', {})
         self.enable_text_logging = logging_config.get('enable_text_logging', False)
         
-        # 🔧 修复：从YAML读取milestone配置
+        # 从YAML读取milestone配置
         training_monitor = params.get('training_monitor', {})
         yaml_milestones = training_monitor.get('milestone_episodes', None)
         
@@ -306,30 +270,34 @@ class RewardLogger:
             self.milestones = yaml_milestones
             print(f"[INFO] 使用YAML配置的Milestones: {self.milestones}")
         else:
-            # 如果YAML中没有配置，使用默认值
             self.milestones = [2, 10, 20, 30, 50, 100]
             print(f"[INFO] 使用默认Milestones: {self.milestones}")
         
-        # 🔧 修复：基于实际milestone列表初始化性能字典
+        # 初始化milestone数据结构
         self.milestone_performances = {m: {} for m in self.milestones}
+        self.milestone_completion_status = {m: {'completed_envs': 0, 'reported': False} for m in self.milestones}
         
         if self.enable_text_logging:
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_dir = f"logs/env_details/{timestamp}"
             os.makedirs(self.log_dir, exist_ok=True)
-            print(f"[INFO] 文本日志已启用，保存到: {self.log_dir}")
+            print(f"[INFO] 文本日志已启用，只记录milestone episodes，保存到: {self.log_dir}")
         else:
             print(f"[INFO] 文本日志已禁用")
         
         print(f"[INFO] RewardLogger初始化: {self.num_envs}个环境")
         print(f"[INFO] 将在以下Episodes进行性能评估: {self.milestones}")
     
+    def is_milestone_episode(self, episode_num):
+        """检查是否为milestone episode"""
+        return episode_num in self.milestones
+    
     def on_step(self, env_ids=None):
         """每步更新步数"""
         if env_ids is None:
             for env_id in range(self.num_envs):
-                self.current_episode_metrics[env_id]['steps'] += 1
+                self.current_episode_basic[env_id]['steps'] += 1
                 self.env_step_counts[env_id] += 1
         else:
             if torch.is_tensor(env_ids):
@@ -340,232 +308,66 @@ class RewardLogger:
                 env_ids_list = env_ids
                 
             for env_id in env_ids_list:
-                self.current_episode_metrics[env_id]['steps'] += 1
+                self.current_episode_basic[env_id]['steps'] += 1
                 self.env_step_counts[env_id] += 1
     
     def update_step_metrics(self, env_id, reward_components, safety_distance, rewards):
-        """记录每步的详细数据"""
-        metrics = self.current_episode_metrics[env_id]
+        """更新step指标 - 优化版"""
+        current_episode = self.episode_count[env_id].item() + 1
         
+        # 更新基本数据（始终进行）
         robot_reward = rewards["robot"][env_id].item() if "robot" in rewards else 0
         human_reward = rewards["human"][env_id].item() if "human" in rewards else 0
         total_reward = robot_reward + human_reward
         
-        metrics['rewards'].append(total_reward)
-        metrics['total_reward'] += total_reward
-        
-        deviation = reward_components['deviation'][env_id].item()
-        metrics['deviations'].append(deviation)
-        metrics['total_deviation'] += deviation
-        
-        safety_dist = safety_distance[env_id].item()
-        metrics['safety_distances'].append(safety_dist)
-        metrics['min_safety_distance'] = min(metrics['min_safety_distance'], safety_dist)
+        basic = self.current_episode_basic[env_id]
+        basic['total_reward'] += total_reward
         
         progress = reward_components['progress_ratio'][env_id].item()
-        metrics['progress_ratios'].append(progress)
-        metrics['final_progress'] = progress
+        basic['final_progress'] = progress
+        
+        safety_dist = safety_distance[env_id].item()
+        basic['min_safety_distance'] = min(basic['min_safety_distance'], safety_dist)
         
         if reward_components['completion_reward'][env_id].item() > 0:
-            metrics['completed'] = True
+            basic['completed'] = True
             
         if safety_dist < 0.001:
-            metrics['collision'] = True
-    
-    def calculate_performance_score(self, env_id, metrics=None):
-        """计算性能分数"""
-        if metrics is None:
-            metrics = self.current_episode_metrics[env_id]
+            basic['collision'] = True
         
-        if metrics is None or metrics['steps'] == 0:
-            return 0.0
-        
-        # 1. 完成分数 (40分)
-        completion_score = 40.0 if metrics['completed'] else 0.0
-        
-        # 2. 进度分数 (20分)
-        progress_score = 20.0 * min(1.0, metrics['final_progress'])
-        
-        # 3. 轨迹精度 (20分)
-        trajectory_score = 0.0
-        if metrics['deviations']:
-            avg_deviation = np.mean(metrics['deviations'])
-            trajectory_score = 20.0 * max(0, min(1.0, (0.05 - avg_deviation) / 0.04))
-        
-        # 4. 安全性 (20分)
-        min_safety = metrics.get('min_safety_distance', float('inf'))
-        
-        if metrics['collision']:
-            safety_score = 0.0
-        else:
-            if min_safety == float('inf'):
-                safety_score = 10.0
-            else:
-                safety_score = 20.0 * max(0, min(1.0, (min_safety - 0.001) / 0.009))
-        
-        total_score = completion_score + progress_score + trajectory_score + safety_score
-        return np.clip(total_score, 0, 100)
-    
-    def on_episode_end(self, env_ids):
-        """Episode结束时的处理"""
-        if not torch.is_tensor(env_ids):
-            env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
-        
-        for env_id in env_ids:
-            env_id_item = env_id.item()
-            metrics = self.current_episode_metrics[env_id_item]
+        # 只在milestone episode时记录详细数据
+        if self.is_milestone_episode(current_episode):
+            if current_episode not in self.milestone_detailed_data:
+                self.milestone_detailed_data[current_episode] = {}
             
-            # 当前正在结束的episode编号（从1开始显示）
-            current_episode_num = self.episode_count[env_id_item].item() + 1
-            
-            # 打印Episode摘要
-            print(f"[EPISODE {current_episode_num}] Env {env_id_item}: "
-                  f"Steps={metrics['steps']}, "
-                  f"Progress={metrics['final_progress']:.1%}, "
-                  f"Completed={metrics['completed']}, "
-                  f"Collision={metrics['collision']}")
-            
-            # 保存数据副本（在重置前）
-            import copy
-            self.last_episode_metrics[env_id_item] = copy.deepcopy(metrics)
-            
-            # 🔧 修复：检查是否是YAML配置的milestone
-            if current_episode_num in self.milestones:
-                score = self.calculate_performance_score(env_id_item, metrics)
-                self.milestone_performances[current_episode_num][env_id_item] = {
-                    'score': score,
-                    'completed': metrics['completed'],
-                    'steps': metrics['steps'],
-                    'collision': metrics['collision'],
-                    'final_progress': metrics['final_progress'],
-                    'avg_reward': np.mean(metrics['rewards']) if metrics['rewards'] else 0.0
+            if env_id not in self.milestone_detailed_data[current_episode]:
+                self.milestone_detailed_data[current_episode][env_id] = {
+                    'rewards': [],
+                    'deviations': [],
+                    'safety_distances': [],
+                    'progress_ratios': []
                 }
-                print(f"[MILESTONE] Env {env_id_item} Episode {current_episode_num}: Score={score:.2f}/100")
             
-            # 关闭日志文件（如果有）
-            if self.enable_text_logging and env_id_item in self.env_log_files:
-                self.env_log_files[env_id_item].close()
-                del self.env_log_files[env_id_item]
+            detailed = self.milestone_detailed_data[current_episode][env_id]
+            detailed['rewards'].append(total_reward)
+            detailed['deviations'].append(reward_components['deviation'][env_id].item())
+            detailed['safety_distances'].append(safety_dist)
+            detailed['progress_ratios'].append(progress)
             
-            # 更新episode计数（现在是已完成的episode数）
-            self.episode_count[env_id_item] += 1
-            self.env_step_counts[env_id_item] = 0
-            
-            # 重置当前episode数据
-            self.current_episode_metrics[env_id_item] = {
-                'steps': 0,
-                'rewards': [],
-                'deviations': [],
-                'safety_distances': [],
-                'progress_ratios': [],
-                'completed': False,
-                'collision': False,
-                'final_progress': 0.0,
-                'min_safety_distance': float('inf'),
-                'total_deviation': 0.0,
-                'total_reward': 0.0,
-            }
-        
-        self.check_and_report_milestones()
+            # 文本日志（只在milestone episode时）
+            if self.enable_text_logging:
+                self._log_step_to_file(env_id, current_episode, reward_components, rewards, safety_distance)
     
-    def check_and_report_milestones(self):
-        """检查并报告milestone - 使用YAML配置的milestone"""
-        min_episodes = self.episode_count.min().item()
-        
-        for milestone in self.milestones:
-            if milestone in self.reported_milestones:
-                continue
-            
-            if min_episodes >= milestone:
-                self.report_milestone(milestone)
-                self.reported_milestones.add(milestone)
-    
-    def report_milestone(self, milestone):
-        """报告milestone性能"""
-        performances = self.milestone_performances[milestone]
-        
-        if len(performances) != self.num_envs:
-            print(f"[WARNING] Milestone {milestone}: 只有{len(performances)}/{self.num_envs}个环境数据")
-            return
-        
-        scores = [p['score'] for p in performances.values()]
-        avg_score = np.mean(scores)
-        std_score = np.std(scores)
-        
-        completion_rate = sum(1 for p in performances.values() if p['completed']) / len(performances)
-        avg_steps = np.mean([p['steps'] for p in performances.values()])
-        collision_rate = sum(1 for p in performances.values() if p['collision']) / len(performances)
-        avg_progress = np.mean([p['final_progress'] for p in performances.values()])
-        
-        print(f"\n{'='*70}")
-        print(f"[MILESTONE {milestone}] 所有{self.num_envs}个环境完成")
-        print(f"{'='*70}")
-        print(f"  平均分: {avg_score:.2f} ± {std_score:.2f} / 100")
-        print(f"  完成率: {completion_rate:.1%}")
-        print(f"  碰撞率: {collision_rate:.1%}")
-        print(f"  平均进度: {avg_progress:.1%}")
-        print(f"  平均步数: {avg_steps:.1f}")
-        print(f"{'='*70}\n")
-    
-    def get_final_evaluation(self, env_id, target_episodes):
-        """获取最终评估分数"""
-        print(f"\n[FINAL EVAL] Env {env_id}:")
-        print(f"  已完成Episodes: {self.episode_count[env_id].item()}")
-        print(f"  当前Episode步数: {self.current_episode_metrics[env_id]['steps']}")
-        
-        # 使用最近的milestone分数
-        recent_milestones = [m for m in self.milestones if m <= target_episodes][-3:]
-        scores = []
-        
-        for milestone in recent_milestones:
-            if milestone in self.milestone_performances:
-                if env_id in self.milestone_performances[milestone]:
-                    score = self.milestone_performances[milestone][env_id]['score']
-                    scores.append(score)
-                    print(f"  Milestone {milestone}: {score:.2f}")
-        
-        if scores:
-            final_score = np.mean(scores)
-            print(f"  基于{len(scores)}个milestone的平均分: {final_score:.2f}")
-        else:
-            # 使用保存的最后一个episode数据
-            if self.last_episode_metrics[env_id] is not None:
-                final_score = self.calculate_performance_score(env_id, self.last_episode_metrics[env_id])
-                print(f"  基于最后Episode数据: {final_score:.2f}")
-            else:
-                # 如果连最后的数据都没有，使用当前数据
-                final_score = self.calculate_performance_score(env_id)
-                print(f"  基于当前数据: {final_score:.2f}")
-        
-        return np.clip(final_score, 0, 100)
-    
-    def get_next_milestone_progress(self):
-        """获取下一个milestone进度"""
-        min_episodes = self.episode_count.min().item()
-        for milestone in self.milestones:
-            if milestone > min_episodes:
-                reached = (self.episode_count >= milestone).sum().item()
-                return milestone, reached, self.num_envs - reached
-        return None, 0, 0
-    
-    def log_step_details(self, env_id, reward_components, rewards, safety_distance):
-        """记录详细步骤信息到文件（如果启用）"""
-        if not self.enable_text_logging:
-            return
-        
-        episode_num = self.episode_count[env_id].item() + 1
-        
-        if episode_num not in self.milestones:
-            return
-        
+    def _log_step_to_file(self, env_id, episode_num, reward_components, rewards, safety_distance):
+        """记录详细步骤信息到文件（只在milestone episode时）"""
         if env_id not in self.env_log_files:
             log_file_path = os.path.join(self.log_dir, f"env_{env_id}_episode_{episode_num}.txt")
             self.env_log_files[env_id] = open(log_file_path, 'w')
-            self.env_log_files[env_id].write(f"Environment {env_id} - Episode {episode_num}\n")
+            self.env_log_files[env_id].write(f"Environment {env_id} - Episode {episode_num} (MILESTONE)\n")
             self.env_log_files[env_id].write("="*60 + "\n")
         
         log_file = self.env_log_files[env_id]
-        step = self.current_episode_metrics[env_id]['steps']
+        step = self.current_episode_basic[env_id]['steps']
         
         if step <= 10 or step % 50 == 0:
             log_file.write(f"\n[Step {step}]\n")
@@ -584,6 +386,189 @@ class RewardLogger:
             
             log_file.write(f"Safety distance: {safety_distance[env_id]:.4f}m\n")
             log_file.flush()
+    
+    def calculate_performance_score(self, env_id, basic_data=None, detailed_data=None):
+        """计算性能分数"""
+        if basic_data is None:
+            basic_data = self.current_episode_basic[env_id]
+        
+        if basic_data['steps'] == 0:
+            return 0.0
+        
+        # 1. 完成分数 (40分)
+        completion_score = 40.0 if basic_data['completed'] else 0.0
+        
+        # 2. 进度分数 (20分)
+        progress_score = 20.0 * min(1.0, basic_data['final_progress'])
+        
+        # 3. 轨迹精度 (20分) - 如果有详细数据则使用，否则估算
+        trajectory_score = 0.0
+        if detailed_data and 'deviations' in detailed_data and detailed_data['deviations']:
+            avg_deviation = np.mean(detailed_data['deviations'])
+            trajectory_score = 20.0 * max(0, min(1.0, (0.05 - avg_deviation) / 0.04))
+        else:
+            # 基于完成情况估算
+            trajectory_score = 10.0 if basic_data['completed'] else 5.0
+        
+        # 4. 安全性 (20分)
+        min_safety = basic_data.get('min_safety_distance', float('inf'))
+        
+        if basic_data['collision']:
+            safety_score = 0.0
+        else:
+            if min_safety == float('inf'):
+                safety_score = 10.0
+            else:
+                safety_score = 20.0 * max(0, min(1.0, (min_safety - 0.001) / 0.009))
+        
+        total_score = completion_score + progress_score + trajectory_score + safety_score
+        return np.clip(total_score, 0, 100)
+    
+    def on_episode_end(self, env_ids):
+        """Episode结束处理 - 优化版"""
+        if not torch.is_tensor(env_ids):
+            env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
+        
+        for env_id in env_ids:
+            env_id_item = env_id.item()
+            current_episode_num = self.episode_count[env_id_item].item() + 1
+            
+            basic = self.current_episode_basic[env_id_item]
+            
+            # 更新基本统计
+            stats = self.basic_stats[env_id_item]
+            stats['total_episodes'] += 1
+            stats['total_steps'] += basic['steps']
+            stats['total_reward'] += basic['total_reward']
+            if basic['completed']:
+                stats['completed_episodes'] += 1
+            if basic['collision']:
+                stats['collision_episodes'] += 1
+            
+            # 只在milestone episode时输出详细日志和计算分数
+            if self.is_milestone_episode(current_episode_num):
+                detailed_data = None
+                if current_episode_num in self.milestone_detailed_data and env_id_item in self.milestone_detailed_data[current_episode_num]:
+                    detailed_data = self.milestone_detailed_data[current_episode_num][env_id_item]
+                
+                score = self.calculate_performance_score(env_id_item, basic, detailed_data)
+                
+                # 输出milestone日志
+                print(f"[MILESTONE {current_episode_num}] Env {env_id_item}: "
+                      f"Steps={basic['steps']}, Progress={basic['final_progress']:.1%}, "
+                      f"Completed={basic['completed']}, Collision={basic['collision']}, "
+                      f"Score={score:.2f}/100")
+                
+                # 存储milestone性能数据
+                self.milestone_performances[current_episode_num][env_id_item] = {
+                    'score': score,
+                    'completed': basic['completed'],
+                    'steps': basic['steps'],
+                    'collision': basic['collision'],
+                    'final_progress': basic['final_progress'],
+                    'avg_reward': basic['total_reward'] / basic['steps'] if basic['steps'] > 0 else 0.0
+                }
+                
+                # 更新milestone完成状态
+                self.milestone_completion_status[current_episode_num]['completed_envs'] += 1
+                
+                # 检查是否所有环境都达到此milestone
+                self._check_milestone_completion(current_episode_num)
+                
+                # 关闭文本日志文件
+                if self.enable_text_logging and env_id_item in self.env_log_files:
+                    self.env_log_files[env_id_item].close()
+                    del self.env_log_files[env_id_item]
+            
+            # 更新episode计数和重置
+            self.episode_count[env_id_item] += 1
+            self.env_step_counts[env_id_item] = 0
+            
+            # 重置当前episode数据
+            self.current_episode_basic[env_id_item] = {
+                'steps': 0,
+                'total_reward': 0.0,
+                'final_progress': 0.0,
+                'completed': False,
+                'collision': False,
+                'min_safety_distance': float('inf'),
+            }
+    
+    def _check_milestone_completion(self, milestone):
+        """检查milestone完成情况并报告"""
+        status = self.milestone_completion_status[milestone]
+        
+        # 如果所有环境都达到了这个milestone且还未报告
+        if status['completed_envs'] >= self.num_envs and not status['reported']:
+            # 修改：触发回调
+            if self.topk_update_callback:
+                print(f"[CALLBACK] Triggering Top-K update for milestone {milestone}...")
+                self.topk_update_callback(milestone)
+
+            self._report_milestone_summary(milestone)
+            status['reported'] = True
+    
+    def _report_milestone_summary(self, milestone):
+        """输出milestone汇总报告"""
+        performances = self.milestone_performances[milestone]
+        
+        if len(performances) != self.num_envs:
+            print(f"[WARNING] Milestone {milestone}: 只有{len(performances)}/{self.num_envs}个环境数据")
+            return
+        
+        scores = [p['score'] for p in performances.values()]
+        avg_score = np.mean(scores)
+        std_score = np.std(scores)
+        
+        completion_rate = sum(1 for p in performances.values() if p['completed']) / len(performances)
+        avg_steps = np.mean([p['steps'] for p in performances.values()])
+        collision_rate = sum(1 for p in performances.values() if p['collision']) / len(performances)
+        avg_progress = np.mean([p['final_progress'] for p in performances.values()])
+        
+        print(f"\n{'='*60}")
+        print(f"[MILESTONE {milestone} COMPLETE] 所有环境已达到")
+        print(f"{'='*60}")
+        print(f"  平均分数: {avg_score:.2f} ± {std_score:.2f} / 100")
+        print(f"  完成率: {completion_rate:.1%}")
+        print(f"  碰撞率: {collision_rate:.1%}")
+        print(f"  平均进度: {avg_progress:.1%}")
+        print(f"  平均步数: {avg_steps:.1f}")
+        print(f"{'='*60}\n")
+    
+    def get_final_evaluation(self, env_id, target_episodes):
+        """获取最终评估分数"""
+        # 使用最近的milestone分数
+        recent_milestones = [m for m in self.milestones if m <= target_episodes][-3:]
+        scores = []
+        
+        for milestone in recent_milestones:
+            if milestone in self.milestone_performances:
+                if env_id in self.milestone_performances[milestone]:
+                    score = self.milestone_performances[milestone][env_id]['score']
+                    scores.append(score)
+        
+        if scores:
+            final_score = np.mean(scores)
+        else:
+            # 基于基本统计估算
+            stats = self.basic_stats[env_id]
+            if stats['total_episodes'] > 0:
+                completion_rate = stats['completed_episodes'] / stats['total_episodes']
+                collision_rate = stats['collision_episodes'] / stats['total_episodes']
+                final_score = (completion_rate * 60) + (1 - collision_rate) * 40
+            else:
+                final_score = 0.0
+        
+        return np.clip(final_score, 0, 100)
+    
+    def get_next_milestone_progress(self):
+        """获取下一个milestone进度"""
+        min_episodes = self.episode_count.min().item()
+        for milestone in self.milestones:
+            if milestone > min_episodes:
+                reached = (self.episode_count >= milestone).sum().item()
+                return milestone, reached, self.num_envs - reached
+        return None, 0, 0
     
     def close_all_files(self):
         """关闭所有日志文件"""
@@ -614,7 +599,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         
         self.reward_logger = RewardLogger(self.num_envs, self.device)
-        self.reward_logger.configure_logging(self.params)
         
         self.agent_actions = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
@@ -809,9 +793,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         self.safety_distances_t = self.last_constraint_results['distances_constraint']
         self.is_violating_t = self.last_constraint_results['is_overlapping']
-        
-        # 更新步数
-        self.reward_logger.on_step()
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """获取观测"""
@@ -839,6 +820,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
         """计算奖励"""
+        self.reward_logger.on_step()
+        
         # 1. 轨迹偏差奖励
         deviations, closest_points = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         
@@ -895,9 +878,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             torch.zeros_like(distance_to_final)
         )
         
-        # 更新检查点
-        self.trajectory_manager.update_setpoint(self.stylus_pos_t1)
-        
         # 获取权重
         robot_weights = self.params['reward_parameters']['robot_weights']
         human_weights = self.params['reward_parameters']['human_weights']
@@ -938,11 +918,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'completion_reward': completion_reward,
             'deviation': deviations,
             'progress_ratio': progress_ratio,
-            'distance_to_setpoint': torch.norm(self.stylus_pos_t1 - self.trajectory_manager.get_current_setpoint_local(), dim=-1),
             'distance_to_final': distance_to_final
         }
         
-        # 更新每个环境的指标
+        # 更新每个环境的指标（优化版 - 根据是否为milestone决定详细程度）
         for env_id in range(self.num_envs):
             self.reward_logger.update_step_metrics(
                 env_id, 
@@ -950,15 +929,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 self.safety_distances_t,
                 rewards
             )
-            
-            # 兼容性：保留log_step_details调用
-            if self.reward_logger.enable_text_logging:
-                self.reward_logger.log_step_details(
-                    env_id,
-                    self.reward_components,
-                    rewards,
-                    self.safety_distances_t
-                )
         
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
@@ -1012,7 +982,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # 过滤出实际运行过的环境
         valid_env_ids = []
         for env_id in env_ids_list:
-            if self.reward_logger.current_episode_metrics[env_id]['steps'] > 0:
+            if self.reward_logger.current_episode_basic[env_id]['steps'] > 0:
                 valid_env_ids.append(env_id)
         
         # 只记录实际运行过的episodes
@@ -1048,8 +1018,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.robot_forces_t[env_ids] = 0.0
         self.safety_distances_t[env_ids] = 0.01
         self.is_violating_t[env_ids] = False
-        
-        self.trajectory_manager.reset_trajectory(env_ids)
         
     def _get_stylus_position(self):
         """获取stylus位置"""

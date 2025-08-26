@@ -17,7 +17,6 @@ logging:
 trajectory:
   start_point: [0.14, -0.2, 0.03]
   end_point: [0.14, 0.2, 0.03]
-  checkpoint_interval: 0.1
   switch_threshold: 0.01
   total_distance: 0.4
 
@@ -67,7 +66,6 @@ reward_parameters:
     progress: 8.0
     velocity: 1.0
     obstacle_cbf: 4.0
-    crossing: 1.0
     force_efficiency: 0.5
     human_awareness: 0.3
     
@@ -76,7 +74,6 @@ reward_parameters:
     progress: 7.0
     velocity: 0.8
     obstacle_cbf: 4.0
-    crossing: 0.8
     force_efficiency: 0.4
     robot_awareness: 0.25
     
