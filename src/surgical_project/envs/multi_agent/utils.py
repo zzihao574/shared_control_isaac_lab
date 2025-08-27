@@ -262,14 +262,13 @@ class TrajectoryManager:
 
 
 class EpisodeTracker:
-    """Tracks basic episode statistics and counts."""
+    """Tracks basic episode statistics WITHOUT counting episodes (done externally)."""
     
     def __init__(self, num_envs: int, device: torch.device):
         self.num_envs = num_envs
         self.device = device
         
-        # Episode counting (completed episodes, starting from 0)
-        self.episode_count = torch.zeros(num_envs, dtype=torch.long, device=device)
+        # NO episode counter here - managed externally
         
         # Basic statistics (always recorded)
         self.basic_stats = {
@@ -294,8 +293,7 @@ class EpisodeTracker:
             } for env_id in range(num_envs)
         }
         
-        # Compatibility aliases
-        self.env_episode_counts = self.episode_count
+        # Step counts
         self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=device)
     
     def on_step(self, env_ids=None):
@@ -338,7 +336,7 @@ class EpisodeTracker:
             basic['collision'] = True
     
     def on_episode_end(self, env_ids):
-        """Handle episode completion."""
+        """Handle episode completion (counter managed externally)."""
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
         
@@ -356,8 +354,7 @@ class EpisodeTracker:
             if basic['collision']:
                 stats['collision_episodes'] += 1
             
-            # Update episode count and reset
-            self.episode_count[env_id_item] += 1
+            # Reset step counter
             self.env_step_counts[env_id_item] = 0
             
             # Reset current episode data
@@ -492,12 +489,21 @@ class MilestoneManager:
         print(f"  Average Steps: {avg_steps:.1f}")
         print(f"{'='*60}\n")
     
-    def get_next_milestone_progress(self, episode_counts: torch.Tensor):
-        """Get next milestone progress information."""
-        min_episodes = episode_counts.min().item()
+    def get_next_milestone_progress(self, episode_counts):
+        """Get next milestone progress information using external counter."""
+        if isinstance(episode_counts, list):
+            # If it's a list from TrainingProgressTracker
+            min_episodes = min(episode_counts)
+        else:
+            # If it's a tensor
+            min_episodes = episode_counts.min().item()
+            
         for milestone in self.milestones:
             if milestone > min_episodes:
-                reached = (episode_counts >= milestone).sum().item()
+                if isinstance(episode_counts, list):
+                    reached = sum(1 for count in episode_counts if count >= milestone)
+                else:
+                    reached = (episode_counts >= milestone).sum().item()
                 return milestone, reached, self.num_envs - reached
         return None, 0, 0
 
@@ -652,25 +658,29 @@ class DetailedLogger:
 
 class RewardLogger:
     """
-    Optimized reward logger - only records detailed data at milestones.
-    Composed of separate components for better maintainability.
+    Optimized reward logger - uses external episode counter.
     """
 
     def __init__(self, num_envs: int, device: torch.device):
         self.num_envs = num_envs
         self.device = device
         
-        # Component initialization (will be configured later)
+        # Component initialization
         self.episode_tracker = EpisodeTracker(num_envs, device)
         self.milestone_manager = None  # Initialized in configure_logging
         self.detailed_logger = None    # Initialized in configure_logging
         
-        # Compatibility aliases
-        self.episode_count = self.episode_tracker.episode_count
-        self.env_episode_counts = self.episode_tracker.env_episode_counts
-        self.env_step_counts = self.episode_tracker.env_step_counts
+        # External episode counter reference (will be set by trainer)
+        self.external_episode_counter = None
+        
+        # Compatibility aliases for backward compatibility
         self.current_episode_basic = self.episode_tracker.current_episode_basic
         self.basic_stats = self.episode_tracker.basic_stats
+        self.env_step_counts = self.episode_tracker.env_step_counts
+    
+    def set_episode_counter(self, counter_reference):
+        """Set reference to external episode counter (from TrainingProgressTracker)."""
+        self.external_episode_counter = counter_reference
 
     def configure_logging(self, params: Dict):
         """Configure logging components based on parameters."""
@@ -713,8 +723,12 @@ class RewardLogger:
         self.episode_tracker.on_step(env_ids)
     
     def update_step_metrics(self, env_id: int, reward_components: Dict, safety_distance: torch.Tensor, rewards: Dict):
-        """Update step metrics - optimized version."""
-        current_episode = self.episode_tracker.episode_count[env_id].item() + 1
+        """Update step metrics - uses external episode counter."""
+        # Use external counter if available, otherwise assume episode 1
+        if self.external_episode_counter is not None:
+            current_episode = int(self.external_episode_counter[env_id]) + 1
+        else:
+            current_episode = 1
         
         # Update basic data (always performed)
         self.episode_tracker.update_step_metrics(env_id, reward_components, safety_distance, rewards)
@@ -733,25 +747,33 @@ class RewardLogger:
                 )
     
     def on_episode_end(self, env_ids):
-        """Episode end processing - optimized version."""
+        """Episode end processing - uses external episode counter."""
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
         
         for env_id in env_ids:
             env_id_item = env_id.item()
-            current_episode_num = self.episode_tracker.episode_count[env_id_item].item() + 1
+            
+            # Use external counter if available (THIS IS THE EPISODE THAT JUST ENDED)
+            if self.external_episode_counter is not None:
+                # Note: counter hasn't been incremented yet, so this is the episode that just ended
+                current_episode_num = int(self.external_episode_counter[env_id_item]) + 1
+            else:
+                current_episode_num = 1
             
             basic = self.episode_tracker.current_episode_basic[env_id_item]
             
-            # Only output detailed logs and calculate scores at milestone episodes
+            # IMPORTANT: Process milestones BEFORE resetting episode data
             if self.milestone_manager and self.milestone_manager.is_milestone_episode(current_episode_num):
-                self.milestone_manager.process_milestone_completion(env_id_item, current_episode_num, basic)
-                
-                # Close text log files
-                if self.detailed_logger and self.detailed_logger.enabled:
-                    self.detailed_logger.close_environment_file(env_id_item)
+                # Only process if we have actual data (not already reset)
+                if basic['steps'] > 0:
+                    self.milestone_manager.process_milestone_completion(env_id_item, current_episode_num, basic)
+                    
+                    # Close text log files
+                    if self.detailed_logger and self.detailed_logger.enabled:
+                        self.detailed_logger.close_environment_file(env_id_item)
             
-            # Always update episode tracker
+            # NOW reset the episode data for next episode
             self.episode_tracker.on_episode_end([env_id_item])
     
     def get_final_evaluation(self, env_id: int, target_episodes: int) -> float:
@@ -768,17 +790,27 @@ class RewardLogger:
         )
     
     def get_next_milestone_progress(self):
-        """Get next milestone progress information."""
-        if not self.milestone_manager:
+        """Get next milestone progress using external counter."""
+        if not self.milestone_manager or not self.external_episode_counter:
             return None, 0, 0
-        return self.milestone_manager.get_next_milestone_progress(self.episode_tracker.episode_count)
+        return self.milestone_manager.get_next_milestone_progress(self.external_episode_counter)
     
     def close_all_files(self):
         """Close all log files."""
         if self.detailed_logger:
             self.detailed_logger.close_all_files()
     
-    # Properties for milestone access (compatibility)
+    # Properties for compatibility 
+    @property
+    def episode_count(self):
+        """Access external episode counter for compatibility."""
+        return self.external_episode_counter
+    
+    @property
+    def env_episode_counts(self):
+        """Access external episode counter for compatibility."""
+        return self.external_episode_counter
+    
     @property
     def milestone_performances(self):
         """Access milestone performances for compatibility."""

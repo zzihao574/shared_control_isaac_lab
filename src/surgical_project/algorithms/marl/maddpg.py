@@ -26,9 +26,9 @@ class MADDPG:
         self.action_dims = agent_config.get('action_dims', [3, 3])
         self.total_obs_dim = agent_config.get('total_observation_dim', 42)
         self.total_action_dim = agent_config.get('total_action_dim', 6)
-        
-        print(f"[INFO] Initializing MADDPG: {self.num_envs} environments, {self.num_envs * self.num_agents} networks")
-        
+
+        print(f"[INFO] Initializing MADDPG: {self.num_envs} environments, {self.num_envs * self.num_agents * 4} networks")
+
         self._initialize_agents()
         self._initialize_replay_buffers()
         

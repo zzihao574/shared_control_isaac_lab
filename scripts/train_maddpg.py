@@ -2,7 +2,7 @@
 
 """
 Surgical Robot MADDPG Multi-Environment Parallel Training
-(MODIFIED VERSION - Simplified logging and bug fixes)
+(FIXED VERSION - Unified episode tracking)
 """
 
 import sys
@@ -68,7 +68,15 @@ class MADDPGTrainer:
 
         if self.checkpoint_manager.load_checkpoint():
             self.checkpoint_manager.initialize_agents_from_checkpoint(self.maddpg_trainer)
+        
+        # Create THE SINGLE episode counter in TrainingProgressTracker
         self.progress_tracker = TrainingProgressTracker(self.maddpg_trainer.num_envs, self.args.max_episodes)
+        
+        # Pass the counter reference to reward logger
+        reward_logger = self._get_reward_logger()
+        if reward_logger:
+            reward_logger.set_episode_counter(self.progress_tracker.env_episode_counts)
+        
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models)
         self.training_started = False
         self.min_buffer_size = self.maddpg_trainer.min_buffer_size
@@ -77,10 +85,22 @@ class MADDPGTrainer:
         from surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
         import gymnasium as gym
         import surgical_project.envs.multi_agent
+        
         env_cfg = SurgicalDirectMARLEnvCfg()
         env_cfg.scene.num_envs = self.args.num_envs
         env_cfg.seed = self.args.seed
+        
+        # Debug: Check episode configuration
+        print(f"[DEBUG] Episode length configured: {env_cfg.episode_length_s}s")
+        print(f"[DEBUG] Decimation: {env_cfg.decimation}")
+        print(f"[DEBUG] Expected steps per episode: {env_cfg.episode_length_s * 60}")  # 60Hz after decimation
+        
         env = gym.make(self.args.task, cfg=env_cfg)
+        
+        # Debug: Check max_episode_length after environment creation
+        if hasattr(env, 'max_episode_length'):
+            print(f"[DEBUG] Environment max_episode_length: {env.max_episode_length}")
+        
         return env, env_cfg
 
     def _get_reward_logger(self):
@@ -89,6 +109,16 @@ class MADDPGTrainer:
     def _configure_reward_logger(self):
         reward_logger = self._get_reward_logger()
         if reward_logger:
+            # FIX: Pass max_episodes to reward logger configuration
+            self.config.params['training_monitor']['max_episodes'] = self.args.max_episodes
+            
+            # FIX: Filter milestones to only include those <= max_episodes
+            original_milestones = self.config.params['training_monitor'].get('milestone_episodes', [])
+            filtered_milestones = [m for m in original_milestones if m <= self.args.max_episodes]
+            self.config.params['training_monitor']['milestone_episodes'] = filtered_milestones
+            
+            print(f"[INFO] Filtered milestones for max_episodes={self.args.max_episodes}: {filtered_milestones}")
+            
             reward_logger.configure_logging(self.config.params)
             reward_logger.set_topk_update_callback(self.update_topk_at_milestone)
 
@@ -98,8 +128,10 @@ class MADDPGTrainer:
             agent = self.maddpg_trainer.env_agents[env_id][agent_id]
             prefix = f'{agent_id}'
             model_state.update({
-                f'{prefix}_actor': agent.actor.state_dict(), f'{prefix}_critic': agent.critic.state_dict(),
-                f'{prefix}_actor_target': agent.actor_target.state_dict(), f'{prefix}_critic_target': agent.critic_target.state_dict()
+                f'{prefix}_actor': agent.actor.state_dict(), 
+                f'{prefix}_critic': agent.critic.state_dict(),
+                f'{prefix}_actor_target': agent.actor_target.state_dict(), 
+                f'{prefix}_critic_target': agent.critic_target.state_dict()
             })
         return model_state
 
@@ -129,19 +161,37 @@ class MADDPGTrainer:
             return
 
         for env_id in active_envs:
+            current_steps = reward_logger.episode_tracker.current_episode_basic[env_id]['steps']
+            
+            # Detect episode end by: explicit done flags OR step count reset (Isaac Lab auto-reset)
             env_done = any(terminated[agent][env_id] or truncated[agent][env_id] for agent in self.maddpg_trainer.agent_ids)
             
-            if env_done and reward_logger.episode_tracker.current_episode_basic[env_id]['steps'] > 0:
-                # 1. Process the episode that just ended
+            # Isaac Lab auto-resets without setting truncated=True
+            # Detect reset by step count dropping (was high, now low)
+            if not hasattr(self, '_prev_steps'):
+                self._prev_steps = {}
+            
+            prev_steps = self._prev_steps.get(env_id, 0)
+            episode_reset = prev_steps > current_steps + 100  # Step count dropped significantly
+            
+            if episode_reset and not env_done:
+                env_done = True
+            
+            self._prev_steps[env_id] = current_steps
+            
+            if env_done and prev_steps > 0:  # Use prev_steps since current_steps may have reset
+                # Process the episode metrics and milestones
                 reward_logger.on_episode_end(torch.tensor([env_id], device=self.maddpg_trainer.device))
                 
-                # 2. Check if this env has finished all its training
+                # Increment THE SINGLE episode counter
                 reached_max = self.progress_tracker.complete_episode(env_id)
+                
                 if reached_max:
-                    final_performance = reward_logger.get_final_evaluation(env_id, self.args.max_episodes)
+                    final_episode_count = self.progress_tracker.env_episode_counts[env_id]
+                    final_performance = reward_logger.get_final_evaluation(env_id, final_episode_count)
                     
                     self.logger.log_environment_completion(
-                        env_id, self.progress_tracker.env_episode_counts[env_id],
+                        env_id, final_episode_count,
                         final_performance, self.progress_tracker.num_completed_envs,
                         self.maddpg_trainer.num_envs
                     )
@@ -150,6 +200,9 @@ class MADDPGTrainer:
 
     def train(self) -> None:
         self.logger.log_training_start(self.args, self.config.params)
+        
+        print(f"[INFO] Training with max_episodes={self.args.max_episodes}")
+        
         try:
             obs_dict, _ = self.env.reset()
             while not self.progress_tracker.is_training_complete():
@@ -191,13 +244,8 @@ class MADDPGTrainer:
             if reward_logger:
                 for env_id in range(self.maddpg_trainer.num_envs):
                     try:
-                        # Only update models for envs that were not completed prematurely
-                        if not self.progress_tracker.env_completed[env_id]:
-                             # If an env never finished, its final evaluation might not be meaningful
-                             # but we can still try to get a score based on its progress.
-                             pass
-                        
-                        performance = reward_logger.get_final_evaluation(env_id, self.args.max_episodes)
+                        final_episode_count = self.progress_tracker.env_episode_counts[env_id]
+                        performance = reward_logger.get_final_evaluation(env_id, final_episode_count)
                         model_state = self._extract_model_state(env_id)
                         self.top_k_manager.update_model(env_id, performance, model_state)
 
