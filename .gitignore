@@ -3,6 +3,7 @@
 
 # 保留.gitignore本身
 !.gitignore
+! README.md
 
 # 保留这些路径
 !/assets/

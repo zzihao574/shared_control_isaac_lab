@@ -117,9 +117,9 @@ maddpg_config:
 agent_config:
   agent_names: ["human", "robot"]     # Agent identifiers
   num_agents: 2                       # Total number of agents
-  observation_dims: [21, 21]         # Observation dimensions per agent
+  observation_dims: [19, 19]          # Observation dimensions per agent
   action_dims: [3, 3]                 # Action dimensions per agent
-  total_observation_dim: 42           # Combined observation dimension
+  total_observation_dim: 38           # Combined observation dimension
   total_action_dim: 6                 # Combined action dimension
 
 # ==============================================================================
