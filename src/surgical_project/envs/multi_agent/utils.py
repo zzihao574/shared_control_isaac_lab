@@ -10,10 +10,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
-
 class CompleteConstraintChecker:
     """
-    Constraint state detection and collision checking utility.
+    Simplified constraint state detection and collision checking utility.
     Provides physics-based constraint analysis for surgical robot environments.
     """
     
@@ -32,9 +31,7 @@ class CompleteConstraintChecker:
             from omni.physx.bindings._physx import acquire_physx_attachment_interface, acquire_physx_scene_query_interface
             self.physics_attachment_interface = acquire_physx_attachment_interface()
             self.physics_scene_query_interface = acquire_physx_scene_query_interface()
-            print("[INFO] Physics query interfaces available")
         except ImportError:
-            print("[ERROR] Physics query interfaces not available")
             self.physics_attachment_interface = None
             self.physics_scene_query_interface = None
     
@@ -66,18 +63,17 @@ class CompleteConstraintChecker:
         
         for env_id in range(num_envs):
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
-            constraint_path = f"/World/envs/env_{env_id}/Constraint/mesh"
+            constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
-                if result is not None and result['distance'] > 0:
+                if result is not None:
                     batch_results['distances_constraint'][env_id] = result['distance']
                     batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
                     batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
                     batch_results['is_overlapping'][env_id] = result['is_overlapping']
                     batch_results['is_inside'][env_id] = result['is_inside']
-            except Exception as e:
-                # Continue with default values if analysis fails
+            except Exception:
                 pass
         
         return batch_results
@@ -87,7 +83,7 @@ class CompleteConstraintChecker:
         Analyze constraint state for a single environment.
         
         Args:
-            stylus_position: Current stylus position
+            stylus_position: Current stylus position in world coordinates
             constraint_path: USD path to constraint mesh
             
         Returns:
@@ -99,6 +95,7 @@ class CompleteConstraintChecker:
             pos = stylus_position.cpu().numpy()
             current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
             
+            # Get closest point
             result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
             
             if not (result and 'closest_points' in result and result['closest_points']):
@@ -106,72 +103,97 @@ class CompleteConstraintChecker:
             
             closest_pt = result['closest_points'][0]
             closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
+            
+            # Calculate distance
             distance = float(np.linalg.norm(pos - closest_pos))
             
-            direction_to_closest = Float3(closest_pt.x - pos[0], closest_pt.y - pos[1], closest_pt.z - pos[2])
-            raycast_result = self.physics_scene_query_interface.raycast_closest(current_point, direction_to_closest, 10000)
+            # Raycast detection: from stylus to closest point
+            direction_vec = closest_pos - pos
+            direction_length = np.linalg.norm(direction_vec)
             
-            # Determine overlap condition
+            if direction_length < 1e-8:
+                return {
+                    'distance': 0.0,
+                    'closest_point': closest_pos,
+                    'normal_vector': np.array([1.0, 0.0, 0.0]),
+                    'state': "overlapping",
+                    'is_overlapping': True,
+                    'is_inside': False
+                }
+            
+            # Normalize direction vector
+            direction_normalized = direction_vec / direction_length
+            direction_to_closest = Float3(
+                float(direction_normalized[0]),
+                float(direction_normalized[1]),
+                float(direction_normalized[2])
+            )
+            
+            # Execute raycast
+            raycast_result = self.physics_scene_query_interface.raycast_closest(
+                current_point, direction_to_closest, direction_length + 0.01
+            )
+            
+            # Filter raycast results - only constraint object collisions
+            filtered_raycast_result = None
+            if raycast_result and 'collision' in raycast_result:
+                collision_path = raycast_result['collision']
+                if constraint_path in collision_path:
+                    filtered_raycast_result = raycast_result
+            
+            # Constraint state determination
             is_overlapping = False
-            if (('faceIndex' not in raycast_result) and distance < 0.5) or \
-               ('faceIndex' in raycast_result and raycast_result.get('faceIndex', -1) == 0 and distance < 0.5):
+            is_inside = False
+            normal_vector = np.array([1.0, 0.0, 0.0])
+            
+            # Check for abnormal distances - likely physics interface error
+            if distance > 1.2 or distance < 1e-8:
                 is_overlapping = True
-            
-            # Check if point is inside constraint (bidirectional raycast test)
-            direction_is_inside_1 = Float3(closest_pt.x - pos[0], closest_pt.y - pos[1], 0)
-            direction_is_inside_2 = Float3(-closest_pt.x + pos[0], -closest_pt.y + pos[1], 0)
-            
-            len1 = np.sqrt((closest_pt.x - pos[0])**2 + (closest_pt.y - pos[1])**2)
-            len2 = np.sqrt((-closest_pt.x + pos[0])**2 + (-closest_pt.y + pos[1])**2)
-            
-            if len1 > 1e-8:
-                direction_is_inside_1 = Float3((closest_pt.x - pos[0])/len1, (closest_pt.y - pos[1])/len1, 0)
-            else:
-                direction_is_inside_1 = Float3(1.0, 0.0, 0.0)
+                is_inside = False
+                distance = 0.0
+                state = "overlapping"
+                normal_vector = np.array([1.0, 0.0, 0.0])
+                    
+            elif distance < 0.002:  # 2mm threshold - normal overlapping detection
+                is_overlapping = True
+                is_inside = False
+                distance = 0.0
+                state = "overlapping"
                 
-            if len2 > 1e-8:
-                direction_is_inside_2 = Float3((-closest_pt.x + pos[0])/len2, (-closest_pt.y + pos[1])/len2, 0)
-            else:
-                direction_is_inside_2 = Float3(-1.0, 0.0, 0.0)
-            
-            is_inside_1 = self.physics_scene_query_interface.raycast_any(current_point, direction_is_inside_1, 10000)
-            is_inside_2 = self.physics_scene_query_interface.raycast_any(current_point, direction_is_inside_2, 10000)
-            is_inside = bool(is_inside_1) and bool(is_inside_2)
-            
-            # Calculate surface normal
-            normal_vector = np.array([1.0, 0.0, 0.0])  # Default normal
-            
-            if is_overlapping:
-                mirror_point_pos = 2 * closest_pos - pos
-                mirror_point = Float3(float(mirror_point_pos[0]), float(mirror_point_pos[1]), float(mirror_point_pos[2]))
-                direction_mirror_to_current = Float3(pos[0] - mirror_point_pos[0], pos[1] - mirror_point_pos[1], pos[2] - mirror_point_pos[2])
-                mirror_raycast = self.physics_scene_query_interface.raycast_closest(mirror_point, direction_mirror_to_current, 10000)
+                if filtered_raycast_result and 'normal' in filtered_raycast_result:
+                    normal_carb = filtered_raycast_result['normal']
+                    normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
+                else:
+                    normal_vector = np.array([1.0, 0.0, 0.0])
                 
-                if mirror_raycast and 'normal' in mirror_raycast:
-                    normal_carb = mirror_raycast['normal']
-                    if is_inside:
-                        normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-                    else:
-                        normal_vector = -np.array([normal_carb.x, normal_carb.y, normal_carb.z])
+            elif not filtered_raycast_result or 'faceIndex' not in filtered_raycast_result:
+                # No ray intersection - usually inside
+                is_inside = True
+                is_overlapping = False
+                state = "inside"
+                normal_vector = np.array([1.0, 0.0, 0.0])
+            
             else:
-                if raycast_result and 'normal' in raycast_result:
-                    normal_carb = raycast_result['normal']
-                    if is_inside:
-                        normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-                    else:
-                        normal_vector = -np.array([normal_carb.x, normal_carb.y, normal_carb.z])
+                # Has ray intersection - usually outside
+                is_inside = False
+                is_overlapping = False
+                state = "outside"
+                
+                if 'normal' in filtered_raycast_result:
+                    normal_carb = filtered_raycast_result['normal']
+                    normal_vector = -np.array([normal_carb.x, normal_carb.y, normal_carb.z])
             
             return {
                 'distance': distance,
                 'closest_point': closest_pos,
                 'normal_vector': normal_vector,
+                'state': state,
                 'is_overlapping': is_overlapping,
                 'is_inside': is_inside
             }
-                
-        except Exception as e:
+            
+        except Exception:
             return None
-
 
 class TrajectoryManager:
     """
