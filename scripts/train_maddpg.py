@@ -2,7 +2,7 @@
 
 """
 Surgical Robot MADDPG Multi-Environment Parallel Training
-(FIXED VERSION - Unified episode tracking)
+清理版本 - 统一维度管理，移除重复配置
 """
 
 import sys
@@ -87,17 +87,22 @@ class MADDPGTrainer:
         import surgical_project.envs.multi_agent
         
         env_cfg = SurgicalDirectMARLEnvCfg()
+        # 从命令行参数设置环境数量（覆盖cfg中的默认值）
         env_cfg.scene.num_envs = self.args.num_envs
         env_cfg.seed = self.args.seed
         
-        # Debug: Check episode configuration
-        print(f"[DEBUG] Episode length configured: {env_cfg.episode_length_s}s")
-        print(f"[DEBUG] Decimation: {env_cfg.decimation}")
-        print(f"[DEBUG] Expected steps per episode: {env_cfg.episode_length_s * 60}")  # 60Hz after decimation
+        # Debug: 检查环境配置
+        print(f"[DEBUG] Environment configuration:")
+        print(f"  Number of environments: {env_cfg.scene.num_envs}")
+        print(f"  Episode length: {env_cfg.episode_length_s}s")
+        print(f"  Decimation: {env_cfg.decimation}")
+        print(f"  Possible agents: {env_cfg.possible_agents}")
+        print(f"  Action spaces: {env_cfg.action_spaces}")
+        print(f"  Observation spaces: {env_cfg.observation_spaces}")
         
         env = gym.make(self.args.task, cfg=env_cfg)
         
-        # Debug: Check max_episode_length after environment creation
+        # Debug: 验证环境创建后的状态
         if hasattr(env, 'max_episode_length'):
             print(f"[DEBUG] Environment max_episode_length: {env.max_episode_length}")
         

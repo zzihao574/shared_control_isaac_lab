@@ -1,6 +1,6 @@
 """
 Multi-environment parallel MADDPG algorithm.
-(MODIFIED VERSION - Simplified with fewer statistics methods and robust indexing)
+清理版本 - 从环境获取维度信息，移除对YAML中重复配置的依赖
 """
 
 import torch
@@ -19,15 +19,24 @@ class MADDPG:
         # FIX: Use the explicitly passed num_envs, which is guaranteed to be correct.
         self.num_envs = num_envs
         
-        agent_config = params.get('agent_config', {})
-        self.agent_ids = agent_config.get('agent_names', ["human", "robot"])
-        self.num_agents = agent_config.get('num_agents', 2)
-        self.obs_dims = agent_config.get('observation_dims', [21, 21])
-        self.action_dims = agent_config.get('action_dims', [3, 3])
-        self.total_obs_dim = agent_config.get('total_observation_dim', 42)
-        self.total_action_dim = agent_config.get('total_action_dim', 6)
+        # 获取真正的环境配置 - 处理Gymnasium包装器
+        actual_env = self._get_actual_env(env)
+        
+        # 从环境cfg获取agent信息 (单一可信来源)
+        self.agent_ids = list(actual_env.cfg.possible_agents)
+        self.num_agents = len(self.agent_ids)
+        
+        # 从环境cfg获取维度信息 (移除对YAML的依赖)
+        self.obs_dims = [actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
+        self.action_dims = [actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
+        self.total_obs_dim = sum(self.obs_dims)
+        self.total_action_dim = sum(self.action_dims)
 
         print(f"[INFO] Initializing MADDPG: {self.num_envs} environments, {self.num_envs * self.num_agents * 4} networks")
+        print(f"[INFO] Auto-detected from environment cfg:")
+        print(f"  Agent IDs: {self.agent_ids}")
+        print(f"  Observation dims: {self.obs_dims} (total: {self.total_obs_dim})")
+        print(f"  Action dims: {self.action_dims} (total: {self.total_action_dim})")
 
         self._initialize_agents()
         self._initialize_replay_buffers()
@@ -40,6 +49,31 @@ class MADDPG:
         
         self.env_active = [True] * self.num_envs
         self.training_steps = 0
+    
+    def _get_actual_env(self, env):
+        """获取真正的环境对象，处理Gymnasium包装器"""
+        # 尝试多种方式访问底层环境
+        if hasattr(env, 'cfg'):
+            return env
+        elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'cfg'):
+            return env.unwrapped
+        elif hasattr(env, 'env') and hasattr(env.env, 'cfg'):
+            return env.env
+        else:
+            # 遍历可能的包装器层级
+            current = env
+            max_depth = 10  # 防止无限循环
+            for _ in range(max_depth):
+                if hasattr(current, 'cfg'):
+                    return current
+                elif hasattr(current, 'unwrapped'):
+                    current = current.unwrapped
+                elif hasattr(current, 'env'):
+                    current = current.env
+                else:
+                    break
+            
+            raise AttributeError(f"Cannot find cfg attribute in environment: {type(env)}")
         
     def _initialize_agents(self) -> None:
         self.env_agents = {}
@@ -48,9 +82,13 @@ class MADDPG:
             for i, agent_id in enumerate(self.agent_ids):
                 agent_name = f"{agent_id}_env_{env_id}"
                 self.env_agents[env_id][agent_id] = DDPGAgent(
-                    agent_id=agent_name, state_dim=self.obs_dims[i], action_dim=self.action_dims[i],
-                    total_state_dim=self.total_obs_dim, total_action_dim=self.total_action_dim,
-                    params=self.params, device=self.device
+                    agent_id=agent_name, 
+                    state_dim=self.obs_dims[i], 
+                    action_dim=self.action_dims[i],
+                    total_state_dim=self.total_obs_dim, 
+                    total_action_dim=self.total_action_dim,
+                    params=self.params, 
+                    device=self.device
                 )
     
     def _initialize_replay_buffers(self) -> None:
@@ -59,8 +97,11 @@ class MADDPG:
         self.env_replay_buffers = {}
         for env_id in range(self.num_envs):
             self.env_replay_buffers[env_id] = MultiAgentReplayBuffer(
-                capacity=self.buffer_size, num_agents=self.num_agents,
-                obs_dims=self.obs_dims, action_dims=self.action_dims, device=self.device
+                capacity=self.buffer_size, 
+                num_agents=self.num_agents,
+                obs_dims=self.obs_dims, 
+                action_dims=self.action_dims, 
+                device=self.device
             )
 
     def select_actions(self, observations: Dict[str, torch.Tensor], active_envs: List[int], add_noise: bool = True) -> Dict[str, torch.Tensor]:

@@ -1,4 +1,4 @@
-# surgical_direct_marl_env_cfg.py
+# surgical_direct_marl_env_cfg.py - 清理重复定义后的版本
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     episode_length_s = 20  # Episode length in seconds
     decimation = 2         # Control decimation factor
     
-    # Multi-agent configuration
+    # Multi-agent configuration (唯一可信来源)
     possible_agents = ["human", "robot"]
     
     action_spaces = {
@@ -45,12 +45,12 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     }
     
     observation_spaces = {
-        "human": 21,  # Local observation dimension
-        "robot": 21,  # Local observation dimension
+        "human": 19,  # 修正为实际维度: 位置(3)+速度(3)+关节位置(6)+关节速度(6)+约束距离(1)=19
+        "robot": 19,  # 修正为实际维度
     }
     
-    state_space = 24  # Global state dimension
-    
+    state_space = 38
+
     # Physics simulation configuration
     sim: SimulationCfg = SimulationCfg(
         device="cuda:0",
@@ -66,14 +66,14 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         ),
     )
     
-    # Scene configuration with multiple environments
+    # Scene configuration with multiple environments (数量可从命令行覆盖)
     scene: InteractiveSceneCfg = MySceneCfg(
-        num_envs=512,      # Number of parallel environments
+        num_envs=512,      # 默认值，可被train_maddpg.py中的--num_envs覆盖
         env_spacing=4.0,   # Spacing between environments
         replicate_physics=True
     )
     
-    # Phantom Omni robot configuration with individual joint actuators
+    # Phantom Omni robot configuration
     phantom_omni = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -115,10 +115,12 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             },
         ),
         # Individual actuator configuration for each joint
+        # 注意：这里的effort_limit与YAML中的force constraint不同用途
+        # effort_limit是关节力矩限制，max_robot_force是末端执行器力限制
         actuators={
             "waist_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["waist"],
-                effort_limit=5.0,   # Force limit in Newtons
+                effort_limit=5.0,   # Joint torque limit (Nm)
                 stiffness=0.0,      # Zero stiffness for force control
                 damping=0.0,        # Zero damping for free motion
             ),
@@ -172,9 +174,3 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         ),
     )
     
-    # Simulation timing parameters
-    physics_dt = 1/120              # Physics timestep (120 Hz)
-    render_dt = 1/60               # Rendering timestep (60 Hz)
-    solver_iterations = 16         # Position solver iterations
-    solver_velocity_iterations = 8 # Velocity solver iterations
-    use_gpu_physics = True        # Enable GPU acceleration

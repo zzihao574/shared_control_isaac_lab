@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - Complete version with console logging
+# surgical_direct_marl_env.py - 清理维度重复定义后的版本
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import yaml
 import os
-import gymnasium as gym
+import gymnasium as gym  # 恢复gymnasium import
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 
@@ -29,7 +29,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Trajectory following with progress tracking
     - Comprehensive reward system with safety considerations
     - Performance evaluation and milestone tracking
-    - Detailed console logging for verification
+    - Console logging via utils (configured by YAML)
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -45,51 +45,35 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Load training parameters and environment configuration
-        self.params = self._load_training_params()
-        self.dt = self.cfg.sim.dt * self.cfg.decimation
-        self._load_configuration_parameters()
+        # Load configuration and initialize core parameters
+        self._setup_core_configuration()
         
-        # Initialize environment base positions
-        self.env_base_positions = torch.zeros(self.num_envs, 3, device=self.device)
+        # Initialize state variables and caches
+        self._initialize_state_variables()
         
-        # Initialize utility managers
-        self._initialize_managers()
+        # Initialize utility managers and components
+        self._initialize_components()
         
-        # Initialize agent actions storage
-        self.agent_actions = {
-            agent: torch.zeros(self.num_envs, 3, device=self.device)
-            for agent in self.cfg.possible_agents
-        }
-        
-        # Physics interaction state (forces applied at time t)
-        self._initialize_physics_state()
-        
-        # Fixed end joints configuration
-        self.fixed_end_joints = torch.tensor([
-            self.params['initial_conditions']['joint_positions']['yaw'],
-            self.params['initial_conditions']['joint_positions']['pitch'],
-            self.params['initial_conditions']['joint_positions']['roll']
-        ], device=self.device, dtype=torch.float32)
-        
-        # Body index for stylus/end-effector
-        self.stylus_body_idx = None
-        
-        # Constraint checker for collision detection
-        self.constraint_checker = CompleteConstraintChecker(self.device, self.collision_threshold)
-        
-        # State cache (will be updated in _get_observations)
-        self._initialize_state_cache()
-        
-        # Reward components cache
-        self.reward_components = {}
-        
-        # Console logging configuration
-        self.enable_console_logging = kwargs.get('enable_console_logging', True)
-        
-        # Gymnasium compatibility
+        # 恢复gymnasium spaces设置 - Isaac Lab和Gymnasium都需要
         self._setup_gymnasium_spaces()
         
+    def _setup_core_configuration(self) -> None:
+        """Load and setup core configuration parameters."""
+        # Load training parameters from YAML
+        self.params = self._load_training_params()
+        self.dt = self.cfg.sim.dt * self.cfg.decimation
+        
+        # Load and cache constraint parameters
+        self._load_constraint_parameters()
+        
+        # Load safety and CBF parameters  
+        self._load_safety_parameters()
+        
+        # Load termination conditions
+        self._load_termination_parameters()
+        
+        print(f"[INFO] Episode length controlled by cfg.episode_length_s: {self.cfg.episode_length_s}s")
+    
     def _load_training_params(self) -> dict:
         """Load training parameters from YAML configuration."""
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -98,14 +82,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         with open(yaml_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     
-    def _load_configuration_parameters(self):
-        """Load and cache configuration parameters for efficient access."""
+    def _load_constraint_parameters(self) -> None:
+        """Load and cache constraint-related parameters."""
         constraints = self.params['constraints']
+        
+        # Position and force limits
         self.min_z_pos = constraints['min_z_position']
         self.max_robot_force = constraints['max_robot_force']
         self.max_human_force = constraints['max_human_force']
         
-        # Joint limits as tensors for efficient clamping
+        # Joint limits as tensors for efficient operations
         joint_limits = constraints['joint_limits']
         self.joint_lower_limits = torch.tensor([
             joint_limits['waist'][0], joint_limits['shoulder'][0], joint_limits['elbow'][0],
@@ -117,32 +103,59 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             joint_limits['yaw'][1], joint_limits['pitch'][1], joint_limits['roll'][1]
         ], device=self.device, dtype=torch.float32)
         
-        # CBF and safety parameters
-        self.safety_margin = self.params['reward_parameters']['cbf_parameters']['safety_margin']
-        self.collision_threshold = self.params['constraint_geometry']['collision_threshold']
-        self.cbf_gamma = self.params['reward_parameters']['cbf_parameters']['gamma']
-        self.cbf_epsilon = self.params['reward_parameters']['cbf_parameters']['epsilon']
+        # Fixed end joints configuration
+        self.fixed_end_joints = torch.tensor([
+            self.params['initial_conditions']['joint_positions']['yaw'],
+            self.params['initial_conditions']['joint_positions']['pitch'],
+            self.params['initial_conditions']['joint_positions']['roll']
+        ], device=self.device, dtype=torch.float32)
+    
+    def _load_safety_parameters(self) -> None:
+        """Load CBF and safety-related parameters."""
+        cbf_params = self.params['reward_parameters']['cbf_parameters']
+        self.safety_margin = cbf_params['safety_margin']
+        self.cbf_gamma = cbf_params['gamma']
+        self.cbf_epsilon = cbf_params['epsilon']
         
-        # Termination conditions
+        # Collision detection parameters
+        self.collision_threshold = self.params['constraint_geometry']['collision_threshold']
+    
+    def _load_termination_parameters(self) -> None:
+        """Load episode termination condition parameters."""
         term_config = self.params.get('termination_conditions', {})
         self.enable_z_termination = term_config.get('z_below_zero', True)
         self.enable_edge_termination = term_config.get('edge_collision', True)
         self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.001)
+    
+    def _initialize_state_variables(self) -> None:
+        """Initialize all state variables and caches."""
+        # Environment base positions
+        self.env_base_positions = torch.zeros(self.num_envs, 3, device=self.device)
         
-        print(f"[INFO] Episode length controlled by cfg.episode_length_s: {self.cfg.episode_length_s}s")
+        # Agent actions storage
+        self.agent_actions = {
+            agent: torch.zeros(self.num_envs, 3, device=self.device)
+            for agent in self.cfg.possible_agents
+        }
         
-    def _initialize_managers(self) -> None:
-        """Initialize utility managers for trajectory and reward tracking."""
-        self.trajectory_manager = TrajectoryManager(
-            device=self.device,
-            params=self.params,
-            num_envs=self.num_envs,
-            env_base_positions=self.env_base_positions
-        )
+        # Physics interaction state (forces applied at time t)
+        self._initialize_physics_state()
         
-        self.reward_logger = RewardLogger(self.num_envs, self.device)
+        # State cache (will be updated in _get_observations)
+        self._initialize_observation_cache()
         
-    def _initialize_state_cache(self) -> None:
+        # Reward components cache
+        self.reward_components = {}
+        
+        # Body index for stylus/end-effector (will be set during scene setup)
+        self.stylus_body_idx = None
+    
+    def _initialize_physics_state(self) -> None:
+        """Initialize physics interaction state variables (forces at time t)."""
+        self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+    
+    def _initialize_observation_cache(self) -> None:
         """Initialize state caching variables (updated in _get_observations)."""
         self.stylus_pos_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.stylus_vel_t1 = torch.zeros(self.num_envs, 3, device=self.device)
@@ -151,17 +164,33 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.safety_distances_t1 = torch.ones(self.num_envs, device=self.device) * 0.01
         self.is_violating_t1 = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.constraint_results_t1 = None
+    
+    def _initialize_components(self) -> None:
+        """Initialize utility managers and components."""
+        # Trajectory manager for path following
+        self.trajectory_manager = TrajectoryManager(
+            device=self.device,
+            params=self.params,
+            num_envs=self.num_envs,
+            env_base_positions=self.env_base_positions
+        )
         
-    def _initialize_physics_state(self) -> None:
-        """Initialize physics interaction state variables (forces at time t)."""
-        self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        # Reward logger with milestone tracking
+        self.reward_logger = RewardLogger(self.num_envs, self.device)
+        self.reward_logger.configure_logging(self.params)
         
+        # Constraint checker for collision detection
+        self.constraint_checker = CompleteConstraintChecker(
+            device=self.device, 
+            collision_threshold=self.collision_threshold
+        )
+    
     def _setup_gymnasium_spaces(self) -> None:
-        """Setup Gymnasium compatibility spaces."""
+        """Setup Gymnasium compatibility spaces with unlimited bounds."""
+        # 使用无限大的边界，实际限制通过环境逻辑处理
         self.action_space = gym.spaces.Dict({
             agent: gym.spaces.Box(
-                low=-1.0, high=1.0, 
+                low=-np.inf, high=np.inf,
                 shape=(self.cfg.action_spaces[agent],), 
                 dtype=np.float32
             ) for agent in self.cfg.possible_agents
@@ -169,7 +198,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self.observation_space = gym.spaces.Dict({
             agent: gym.spaces.Box(
-                low=-10.0, high=10.0, 
+                low=-np.inf, high=np.inf,
                 shape=(self.cfg.observation_spaces[agent],), 
                 dtype=np.float32
             ) for agent in self.cfg.possible_agents
@@ -189,26 +218,45 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.scene.clone_environments(copy_from_source=False)
         
         # Setup scene lighting
+        self._setup_scene_lighting()
+        
+    def _setup_scene_lighting(self) -> None:
+        """Configure scene lighting."""
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
         
     def _setup_post_scene_creation(self):
         """Post-scene creation setup including physics configuration."""
         super()._setup_post_scene_creation()
+        
+        # Initialize robot-specific configurations
+        self._configure_robot_physics()
+        
+        # Update managers with robot data
+        self._update_managers_with_robot_data()
+        
+    def _configure_robot_physics(self) -> None:
+        """Configure robot physics properties and find body indices."""
+        if not hasattr(self, '_omni_robot'):
+            return
+            
+        # Find stylus/end-effector body index
         self._initialize_body_indices()
         
+        # Configure robot for force control (zero stiffness and damping)
+        num_joints = self._omni_robot.num_joints
+        zero_stiffness = torch.zeros(self.num_envs, num_joints, device=self.device)
+        zero_damping = torch.zeros(self.num_envs, num_joints, device=self.device)
+        
+        self._omni_robot.write_joint_stiffness_to_sim(zero_stiffness)
+        self._omni_robot.write_joint_damping_to_sim(zero_damping)
+        
+    def _update_managers_with_robot_data(self) -> None:
+        """Update managers with robot position data."""
         if hasattr(self, '_omni_robot'):
-            # Update environment base positions
+            # Update environment base positions from robot data
             self.env_base_positions = self._omni_robot.data.root_link_pos_w.clone()
             self.trajectory_manager.env_base_positions = self.env_base_positions
-            
-            # Configure robot for force control (zero stiffness and damping)
-            num_joints = self._omni_robot.num_joints
-            zero_stiffness = torch.zeros(self.num_envs, num_joints, device=self.device)
-            zero_damping = torch.zeros(self.num_envs, num_joints, device=self.device)
-            
-            self._omni_robot.write_joint_stiffness_to_sim(zero_stiffness)
-            self._omni_robot.write_joint_damping_to_sim(zero_damping)
             
     def _initialize_body_indices(self):
         """Initialize body indices for end-effector/stylus identification."""
@@ -217,6 +265,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         # Search for end-effector using common naming patterns
         search_patterns = ['stylus', 'tip', 'end_effector', 'link6', 'end', 'tool']
+        
         for pattern in search_patterns:
             for i, name in enumerate(self._omni_robot.body_names):
                 if pattern in name.lower():
@@ -344,11 +393,17 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             constraint_distances,     # Distance measurements (1)
         ], dim=-1)                   # Total: 19 dimensions
         
+        # 验证观测维度与配置一致
+        expected_dim = self.cfg.observation_spaces[self.cfg.possible_agents[0]]
+        actual_dim = obs.shape[-1]
+        if expected_dim != actual_dim:
+            print(f"[WARNING] Observation dimension mismatch: config={expected_dim}, actual={actual_dim}")
+        
         # Create observation dictionary for each agent
         observations = {}
         for agent in self.cfg.possible_agents:
-            # Apply observation bounds for stability
-            observations[agent] = torch.clamp(obs, -20.0, 20.0)
+            # 不限制观测范围，让网络学习处理任何数值
+            observations[agent] = obs
             
         return observations
         
@@ -419,9 +474,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'distance_to_final': distance_to_final
         }
         
-        # Add console logging if enabled
-        if self.enable_console_logging:
-            self._log_console_step_info(rewards, robot_weights, human_weights)
+        # Console logging via utils (controlled by YAML)
+        self.reward_logger.log_console_if_enabled(self, rewards, robot_weights, human_weights)
         
         # Update environment-specific metrics
         for env_id in range(self.num_envs):
@@ -610,102 +664,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         return self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
     
-    def _log_console_step_info(self, rewards: Dict[str, torch.Tensor], robot_weights: dict, human_weights: dict):
-        """
-        Log detailed step information to console for verification.
-        """
-        current_step = self.common_step_counter
-        
-        # Only log every few steps to avoid overwhelming output
-        if current_step % 10 != 0:  # Log every 10 steps
-            return
-        
-        print(f"\n{'='*80}")
-        print(f"STEP {current_step} - Detailed Environment State")
-        print(f"{'='*80}")
-        
-        # Only log first 2 environments to avoid spam
-        for env_id in range(min(2, self.num_envs)):
-            print(f"\n--- Environment {env_id} ---")
-            
-            # Stylus position (relative to base)
-            stylus_pos = self.stylus_pos_t1[env_id]
-            print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
-            
-            # Trajectory information
-            deviation = self.reward_components['deviation'][env_id].item()
-            progress = self.reward_components['progress_ratio'][env_id].item()
-            distance_to_final = self.reward_components['distance_to_final'][env_id].item()
-            print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
-            
-            # Constraint information
-            safety_distance = self.safety_distances_t1[env_id].item()
-            is_overlapping = self.is_violating_t1[env_id].item()
-            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}")
-            
-            # Agent forces
-            robot_force = self.robot_forces_t[env_id]
-            human_force = self.human_forces_t[env_id]
-            robot_force_mag = torch.norm(robot_force).item()
-            human_force_mag = torch.norm(human_force).item()
-            print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
-            
-            # Reward breakdown with weights
-            print(f"\nReward Breakdown:")
-            print(f"Robot Agent:")
-            traj_r = self.reward_components['trajectory_reward'][env_id].item()
-            prog_r = self.reward_components['progress_reward'][env_id].item()
-            vel_r = self.reward_components['velocity_reward'][env_id].item()
-            cbf_r = self.reward_components['cbf_reward'][env_id].item()
-            robot_force_pen = self.reward_components['robot_force_penalty'][env_id].item()
-            human_force_pen = self.reward_components['human_force_penalty'][env_id].item()
-            z_pen = self.reward_components['z_penalty'][env_id].item()
-            comp_r = self.reward_components['completion_reward'][env_id].item()
-            
-            print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
-            print(f"  Velocity: {vel_r:.3f} * {robot_weights['velocity']:.2f} = {vel_r * robot_weights['velocity']:.3f}")
-            print(f"  CBF: {cbf_r:.3f} * {robot_weights['obstacle_cbf']:.2f} = {cbf_r * robot_weights['obstacle_cbf']:.3f}")
-            print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
-            print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
-            print(f"  Z Penalty: {z_pen:.3f}")
-            print(f"  Completion: {comp_r:.3f}")
-            robot_total = rewards["robot"][env_id].item()
-            print(f"  ROBOT TOTAL: {robot_total:.3f}")
-            
-            print(f"Human Agent:")
-            print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
-            print(f"  Velocity: {vel_r:.3f} * {human_weights['velocity']:.2f} = {vel_r * human_weights['velocity']:.3f}")
-            print(f"  CBF: {cbf_r:.3f} * {human_weights['obstacle_cbf']:.2f} = {cbf_r * human_weights['obstacle_cbf']:.3f}")
-            print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
-            print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
-            print(f"  Z Penalty: {z_pen:.3f}")
-            print(f"  Completion: {comp_r:.3f}")
-            human_total = rewards["human"][env_id].item()
-            print(f"  HUMAN TOTAL: {human_total:.3f}")
-            
-            print(f"Combined Total Reward: {robot_total + human_total:.3f}")
-
-    def _log_constraint_state(self):
-        """Log constraint state information to console."""
-        current_step = self.common_step_counter
-        
-        if current_step % 20 != 0:
-            return
-        
-        print(f"\n--- CONSTRAINT STATE (Step {current_step}) ---")
-        for env_id in range(min(2, self.num_envs)):
-            if self.constraint_results_t1:
-                distance = self.safety_distances_t1[env_id].item()
-                overlapping = self.is_violating_t1[env_id].item()
-                closest_point = self.constraint_results_t1['closest_points'][env_id]
-                normal_vector = self.constraint_results_t1['normal_vectors'][env_id]
-                
-                print(f"Env {env_id}: Distance={distance:.4f}m, Overlapping={overlapping}")
-                print(f"  Closest Point: [{closest_point[0]:.4f}, {closest_point[1]:.4f}, {closest_point[2]:.4f}]")
-                print(f"  Normal Vector: [{normal_vector[0]:.4f}, {normal_vector[1]:.4f}, {normal_vector[2]:.4f}]")
-    
     def __del__(self):
         """Destructor to clean up resources."""
         if hasattr(self, 'reward_logger'):
@@ -752,14 +710,3 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             key: value[env_ids] if torch.is_tensor(value) else value
             for key, value in self.reward_components.items()
         }
-    
-    def enable_logging(self, enable: bool = True):
-        """Enable or disable console logging."""
-        self.enable_console_logging = enable
-        print(f"[INFO] Console logging {'enabled' if enable else 'disabled'}")
-        
-    def set_logging_frequency(self, step_interval: int = 10):
-        """Set console logging frequency."""
-        # This would require modifying the _log_console_step_info method
-        # For now, it's hardcoded to every 10 steps
-        print(f"[INFO] Logging frequency setting not implemented yet. Currently logs every 10 steps.")

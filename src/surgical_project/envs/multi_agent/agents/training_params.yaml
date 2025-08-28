@@ -9,7 +9,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_text_logging: false  # Enable detailed text logging for milestone episodes
+  enable_console_logging: true  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
 # Trajectory Parameters

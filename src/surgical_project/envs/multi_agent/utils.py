@@ -618,64 +618,113 @@ class PerformanceEvaluator:
         return np.clip(final_score, 0, 100)
 
 
-class DetailedLogger:
-    """Handles detailed file logging for milestone episodes."""
+class ConsoleLogger:
+    """Handles console logging for step information."""
     
-    def __init__(self, log_dir: Optional[str] = None, enabled: bool = False):
+    def __init__(self, enabled: bool = False):
         self.enabled = enabled
-        self.log_dir = log_dir
-        self.env_log_files = {}
         
-        if self.enabled and log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            print(f"[INFO] Text logging enabled, milestone episodes only, saved to: {log_dir}")
+        if self.enabled:
+            print(f"[INFO] Console logging enabled (milestone episodes only)")
         else:
-            print(f"[INFO] Text logging disabled")
+            print(f"[INFO] Console logging disabled")
     
-    def log_step_to_file(self, env_id: int, episode_num: int, reward_components: Dict, 
-                        rewards: Dict, safety_distance: torch.Tensor, current_step: int):
-        """Log detailed step information to file (milestone episodes only)."""
+    def log_step_to_console(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, reward_logger_instance=None):
+        """Log detailed step information to console (milestone episodes only)."""
         if not self.enabled:
             return
             
-        if env_id not in self.env_log_files:
-            log_file_path = os.path.join(self.log_dir, f"env_{env_id}_episode_{episode_num}.txt")
-            self.env_log_files[env_id] = open(log_file_path, 'w')
-            self.env_log_files[env_id].write(f"Environment {env_id} - Episode {episode_num} (MILESTONE)\n")
-            self.env_log_files[env_id].write("="*60 + "\n")
+        current_step = env.common_step_counter
         
-        log_file = self.env_log_files[env_id]
+        # Only log every few steps to avoid overwhelming output
+        if current_step % 10 != 0:  # Log every 10 steps
+            return
         
-        if current_step <= 10 or current_step % 10 == 0:
-            log_file.write(f"\n[Step {current_step}]\n")
-            log_file.write("-" * 40 + "\n")
+        print(f"\n{'='*80}")
+        print(f"STEP {current_step} - Detailed Environment State (Milestone Episodes)")
+        print(f"{'='*80}")
+        
+        # Check each environment individually for milestone status
+        environments_to_log = []
+        
+        if reward_logger_instance and reward_logger_instance.milestone_manager and reward_logger_instance.external_episode_counter is not None:
+            # Check each environment individually
+            for env_id in range(min(2, env.num_envs)):  # Still limit to first 2 for readability
+                current_episode = int(reward_logger_instance.external_episode_counter[env_id]) + 1
+                if reward_logger_instance.milestone_manager.is_milestone_episode(current_episode):
+                    environments_to_log.append((env_id, current_episode))
+        else:
+            # Fallback: assume episode 1 and check if it's a milestone
+            if reward_logger_instance and reward_logger_instance.milestone_manager:
+                if reward_logger_instance.milestone_manager.is_milestone_episode(1):
+                    environments_to_log = [(env_id, 1) for env_id in range(min(2, env.num_envs))]
+        
+        # If no environments are in milestone episodes, don't log anything
+        if not environments_to_log:
+            return
+        
+        # Log each environment that's in a milestone episode
+        for env_id, episode_num in environments_to_log:
+            print(f"\n--- Environment {env_id} (Episode {episode_num}) ---")
             
-            robot_reward = rewards["robot"][env_id].item() if "robot" in rewards else 0
-            human_reward = rewards["human"][env_id].item() if "human" in rewards else 0
+            # Stylus position (relative to base)
+            stylus_pos = env.stylus_pos_t1[env_id]
+            print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
             
-            log_file.write(f"Robot reward: {robot_reward:.4f}\n")
-            log_file.write(f"Human reward: {human_reward:.4f}\n")
-            log_file.write(f"Total reward: {robot_reward + human_reward:.4f}\n")
+            # Trajectory information
+            deviation = env.reward_components['deviation'][env_id].item()
+            progress = env.reward_components['progress_ratio'][env_id].item()
+            distance_to_final = env.reward_components['distance_to_final'][env_id].item()
+            print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
             
-            for key, value in reward_components.items():
-                if torch.is_tensor(value):
-                    log_file.write(f"{key}: {value[env_id].item():.4f}\n")
+            # Constraint information
+            safety_distance = env.safety_distances_t1[env_id].item()
+            is_overlapping = env.is_violating_t1[env_id].item()
+            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}")
             
-            log_file.write(f"Safety distance: {safety_distance[env_id]:.4f}m\n")
-            log_file.flush()
-    
-    def close_environment_file(self, env_id: int):
-        """Close log file for specific environment."""
-        if env_id in self.env_log_files:
-            self.env_log_files[env_id].close()
-            del self.env_log_files[env_id]
-    
-    def close_all_files(self):
-        """Close all log files."""
-        for f in self.env_log_files.values():
-            if f and not f.closed:
-                f.close()
-        self.env_log_files.clear()
+            # Agent forces
+            robot_force = env.robot_forces_t[env_id]
+            human_force = env.human_forces_t[env_id]
+            robot_force_mag = torch.norm(robot_force).item()
+            human_force_mag = torch.norm(human_force).item()
+            print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
+            
+            # Reward breakdown with weights
+            print(f"\nReward Breakdown:")
+            print(f"Robot Agent:")
+            traj_r = env.reward_components['trajectory_reward'][env_id].item()
+            prog_r = env.reward_components['progress_reward'][env_id].item()
+            vel_r = env.reward_components['velocity_reward'][env_id].item()
+            cbf_r = env.reward_components['cbf_reward'][env_id].item()
+            robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
+            human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
+            z_pen = env.reward_components['z_penalty'][env_id].item()
+            comp_r = env.reward_components['completion_reward'][env_id].item()
+            
+            print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
+            print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
+            print(f"  Velocity: {vel_r:.3f} * {robot_weights['velocity']:.2f} = {vel_r * robot_weights['velocity']:.3f}")
+            print(f"  CBF: {cbf_r:.3f} * {robot_weights['obstacle_cbf']:.2f} = {cbf_r * robot_weights['obstacle_cbf']:.3f}")
+            print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
+            print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
+            print(f"  Z Penalty: {z_pen:.3f}")
+            print(f"  Completion: {comp_r:.3f}")
+            robot_total = rewards["robot"][env_id].item()
+            print(f"  ROBOT TOTAL: {robot_total:.3f}")
+            
+            print(f"Human Agent:")
+            print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
+            print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
+            print(f"  Velocity: {vel_r:.3f} * {human_weights['velocity']:.2f} = {vel_r * human_weights['velocity']:.3f}")
+            print(f"  CBF: {cbf_r:.3f} * {human_weights['obstacle_cbf']:.2f} = {cbf_r * human_weights['obstacle_cbf']:.3f}")
+            print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
+            print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
+            print(f"  Z Penalty: {z_pen:.3f}")
+            print(f"  Completion: {comp_r:.3f}")
+            human_total = rewards["human"][env_id].item()
+            print(f"  HUMAN TOTAL: {human_total:.3f}")
+            
+            print(f"Combined Total Reward: {robot_total + human_total:.3f}")
 
 
 class RewardLogger:
@@ -690,7 +739,7 @@ class RewardLogger:
         # Component initialization
         self.episode_tracker = EpisodeTracker(num_envs, device)
         self.milestone_manager = None  # Initialized in configure_logging
-        self.detailed_logger = None    # Initialized in configure_logging
+        self.console_logger = None     # Initialized in configure_logging
         
         # External episode counter reference (will be set by trainer)
         self.external_episode_counter = None
@@ -707,7 +756,7 @@ class RewardLogger:
     def configure_logging(self, params: Dict):
         """Configure logging components based on parameters."""
         logging_config = params.get('logging', {})
-        enable_text_logging = logging_config.get('enable_text_logging', False)
+        enable_console_logging = logging_config.get('enable_console_logging', False)
         
         # Load milestones from YAML
         training_monitor = params.get('training_monitor', {})
@@ -723,14 +772,8 @@ class RewardLogger:
         # Initialize milestone manager
         self.milestone_manager = MilestoneManager(self.num_envs, milestones)
         
-        # Initialize detailed logger
-        if enable_text_logging:
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_dir = f"logs/env_details/{timestamp}"
-            self.detailed_logger = DetailedLogger(log_dir, enabled=True)
-        else:
-            self.detailed_logger = DetailedLogger(enabled=False)
+        # Initialize console logger
+        self.console_logger = ConsoleLogger(enabled=enable_console_logging)
         
         print(f"[INFO] RewardLogger initialized: {self.num_envs} environments")
         print(f"[INFO] Performance evaluation at episodes: {milestones}")
@@ -760,13 +803,11 @@ class RewardLogger:
             self.milestone_manager.record_milestone_detailed_step(
                 env_id, current_episode, reward_components, rewards, safety_distance
             )
-            
-            # Text logging (only at milestone episodes)
-            if self.detailed_logger and self.detailed_logger.enabled:
-                current_step = self.episode_tracker.current_episode_basic[env_id]['steps']
-                self.detailed_logger.log_step_to_file(
-                    env_id, current_episode, reward_components, rewards, safety_distance, current_step
-                )
+    
+    def log_console_if_enabled(self, env, rewards: Dict, robot_weights: dict, human_weights: dict):
+        """Log to console if console logging is enabled."""
+        if self.console_logger:
+            self.console_logger.log_step_to_console(env, rewards, robot_weights, human_weights, self)
     
     def on_episode_end(self, env_ids):
         """Episode end processing - uses external episode counter."""
@@ -790,10 +831,6 @@ class RewardLogger:
                 # Only process if we have actual data (not already reset)
                 if basic['steps'] > 0:
                     self.milestone_manager.process_milestone_completion(env_id_item, current_episode_num, basic)
-                    
-                    # Close text log files
-                    if self.detailed_logger and self.detailed_logger.enabled:
-                        self.detailed_logger.close_environment_file(env_id_item)
             
             # NOW reset the episode data for next episode
             self.episode_tracker.on_episode_end([env_id_item])
@@ -818,9 +855,8 @@ class RewardLogger:
         return self.milestone_manager.get_next_milestone_progress(self.external_episode_counter)
     
     def close_all_files(self):
-        """Close all log files."""
-        if self.detailed_logger:
-            self.detailed_logger.close_all_files()
+        """Close all files (no files in console logging)."""
+        pass
     
     # Properties for compatibility 
     @property
