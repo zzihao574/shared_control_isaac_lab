@@ -1,8 +1,3 @@
-"""
-Individual DDPG agent for multi-environment parallel MADDPG.
-(MODIFIED VERSION - Simplified state)
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,8 +17,15 @@ class DDPGAgent:
         self.tau = float(maddpg_cfg.get('tau', 0.01))
         hidden_dim = int(maddpg_cfg.get('num_units', 64))
         
-        self.actor = Actor(state_dim, action_dim, hidden_dim).to(device)
-        self.actor_target = Actor(state_dim, action_dim, hidden_dim).to(device)
+        # 从环境约束获取合理的最大action
+        constraints = params.get('constraints', {})
+        if 'robot' in agent_id.lower():
+            max_action = constraints.get('max_robot_force', 0.02)
+        else:
+            max_action = constraints.get('max_human_force', 0.02)
+        
+        self.actor = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
+        self.actor_target = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
         self.critic = Critic(total_state_dim, total_action_dim, hidden_dim).to(device)

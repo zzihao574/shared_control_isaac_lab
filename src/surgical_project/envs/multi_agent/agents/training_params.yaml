@@ -1,4 +1,5 @@
-# training_params.yaml - Optimized English version
+# training_params.yaml - 清理重复定义后的版本
+# 只保留训练算法和任务逻辑相关参数，环境结构定义移到cfg文件
 
 # ==============================================================================
 # Global Settings
@@ -12,16 +13,15 @@ logging:
   enable_console_logging: true  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
-# Trajectory Parameters
+# Trajectory Parameters (任务逻辑)
 # ==============================================================================
 trajectory:
   start_point: [0.14, -0.2, 0.03]    # Starting position in 3D space (meters)
   end_point: [0.14, 0.2, 0.03]       # Target end position in 3D space (meters)
   switch_threshold: 0.01              # Distance threshold for completion (1cm)
-  total_distance: 0.4                 # Total trajectory distance (meters)
 
 # ==============================================================================
-# Constraint Parameters
+# Physics Constraints (运行时约束)
 # ==============================================================================
 constraints:
   min_z_position: 0.0                 # Minimum Z position for safety
@@ -112,32 +112,8 @@ maddpg_config:
   max_replay_buffer_len: 10000        # Maximum replay buffer size
 
 # ==============================================================================
-# Agent Configuration
-# ==============================================================================
-agent_config:
-  agent_names: ["human", "robot"]     # Agent identifiers
-  num_agents: 2                       # Total number of agents
-  observation_dims: [19, 19]          # Observation dimensions per agent
-  action_dims: [3, 3]                 # Action dimensions per agent
-  total_observation_dim: 38           # Combined observation dimension
-  total_action_dim: 6                 # Combined action dimension
-
-# ==============================================================================
 # Training Monitoring
 # ==============================================================================
 training_monitor:
   # Milestone episodes for performance evaluation and TopK model selection
   milestone_episodes: [2, 10, 20, 30, 50, 75, 90, 100, 125, 150, 175, 200, 300, 500]
-
-# ==============================================================================
-# Environment Configuration
-# ==============================================================================
-env_config:
-  num_envs: 512                       # Number of parallel environments
-  agents: ["human", "robot"]          # Agent types in environment
-
-# ==============================================================================
-# Hardware Configuration
-# ==============================================================================
-hardware:
-  device: "cuda"                      # Compute device (cuda/cpu)
