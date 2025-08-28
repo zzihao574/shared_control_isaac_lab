@@ -2,7 +2,7 @@
 
 """
 Surgical Robot MADDPG Multi-Environment Parallel Training
-清理版本 - 统一维度管理，移除重复配置
+Unified dimension management and streamlined configuration
 """
 
 import sys
@@ -27,6 +27,8 @@ from utils.training_helpers import (
 )
 
 class MADDPGTrainer:
+    """Main trainer class for MADDPG algorithm in surgical robot environments."""
+    
     def __init__(self, args):
         self.args = args
         self.config = TrainingConfiguration(args.config)
@@ -38,6 +40,7 @@ class MADDPGTrainer:
         self.global_step = 0
 
     def _setup_environment(self):
+        """Initialize environment with proper seeding and configuration."""
         torch.manual_seed(self.args.seed)
         np.random.seed(self.args.seed)
         random.seed(self.args.seed)
@@ -46,6 +49,7 @@ class MADDPGTrainer:
         self._configure_reward_logger()
 
     def _setup_logging(self):
+        """Configure logging directories and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_dir = f"logs/maddpg_parallel/{timestamp}"
         self.logger = TrainingLogger(log_dir)
@@ -56,6 +60,7 @@ class MADDPGTrainer:
             self.wandb_logger.initialize_run(run_config, run_name)
 
     def _setup_training_components(self):
+        """Initialize MADDPG trainer and related training components."""
         from surgical_project.algorithms.marl.maddpg import MADDPG
         device = self.config.get_compute_device()
 
@@ -69,10 +74,10 @@ class MADDPGTrainer:
         if self.checkpoint_manager.load_checkpoint():
             self.checkpoint_manager.initialize_agents_from_checkpoint(self.maddpg_trainer)
         
-        # Create THE SINGLE episode counter in TrainingProgressTracker
+        # Create single episode counter in TrainingProgressTracker
         self.progress_tracker = TrainingProgressTracker(self.maddpg_trainer.num_envs, self.args.max_episodes)
         
-        # Pass the counter reference to reward logger
+        # Pass counter reference to reward logger
         reward_logger = self._get_reward_logger()
         if reward_logger:
             reward_logger.set_episode_counter(self.progress_tracker.env_episode_counts)
@@ -82,17 +87,17 @@ class MADDPGTrainer:
         self.min_buffer_size = self.maddpg_trainer.min_buffer_size
 
     def _create_environment(self) -> Tuple[Any, Any]:
+        """Create and configure the surgical environment."""
         from surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
         import gymnasium as gym
         import surgical_project.envs.multi_agent
         
         env_cfg = SurgicalDirectMARLEnvCfg()
-        # 从命令行参数设置环境数量（覆盖cfg中的默认值）
+        # Override environment count from command line arguments
         env_cfg.scene.num_envs = self.args.num_envs
         env_cfg.seed = self.args.seed
         
-        # Debug: 检查环境配置
-        print(f"[DEBUG] Environment configuration:")
+        print(f"[INFO] Environment configuration:")
         print(f"  Number of environments: {env_cfg.scene.num_envs}")
         print(f"  Episode length: {env_cfg.episode_length_s}s")
         print(f"  Decimation: {env_cfg.decimation}")
@@ -102,22 +107,23 @@ class MADDPGTrainer:
         
         env = gym.make(self.args.task, cfg=env_cfg)
         
-        # Debug: 验证环境创建后的状态
         if hasattr(env, 'max_episode_length'):
-            print(f"[DEBUG] Environment max_episode_length: {env.max_episode_length}")
+            print(f"[INFO] Environment max_episode_length: {env.max_episode_length}")
         
         return env, env_cfg
 
     def _get_reward_logger(self):
+        """Get reward logger from environment."""
         return getattr(self.env, 'reward_logger', None) or getattr(getattr(self.env, 'unwrapped', None), 'reward_logger', None)
 
     def _configure_reward_logger(self):
+        """Configure reward logger with milestone filtering."""
         reward_logger = self._get_reward_logger()
         if reward_logger:
-            # FIX: Pass max_episodes to reward logger configuration
+            # Pass max_episodes to reward logger configuration
             self.config.params['training_monitor']['max_episodes'] = self.args.max_episodes
             
-            # FIX: Filter milestones to only include those <= max_episodes
+            # Filter milestones to only include those within max_episodes
             original_milestones = self.config.params['training_monitor'].get('milestone_episodes', [])
             filtered_milestones = [m for m in original_milestones if m <= self.args.max_episodes]
             self.config.params['training_monitor']['milestone_episodes'] = filtered_milestones
@@ -128,6 +134,7 @@ class MADDPGTrainer:
             reward_logger.set_topk_update_callback(self.update_topk_at_milestone)
 
     def _extract_model_state(self, env_id: int) -> Dict[str, Any]:
+        """Extract model state dictionaries for all agents in an environment."""
         model_state = {}
         for agent_id in self.maddpg_trainer.agent_ids:
             agent = self.maddpg_trainer.env_agents[env_id][agent_id]
@@ -141,6 +148,7 @@ class MADDPGTrainer:
         return model_state
 
     def update_topk_at_milestone(self, milestone: int) -> None:
+        """Update Top-K models when milestone episodes are reached."""
         print(f"[TopK Update] Evaluating all environments at Milestone {milestone}...")
         reward_logger = self._get_reward_logger()
         if not reward_logger or milestone not in reward_logger.milestone_performances:
@@ -161,6 +169,7 @@ class MADDPGTrainer:
         self.wandb_logger.log_milestone_completion(self.global_step, milestone, performances)
 
     def _process_rewards_and_completion(self, active_envs: List[int], terminated: Dict[str, Any], truncated: Dict[str, Any]):
+        """Process rewards and handle environment completion detection."""
         reward_logger = self._get_reward_logger()
         if not reward_logger:
             return
@@ -168,11 +177,11 @@ class MADDPGTrainer:
         for env_id in active_envs:
             current_steps = reward_logger.episode_tracker.current_episode_basic[env_id]['steps']
             
-            # Detect episode end by: explicit done flags OR step count reset (Isaac Lab auto-reset)
+            # Detect episode end by explicit done flags OR step count reset (Isaac Lab auto-reset)
             env_done = any(terminated[agent][env_id] or truncated[agent][env_id] for agent in self.maddpg_trainer.agent_ids)
             
             # Isaac Lab auto-resets without setting truncated=True
-            # Detect reset by step count dropping (was high, now low)
+            # Detect reset by step count dropping significantly
             if not hasattr(self, '_prev_steps'):
                 self._prev_steps = {}
             
@@ -185,10 +194,10 @@ class MADDPGTrainer:
             self._prev_steps[env_id] = current_steps
             
             if env_done and prev_steps > 0:  # Use prev_steps since current_steps may have reset
-                # Process the episode metrics and milestones
+                # Process episode metrics and milestones
                 reward_logger.on_episode_end(torch.tensor([env_id], device=self.maddpg_trainer.device))
                 
-                # Increment THE SINGLE episode counter
+                # Increment episode counter
                 reached_max = self.progress_tracker.complete_episode(env_id)
                 
                 if reached_max:
@@ -204,6 +213,7 @@ class MADDPGTrainer:
                     self.maddpg_trainer.disable_environment(env_id)
 
     def train(self) -> None:
+        """Main training loop."""
         self.logger.log_training_start(self.args, self.config.params)
         
         print(f"[INFO] Training with max_episodes={self.args.max_episodes}")
@@ -243,7 +253,7 @@ class MADDPGTrainer:
                     self.logger.log_training_progress(self.global_step, stats, self.top_k_manager)
                     self.wandb_logger.log_training_progress(self.global_step, stats, self.top_k_manager)
             
-            # Final Evaluation
+            # Final evaluation of all environments
             print("[TopK Update] Starting final evaluation...")
             reward_logger = self._get_reward_logger()
             if reward_logger:
@@ -276,6 +286,7 @@ class MADDPGTrainer:
             print("\nTraining finished")
 
 def main():
+    """Main entry point for training script."""
     parser = create_argument_parser()
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()

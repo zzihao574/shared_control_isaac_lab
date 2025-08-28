@@ -2,7 +2,7 @@
 
 """
 Training helper utilities for MADDPG multi-environment parallel training.
-清理版本 - 移除对YAML重复配置的依赖，从环境cfg获取维度信息
+Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
 """
 
 import argparse
@@ -43,6 +43,7 @@ class CheckpointManager:
         self.load_strategy = load_strategy
         
     def load_checkpoint(self) -> bool:
+        """Load checkpoint from file if exists."""
         if not self.checkpoint_path or not os.path.exists(self.checkpoint_path):
             print(f"[CHECKPOINT] Checkpoint file not found: {self.checkpoint_path}")
             return False
@@ -64,6 +65,7 @@ class CheckpointManager:
             return False
     
     def initialize_agents_from_checkpoint(self, maddpg_trainer) -> None:
+        """Initialize agents from checkpoint data using specified strategy."""
         if not (self.checkpoint_data and 'top_k_envs' in self.checkpoint_data and self.checkpoint_data['top_k_envs']):
             print("[CHECKPOINT] No valid data, using random initialization")
             return
@@ -117,6 +119,7 @@ class WandBLogger:
             print("[WANDB] Disabled")
 
     def initialize_run(self, config: Dict[str, Any], run_name: Optional[str] = None) -> None:
+        """Initialize WandB run with configuration."""
         if not self.enabled:
             return
         try:
@@ -217,6 +220,7 @@ class WandBLogger:
             print(f"[WANDB] Failed to log training completion: {e}")
 
     def finalize_run(self) -> None:
+        """Finalize WandB run."""
         if self.enabled and self.run:
             try:
                 wandb.finish()
@@ -226,28 +230,33 @@ class WandBLogger:
 
 
 class TrainingConfiguration:
+    """Training configuration loader and parameter manager."""
+    
     def __init__(self, config_path: str):
         self.config_path = config_path
         with open(self.config_path, 'r') as f:
             self.params = yaml.safe_load(f)
         self.maddpg_cfg = self.params.get('maddpg_config', {})
-        # 移除对env_config的依赖 - 从环境cfg获取
         self.hardware_cfg = self.params.get('hardware', {})
     
     def get_compute_device(self) -> str:
-        # 优先使用命令行指定的device，否则使用CUDA
+        """Get compute device (CUDA if available)."""
         return 'cuda' if torch.cuda.is_available() else 'cpu'
     
     def get_milestone_episodes(self) -> List[int]:
+        """Get milestone episode numbers."""
         return self.params.get('training_monitor', {}).get('milestone_episodes', [])
 
 
 class TopKModelManager:
+    """Manages top-K model collection and checkpoint saving."""
+    
     def __init__(self, k: int = 10):
         self.k = k
         self.top_models: List[Tuple[int, float, Dict]] = []
     
     def update_model(self, env_id: int, performance: float, model_state: Dict[str, Any]) -> None:
+        """Update top-K models with new performance data."""
         performance = np.clip(performance, 0, 100)
         existing_index = next((i for i, (e_id, _, _) in enumerate(self.top_models) if e_id == env_id), None)
         if existing_index is not None:
@@ -259,9 +268,11 @@ class TopKModelManager:
         self.top_models.sort(key=lambda x: x[1], reverse=True)
     
     def get_top_models(self) -> List[Tuple[int, float, Dict]]:
+        """Get list of top-K models."""
         return self.top_models
     
     def save_checkpoint(self, filepath: str, maddpg_trainer) -> None:
+        """Save checkpoint with top-K models."""
         checkpoint = {
             'params': maddpg_trainer.params,
             'agent_ids': maddpg_trainer.agent_ids,
@@ -278,6 +289,8 @@ class TopKModelManager:
 
 
 class TrainingProgressTracker:
+    """Tracks training progress across multiple environments."""
+    
     def __init__(self, num_envs: int, max_episodes: int):
         self.num_envs = num_envs
         self.max_episodes = max_episodes
@@ -286,6 +299,7 @@ class TrainingProgressTracker:
         self.num_completed_envs = 0
     
     def complete_episode(self, env_id: int) -> bool:
+        """Mark episode completion and check if environment finished training."""
         self.env_episode_counts[env_id] += 1
         if self.env_episode_counts[env_id] >= self.max_episodes and not self.env_completed[env_id]:
             self.env_completed[env_id] = True
@@ -294,31 +308,39 @@ class TrainingProgressTracker:
         return False
     
     def get_active_environments(self) -> List[int]:
+        """Get list of environments still training."""
         return [i for i in range(self.num_envs) if not self.env_completed[i]]
     
     def is_training_complete(self) -> bool:
+        """Check if all environments completed training."""
         return self.num_completed_envs >= self.num_envs
     
     def get_progress_statistics(self) -> Dict[str, Union[int, float]]:
+        """Get training progress statistics."""
         active_count = len(self.get_active_environments())
         return {'active_count': active_count, 'completed_count': self.num_completed_envs}
 
 
 class TrainingLogger:
+    """Handles training progress logging and file operations."""
+    
     def __init__(self, log_directory: str):
         self.log_directory = log_directory
         os.makedirs(log_directory, exist_ok=True)
     
     def log_training_start(self, args: argparse.Namespace, params: Dict[str, Any]) -> None:
+        """Log training start information."""
         print("=" * 70, "\nMADDPG Multi-Environment Parallel Training")
         print(f"Environments: {args.num_envs}, Target: {args.max_episodes} episodes per env")
         print(f"Log Directory: {self.log_directory}\n", "="*70)
     
     def log_environment_completion(self, env_id: int, episode_count: int, performance: float, completed_count: int, total_envs: int) -> None:
+        """Log environment training completion."""
         print(f"[ENV {env_id}] Training Complete - {episode_count} episodes - Final Score: {performance:.2f}/100")
         print(f"[Progress] {completed_count}/{total_envs} environments completed\n")
     
     def log_training_progress(self, global_step: int, stats: Dict[str, Any], top_k_manager: TopKModelManager) -> None:
+        """Log periodic training progress."""
         total_envs = stats['active_count'] + stats['completed_count']
         print(f"[Step {global_step}] Completed: {stats['completed_count']}/{total_envs}")
         if top_k_manager.top_models:
@@ -326,6 +348,7 @@ class TrainingLogger:
             print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}/100")
     
     def log_training_complete(self, top_k_manager: TopKModelManager) -> None:
+        """Log training completion summary."""
         print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
         print("\nFinal Top-K Models:")
         for i, (env_id, performance, _) in enumerate(top_k_manager.get_top_models()):
@@ -334,6 +357,7 @@ class TrainingLogger:
     
     def save_final_results(self, global_step: int, progress_tracker: TrainingProgressTracker, 
                           top_k_manager: TopKModelManager, params: Dict[str, Any], args: argparse.Namespace) -> None:
+        """Save final training results to disk."""
         stats = {'total_steps': global_step, 'top_k_scores': [(e, p) for e, p, _ in top_k_manager.get_top_models()]}
         with open(os.path.join(self.log_directory, "training_stats.pkl"), 'wb') as f:
             pickle.dump(stats, f)
@@ -343,8 +367,8 @@ class TrainingLogger:
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
+    """Create command line argument parser with default configuration."""
     if config_path is None:
-        # Adjust this path if necessary for your setup
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
@@ -352,7 +376,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training")
     parser.add_argument("--config", type=str, default=config_path)
     
-    # 环境数量从命令行设置，覆盖cfg中的默认值
+    # Environment count from command line overrides cfg default
     parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
     parser.add_argument("--seed", type=int, default=config.params.get('seed', 42))

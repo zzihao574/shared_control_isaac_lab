@@ -1,4 +1,4 @@
-# surgical_direct_marl_env_cfg.py - 清理重复定义后的版本
+# surgical_direct_marl_env_cfg.py - Clean version after removing duplicate definitions
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     episode_length_s = 20  # Episode length in seconds
     decimation = 2         # Control decimation factor
     
-    # Multi-agent configuration (唯一可信来源)
+    # Multi-agent configuration (single source of truth)
     possible_agents = ["human", "robot"]
     
     action_spaces = {
@@ -45,8 +45,8 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     }
     
     observation_spaces = {
-        "human": 19,  # 修正为实际维度: 位置(3)+速度(3)+关节位置(6)+关节速度(6)+约束距离(1)=19
-        "robot": 19,  # 修正为实际维度
+        "human": 19,  # Corrected to actual dimensions: pos(3)+vel(3)+joint_pos(6)+joint_vel(6)+constraint_dist(1)=19
+        "robot": 19,  # Corrected to actual dimensions
     }
     
     state_space = 38
@@ -66,9 +66,9 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         ),
     )
     
-    # Scene configuration with multiple environments (数量可从命令行覆盖)
+    # Scene configuration with multiple environments (count can be overridden from command line)
     scene: InteractiveSceneCfg = MySceneCfg(
-        num_envs=512,      # 默认值，可被train_maddpg.py中的--num_envs覆盖
+        num_envs=512,      # Default value, can be overridden by --num_envs in train_maddpg.py
         env_spacing=4.0,   # Spacing between environments
         replicate_physics=True
     )
@@ -104,7 +104,6 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
                 "pitch": 2.0944,  # ~120 degrees
                 "roll": 0.0,
             },
-            # Zero initial velocities
             joint_vel={
                 "waist": 0.0,
                 "shoulder": 0.0,
@@ -115,8 +114,8 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             },
         ),
         # Individual actuator configuration for each joint
-        # 注意：这里的effort_limit与YAML中的force constraint不同用途
-        # effort_limit是关节力矩限制，max_robot_force是末端执行器力限制
+        # Note: effort_limit here is different from YAML force constraints
+        # effort_limit is joint torque limit, max_robot_force is end-effector force limit
         actuators={
             "waist_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["waist"],
@@ -173,4 +172,3 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             rot=(1.0, 0.0, 0.0, 0.0),     # Default orientation
         ),
     )
-    

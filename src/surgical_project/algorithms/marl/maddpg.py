@@ -1,6 +1,6 @@
 """
 Multi-environment parallel MADDPG algorithm.
-清理版本 - 从环境获取维度信息，移除对YAML中重复配置的依赖
+Clean version - gets dimensions from environment, removes YAML duplicate dependencies.
 """
 
 import torch
@@ -11,22 +11,33 @@ from .ddpg_agent import DDPGAgent
 from .replay_buffer import MultiAgentReplayBuffer
 
 class MADDPG:
+    """
+    Multi-Agent Deep Deterministic Policy Gradient algorithm for parallel training.
+    
+    Features:
+    - Multi-environment parallel training
+    - Centralized training, decentralized execution
+    - Automatic environment dimension detection
+    - Selective training for active environments
+    - Environment deactivation for completed training
+    """
+    
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
         self.env = env
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # FIX: Use the explicitly passed num_envs, which is guaranteed to be correct.
+        # Use explicitly passed num_envs for guaranteed accuracy
         self.num_envs = num_envs
         
-        # 获取真正的环境配置 - 处理Gymnasium包装器
+        # Get actual environment configuration through Gymnasium wrappers
         actual_env = self._get_actual_env(env)
         
-        # 从环境cfg获取agent信息 (单一可信来源)
+        # Get agent information from environment cfg (single source of truth)
         self.agent_ids = list(actual_env.cfg.possible_agents)
         self.num_agents = len(self.agent_ids)
         
-        # 从环境cfg获取维度信息 (移除对YAML的依赖)
+        # Get dimensions from environment cfg (removes YAML dependency)
         self.obs_dims = [actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
         self.action_dims = [actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
         self.total_obs_dim = sum(self.obs_dims)
@@ -41,6 +52,7 @@ class MADDPG:
         self._initialize_agents()
         self._initialize_replay_buffers()
         
+        # Load training hyperparameters
         maddpg_cfg = self.params.get('maddpg_config', {})
         self.batch_size = int(maddpg_cfg.get('batch_size', 1024))
         self.gamma = float(maddpg_cfg.get('gamma', 0.9))
@@ -51,8 +63,8 @@ class MADDPG:
         self.training_steps = 0
     
     def _get_actual_env(self, env):
-        """获取真正的环境对象，处理Gymnasium包装器"""
-        # 尝试多种方式访问底层环境
+        """Get actual environment object through Gymnasium wrappers."""
+        # Try multiple ways to access underlying environment
         if hasattr(env, 'cfg'):
             return env
         elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'cfg'):
@@ -60,9 +72,9 @@ class MADDPG:
         elif hasattr(env, 'env') and hasattr(env.env, 'cfg'):
             return env.env
         else:
-            # 遍历可能的包装器层级
+            # Traverse possible wrapper layers
             current = env
-            max_depth = 10  # 防止无限循环
+            max_depth = 10  # Prevent infinite loops
             for _ in range(max_depth):
                 if hasattr(current, 'cfg'):
                     return current
@@ -76,6 +88,7 @@ class MADDPG:
             raise AttributeError(f"Cannot find cfg attribute in environment: {type(env)}")
         
     def _initialize_agents(self) -> None:
+        """Initialize DDPG agents for all environments and agents."""
         self.env_agents = {}
         for env_id in range(self.num_envs):
             self.env_agents[env_id] = {}
@@ -92,6 +105,7 @@ class MADDPG:
                 )
     
     def _initialize_replay_buffers(self) -> None:
+        """Initialize replay buffers for each environment."""
         maddpg_cfg = self.params.get('maddpg_config', {})
         self.buffer_size = int(maddpg_cfg.get('max_replay_buffer_len', 10000))
         self.env_replay_buffers = {}
@@ -105,9 +119,7 @@ class MADDPG:
             )
 
     def select_actions(self, observations: Dict[str, torch.Tensor], active_envs: List[int], add_noise: bool = True) -> Dict[str, torch.Tensor]:
-        """
-        Select actions only for active environments to prevent IndexError.
-        """
+        """Select actions only for active environments to prevent IndexError."""
         obs_len = observations[self.agent_ids[0]].shape[0]
         assert obs_len == self.num_envs, \
             f"Observation tensor dimension ({obs_len}) does not match configured num_envs ({self.num_envs})"
@@ -128,6 +140,7 @@ class MADDPG:
     def store_transitions_selective(self, obs: Dict[str, torch.Tensor], actions: Dict[str, torch.Tensor], 
                                    rewards: Dict[str, torch.Tensor], next_obs: Dict[str, torch.Tensor], 
                                    dones: Dict[str, torch.Tensor], active_envs: List[int]) -> None:
+        """Store transitions only for active environments."""
         for env_id in active_envs:
             is_done = dones[self.agent_ids[0]][env_id]
             
@@ -140,6 +153,7 @@ class MADDPG:
             self.env_replay_buffers[env_id].add(env_obs, env_actions, env_rewards, env_next_obs, env_dones)
     
     def disable_environment(self, env_id: int) -> None:
+        """Disable environment and clear its replay buffer."""
         if 0 <= env_id < self.num_envs and self.env_active[env_id]:
             self.env_active[env_id] = False
             if env_id in self.env_replay_buffers:
@@ -148,6 +162,7 @@ class MADDPG:
             print(f"[INFO] Environment {env_id} disabled")
     
     def update(self) -> Dict[str, Any]:
+        """Update all agents using centralized training."""
         self.training_steps += 1
         if self.training_steps % self.update_interval != 0:
             return {}
@@ -163,10 +178,12 @@ class MADDPG:
                 obs, act, rew, next_obs, done = self.env_replay_buffers[env_id].sample(self.batch_size)
                 if not obs: continue
 
+                # Concatenate observations and actions for centralized training
                 obs_cat = torch.cat(obs, dim=-1)
                 next_obs_cat = torch.cat(next_obs, dim=-1)
                 act_cat = torch.cat(act, dim=-1)
                 
+                # Compute target actions using target networks
                 with torch.no_grad():
                     next_actions_list = []
                     for j, agent_id_j in enumerate(self.agent_ids):
@@ -174,9 +191,11 @@ class MADDPG:
                          next_actions_list.append(next_mean)
                     next_actions_cat = torch.cat(next_actions_list, dim=-1)
 
+                # Update each agent
                 for i, agent_id in enumerate(self.agent_ids):
                     agent = self.env_agents[env_id][agent_id]
                     
+                    # Critic update
                     with torch.no_grad():
                         q_next = agent.critic_target(next_obs_cat, next_actions_cat)
                         q_target = rew[i] + self.gamma * q_next * (1 - done[i])
@@ -184,6 +203,7 @@ class MADDPG:
                     critic_out = agent.update_critic(obs_cat, act_cat, q_target)
                     stats['critic_losses'].append(critic_out['critic_loss'])
                     
+                    # Actor update
                     actions_pred_list = []
                     for j, agent_id_j in enumerate(self.agent_ids):
                         if i == j:
@@ -198,6 +218,7 @@ class MADDPG:
                     actor_out = agent.update_actor(actor_loss)
                     stats['actor_losses'].append(actor_out['actor_loss'])
                     
+                # Soft update target networks
                 for agent in self.env_agents[env_id].values():
                     agent.soft_update()
 

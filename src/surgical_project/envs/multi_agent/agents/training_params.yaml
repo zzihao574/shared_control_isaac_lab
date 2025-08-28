@@ -1,5 +1,6 @@
-# training_params.yaml - 清理重复定义后的版本
-# 只保留训练算法和任务逻辑相关参数，环境结构定义移到cfg文件
+# Training parameters configuration
+# Clean version - only training algorithm and task logic parameters
+# Environment structure definitions moved to cfg files
 
 # ==============================================================================
 # Global Settings
@@ -13,7 +14,7 @@ logging:
   enable_console_logging: true  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
-# Trajectory Parameters (任务逻辑)
+# Trajectory Parameters (Task Logic)
 # ==============================================================================
 trajectory:
   start_point: [0.14, -0.2, 0.03]    # Starting position in 3D space (meters)
@@ -21,7 +22,7 @@ trajectory:
   switch_threshold: 0.01              # Distance threshold for completion (1cm)
 
 # ==============================================================================
-# Physics Constraints (运行时约束)
+# Physics Constraints (Runtime Constraints)
 # ==============================================================================
 constraints:
   min_z_position: 0.0                 # Minimum Z position for safety

@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - 清理维度重复定义后的版本
+# surgical_direct_marl_env.py - Clean version after removing duplicate dimension definitions
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import yaml
 import os
-import gymnasium as gym  # 恢复gymnasium import
+import gymnasium as gym  
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 
@@ -54,12 +54,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Initialize utility managers and components
         self._initialize_components()
         
-        # 恢复gymnasium spaces设置 - Isaac Lab和Gymnasium都需要
+        # Restore gymnasium spaces setup - both Isaac Lab and Gymnasium need this
         self._setup_gymnasium_spaces()
         
     def _setup_core_configuration(self) -> None:
         """Load and setup core configuration parameters."""
-        # Load training parameters from YAML
         self.params = self._load_training_params()
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
@@ -187,7 +186,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _setup_gymnasium_spaces(self) -> None:
         """Setup Gymnasium compatibility spaces with unlimited bounds."""
-        # 使用无限大的边界，实际限制通过环境逻辑处理
+        # Use unlimited bounds, actual limits handled by environment logic
         self.action_space = gym.spaces.Dict({
             agent: gym.spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -279,12 +278,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             print(f"[INFO] Using fallback stylus body index: {self.stylus_body_idx}")
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
-        """
-        Pre-physics step processing including action validation and force application.
-        
-        Args:
-            actions: Dictionary of actions for each agent
-        """
+        """Pre-physics step processing including action validation and force application."""
         # Process and validate actions
         for agent, action in actions.items():
             if agent in self.cfg.possible_agents:
@@ -347,12 +341,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._omni_robot.write_data_to_sim()
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """
-        Compute observations for all agents and update state cache.
-        
-        Returns:
-            Dictionary of observations for each agent
-        """
+        """Compute observations for all agents and update state cache."""
         # Update all state cache (t+1 state after physics)
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
@@ -393,7 +382,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             constraint_distances,     # Distance measurements (1)
         ], dim=-1)                   # Total: 19 dimensions
         
-        # 验证观测维度与配置一致
+        # Verify observation dimensions match configuration
         expected_dim = self.cfg.observation_spaces[self.cfg.possible_agents[0]]
         actual_dim = obs.shape[-1]
         if expected_dim != actual_dim:
@@ -402,18 +391,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Create observation dictionary for each agent
         observations = {}
         for agent in self.cfg.possible_agents:
-            # 不限制观测范围，让网络学习处理任何数值
+            # Don't limit observation ranges, let networks learn to handle any values
             observations[agent] = obs
             
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """
-        Compute rewards using modular reward components.
-        
-        Returns:
-            Dictionary of rewards for each agent
-        """
+        """Compute rewards using modular reward components."""
         self.reward_logger.on_step()
         
         # Calculate individual reward components
@@ -561,12 +545,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """
-        Determine termination and truncation conditions.
-        
-        Returns:
-            Tuple of (terminated, truncated) dictionaries
-        """
+        """Determine termination and truncation conditions."""
         
         # Z-axis termination (safety)
         z_below_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -593,12 +572,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return terminated, truncated
         
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """
-        Reset specified environments.
-        
-        Args:
-            env_ids: Environment IDs to reset
-        """
+        """Reset specified environments."""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         
@@ -691,15 +665,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         }
     
     def get_reward_details(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """
-        Get detailed reward component information.
-        
-        Args:
-            env_ids: Optional list of environment IDs to query
-            
-        Returns:
-            Dictionary containing reward component details
-        """
+        """Get detailed reward component information."""
         if not self.reward_components:
             return {}
         
