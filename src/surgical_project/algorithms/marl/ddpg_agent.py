@@ -25,7 +25,7 @@ class DDPGAgent:
         self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.01))
         self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.01))
         self.tau = float(maddpg_cfg.get('tau', 0.01))
-        hidden_dim = int(maddpg_cfg.get('num_units', 64))
+        hidden_dim = int(maddpg_cfg.get('hidden_units', 64))
         
         # Get reasonable max action from environment constraints
         constraints = params.get('constraints', {})

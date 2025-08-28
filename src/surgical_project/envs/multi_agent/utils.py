@@ -591,7 +591,8 @@ class ConsoleLogger:
             # Constraint status
             safety_distance = env.safety_distances_t1[env_id].item()
             is_overlapping = env.is_violating_t1[env_id].item()
-            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}")
+            normals = env.normal_t1[env_id]
+            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
             
             # Force magnitudes
             robot_force = env.robot_forces_t[env_id]

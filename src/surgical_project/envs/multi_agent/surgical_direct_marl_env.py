@@ -162,6 +162,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.joint_vel_t1 = torch.zeros(self.num_envs, 6, device=self.device)
         self.safety_distances_t1 = torch.ones(self.num_envs, device=self.device) * 0.01
         self.is_violating_t1 = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.normal_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.constraint_results_t1 = None
     
     def _initialize_components(self) -> None:
@@ -366,6 +367,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         self.safety_distances_t1 = self.constraint_results_t1['distances_constraint']
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
+        self.normal_t1 = self.constraint_results_t1['normal_vectors']
 
         # Constrain velocity for stability
         stylus_vel_constrained = self.stylus_vel_t1
@@ -513,7 +515,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             torch.where(
                 self.safety_distances_t1 < 0.008,
                 torch.full_like(self.safety_distances_t1, -200.0),
-                0.5 + 10.0 * torch.clamp(self.safety_distances_t1, max=0.05)
+                0.0
             )
         )
     
@@ -621,7 +623,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.robot_forces_t[env_ids] = 0.0
         self.safety_distances_t1[env_ids] = 0.01
         self.is_violating_t1[env_ids] = False
-        
+        self.normal_t1[env_ids] = torch.zeros((num_resets, 3), device=self.device)
+
     def _get_stylus_position(self) -> torch.Tensor:
         """Get stylus position relative to robot base."""
         if self.stylus_body_idx is None:
