@@ -31,7 +31,7 @@ class Actor(nn.Module):
         action_mean = torch.tanh(action_mean) * self.max_action
         
         # Constrained standard deviation for stable training
-        action_std = torch.exp(log_std.clamp(-20, -2)) * self.max_action * 0.15
+        action_std = torch.exp(log_std.clamp(-20, -2)) * self.max_action * 0.5
         
         return action_mean, action_std
 

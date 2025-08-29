@@ -323,6 +323,7 @@ class EpisodeTracker:
                 'collision': False,
                 'min_safety_distance': float('inf'),
             }
+            
 
 
 class MilestoneManager:
@@ -471,7 +472,7 @@ class PerformanceEvaluator:
         if basic_data['steps'] == 0:
             return 0.0
         
-        # Completion bonus (40 points)
+        # Completion bonus (40 points)0.5 + 10.0 * torch.clamp(self.safety_distances_t1, max=0.05)
         completion_score = 40.0 if basic_data['completed'] else 0.0
         
         # Progress score (20 points)
@@ -601,38 +602,38 @@ class ConsoleLogger:
             human_force_mag = torch.norm(human_force).item()
             print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
             
-            # Detailed reward breakdown
+            # Detailed reward breakdown - 更新为新的奖励组件
             print(f"\nReward Breakdown:")
             print(f"Robot Agent:")
             traj_r = env.reward_components['trajectory_reward'][env_id].item()
             prog_r = env.reward_components['progress_reward'][env_id].item()
-            vel_r = env.reward_components['velocity_reward'][env_id].item()
-            cbf_r = env.reward_components['cbf_reward'][env_id].item()
+            potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
             robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
             human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
             z_pen = env.reward_components['z_penalty'][env_id].item()
             comp_r = env.reward_components['completion_reward'][env_id].item()
+            time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
             
             print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
             print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
-            print(f"  Velocity: {vel_r:.3f} * {robot_weights['velocity']:.2f} = {vel_r * robot_weights['velocity']:.3f}")
-            print(f"  CBF: {cbf_r:.3f} * {robot_weights['obstacle_cbf']:.2f} = {cbf_r * robot_weights['obstacle_cbf']:.3f}")
+            print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
             print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
             print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
             print(f"  Z Penalty: {z_pen:.3f}")
             print(f"  Completion: {comp_r:.3f}")
+            print(f"  Time Efficiency: {time_eff_r:.3f}")
             robot_total = rewards["robot"][env_id].item()
             print(f"  ROBOT TOTAL: {robot_total:.3f}")
             
             print(f"Human Agent:")
             print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
             print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
-            print(f"  Velocity: {vel_r:.3f} * {human_weights['velocity']:.2f} = {vel_r * human_weights['velocity']:.3f}")
-            print(f"  CBF: {cbf_r:.3f} * {human_weights['obstacle_cbf']:.2f} = {cbf_r * human_weights['obstacle_cbf']:.3f}")
+            print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
             print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
             print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
             print(f"  Z Penalty: {z_pen:.3f}")
             print(f"  Completion: {comp_r:.3f}")
+            print(f"  Time Efficiency: {time_eff_r:.3f}")
             human_total = rewards["human"][env_id].item()
             print(f"  HUMAN TOTAL: {human_total:.3f}")
             

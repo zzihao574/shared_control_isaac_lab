@@ -399,17 +399,17 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """Compute rewards using modular reward components."""
+        """基于势场引导和阶段性偏差要求的奖励系统"""
         self.reward_logger.on_step()
         
         # Calculate individual reward components
-        trajectory_reward = self._calculate_trajectory_reward()
+        trajectory_reward = self._calculate_adaptive_trajectory_reward()
         progress_reward = self._calculate_progress_reward()
-        velocity_reward = self._calculate_velocity_reward()
-        cbf_reward = self._calculate_cbf_reward()
+        potential_field_reward = self._calculate_potential_field_reward()
         force_penalties = self._calculate_force_penalties()
         z_penalty = self._calculate_z_penalty()
         completion_reward = self._calculate_completion_reward()
+        time_efficiency_reward = self._calculate_time_efficiency_reward()
         
         # Get reward weights from configuration
         robot_weights = self.params['reward_parameters']['robot_weights']
@@ -420,23 +420,23 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         rewards["robot"] = (
             trajectory_reward * robot_weights['trajectory_tracking'] +
             progress_reward * robot_weights['progress'] +
-            velocity_reward * robot_weights['velocity'] +
-            cbf_reward * robot_weights['obstacle_cbf'] +
+            potential_field_reward * robot_weights['potential_field'] +
             force_penalties['robot'] * robot_weights['force_efficiency'] +
             force_penalties['human'] * robot_weights['human_awareness'] +
             z_penalty +
-            completion_reward
+            completion_reward +
+            time_efficiency_reward
         )
         
         rewards["human"] = (
             trajectory_reward * human_weights['trajectory_tracking'] +
             progress_reward * human_weights['progress'] +
-            velocity_reward * human_weights['velocity'] +
-            cbf_reward * human_weights['obstacle_cbf'] +
+            potential_field_reward * human_weights['potential_field'] +
             force_penalties['human'] * human_weights['force_efficiency'] +
             force_penalties['robot'] * human_weights['robot_awareness'] +
             z_penalty +
-            completion_reward
+            completion_reward +
+            time_efficiency_reward
         )
         
         # Cache reward components for logging
@@ -449,12 +449,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.reward_components = {
             'trajectory_reward': trajectory_reward,
             'progress_reward': progress_reward,
-            'velocity_reward': velocity_reward,
-            'cbf_reward': cbf_reward,
+            'potential_field_reward': potential_field_reward,
             'robot_force_penalty': force_penalties['robot'],
             'human_force_penalty': force_penalties['human'],
             'z_penalty': z_penalty,
             'completion_reward': completion_reward,
+            'time_efficiency_reward': time_efficiency_reward,
             'deviation': deviations,
             'progress_ratio': progress_ratio,
             'distance_to_final': distance_to_final
@@ -473,79 +473,132 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
             "human_reward": rewards["human"].mean().item(),
+            "trajectory_reward": trajectory_reward.mean().item(),
+            "progress_reward": progress_reward.mean().item(),
+            "potential_field_reward": potential_field_reward.mean().item(),
             "deviation": deviations.mean().item(),
             "progress": progress_ratio.mean().item(),
             "safety_distance": self.safety_distances_t1.mean().item(),
-            "z_penalty": z_penalty.mean().item(),
+            "time_efficiency": time_efficiency_reward.mean().item(),
         }
         
         return rewards
-    
-    def _calculate_trajectory_reward(self) -> torch.Tensor:
-        """Calculate trajectory tracking reward."""
+
+    def _calculate_adaptive_trajectory_reward(self) -> torch.Tensor:
+        """
+        Calculate adaptive trajectory reward based on distance to obstacle.
+        - Outside 1.5cm: Strict deviation requirements
+        - Within 1.5cm: Relaxed deviation requirements (4cm tolerance)
+        """
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        safety_distances = self.safety_distances_t1
         
-        return torch.where(
-            deviations < 0.01,
-            torch.ones_like(deviations),
-            torch.where(
-                deviations < 0.025,
-                1.0 - (deviations - 0.01) / 0.015,
-                -10.0 * (deviations - 0.025)
+        # Define phase boundary
+        OBSTACLE_BOUNDARY = 0.015  # 1.5cm
+        
+        # Phase A: Outside obstacle boundary (>1.5cm) - Strict trajectory following
+        outside_mask = safety_distances > OBSTACLE_BOUNDARY
+        trajectory_reward = torch.zeros_like(deviations)
+        
+        if torch.any(outside_mask):
+            outside_deviations = deviations[outside_mask]
+            trajectory_reward[outside_mask] = torch.where(
+                outside_deviations < 0.01,  # <1cm: full reward
+                torch.full_like(outside_deviations, 15.0),
+                torch.where(
+                    outside_deviations < 0.025,  # 1-2.5cm: linear decrease
+                    15.0 * (1.0 - (outside_deviations - 0.01) / 0.015),
+                    -10.0 * (outside_deviations - 0.025)  # >2.5cm: penalty
+                )
             )
-        )
-    
+        
+        # Phase B: Inside obstacle boundary (≤1.5cm) - Relaxed trajectory following
+        inside_mask = safety_distances <= OBSTACLE_BOUNDARY
+        trajectory_reward[inside_mask] = 2.0  # 固定小奖励，不依赖deviation
+        
+        return trajectory_reward
+
     def _calculate_progress_reward(self) -> torch.Tensor:
-        """Calculate progress reward."""
+        """Calculate progress reward - shared across all phases."""
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-        return progress_ratio * 5.0
-    
-    def _calculate_velocity_reward(self) -> torch.Tensor:
-        """Calculate velocity control reward."""
-        velocity_along_line = torch.abs(
-            torch.sum(self.stylus_vel_t1 * self.trajectory_manager.line_direction.unsqueeze(0), dim=-1)
-        )
-        return torch.exp(-velocity_along_line * 20.0)
-    
-    def _calculate_cbf_reward(self) -> torch.Tensor:
-        """Calculate Control Barrier Function reward for obstacle avoidance."""
-        return torch.where(
-            self.safety_distances_t1 < 0.001,
-            torch.full_like(self.safety_distances_t1, -500.0),
-            torch.where(
-                self.safety_distances_t1 < 0.008,
-                torch.full_like(self.safety_distances_t1, -200.0),
-                0.0
-            )
-        )
-    
+        return progress_ratio - 1.0 # Scale progress reward
+
+    def _calculate_potential_field_reward(self) -> torch.Tensor:
+        """
+        Calculate potential field reward for obstacle region navigation.
+        Combines repulsion from obstacle and attraction to goal.
+        Only active when within obstacle boundary (≤1.5cm).
+        """
+        safety_distances = self.safety_distances_t1
+        progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+        
+        # Define obstacle boundary
+        OBSTACLE_BOUNDARY = 0.015  # 1.5cm
+        
+        # Only apply potential field within obstacle region
+        inside_obstacle_mask = safety_distances <= OBSTACLE_BOUNDARY
+        potential_field_reward = torch.zeros_like(safety_distances)
+        
+        if torch.any(inside_obstacle_mask):
+            inside_safety = safety_distances[inside_obstacle_mask]
+            inside_progress = progress_ratio[inside_obstacle_mask]
+            
+            # Repulsion force: stronger when closer to obstacle
+            # Use inverse relationship but clamped to avoid extreme values
+            repulsion = -1000.0 / (inside_safety + 0.01)  # Prevent division by zero
+            repulsion = torch.clamp(repulsion, min=-150.0, max=-2.0)  # Clamp extreme values
+            
+            # Attraction force: encourage progress toward goal
+            attraction = (inside_progress - 1.0) * 20.0
+
+            # Combined potential field (repulsion + attraction creates tangential motion)
+            potential_field_reward[inside_obstacle_mask] = repulsion + attraction
+        
+        return potential_field_reward
+
     def _calculate_force_penalties(self) -> Dict[str, torch.Tensor]:
-        """Calculate force efficiency penalties."""
+        """Calculate force efficiency penalties - shared across all phases."""
         return {
-            'robot': -50.0 * torch.sum(self.robot_forces_t**2, dim=-1),
-            'human': -50.0 * torch.sum(self.human_forces_t**2, dim=-1)
+            'robot': -50.0 * torch.norm(self.robot_forces_t, dim=-1),
+            'human': -50.0 * torch.norm(self.human_forces_t, dim=-1)
         }
-    
+
     def _calculate_z_penalty(self) -> torch.Tensor:
-        """Calculate Z-axis constraint penalty."""
+        """Calculate Z-axis constraint penalty - shared across all phases."""
         return torch.where(
             self.stylus_pos_t1[:, 2] < 0.0,
             -500.0 * torch.abs(self.stylus_pos_t1[:, 2]),
             torch.zeros_like(self.stylus_pos_t1[:, 2])
         )
-    
+
     def _calculate_completion_reward(self) -> torch.Tensor:
-        """Calculate task completion reward."""
-        distance_to_final = torch.norm(
-            self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), 
-            dim=-1
-        )
+        """Calculate task completion reward - shared across all phases."""
+        is_final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         return torch.where(
-            distance_to_final < 0.01,
-            torch.full_like(distance_to_final, 50.0),
-            torch.zeros_like(distance_to_final)
+            is_final_reached,
+            torch.full_like(self.safety_distances_t1, 100.0),
+            torch.zeros_like(self.safety_distances_t1)
         )
+
+    def _calculate_time_efficiency_reward(self) -> torch.Tensor:
+        """
+        Calculate time efficiency reward using reward_logger's episode step tracking.
+        Encourages faster completion (又快又准).
+        """
+        max_steps = 1200  # 20s * 60fps = 1200 steps per episode
         
+        # 获取每个环境当前episode的步数
+        current_steps = torch.tensor([
+            self.reward_logger.current_episode_basic[env_id]['steps'] 
+            for env_id in range(self.num_envs)
+        ], device=self.device, dtype=torch.float32)
+        
+        # Time efficiency: higher reward for completing tasks faster
+        time_efficiency = (max_steps - current_steps) / max_steps
+        time_efficiency = torch.clamp(time_efficiency, min=0.0, max=1.0)
+
+        return time_efficiency * 3.0  # Scale time efficiency reward
+
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Determine termination and truncation conditions."""
         
