@@ -79,12 +79,7 @@ reward_parameters:
     potential_field: 4.0  # 新增：势场引导权重
     
   completion_threshold: 0.01          # Distance threshold for completion (meters)
-  
-  # Control Barrier Function (CBF) parameters
-  cbf_parameters:
-    safety_margin: 0.01               # Safety margin for constraints (meters)
-    gamma: 10.0                       # CBF aggressiveness parameter
-    epsilon: 0.000001                 # CBF numerical stability parameter
+
 
 # ==============================================================================
 # Termination Conditions
@@ -107,7 +102,7 @@ maddpg_config:
   update_interval: 100                # Updates every N steps
   min_buffer_size: 1024               # Minimum buffer size to start training
   tau: 0.01                           # Target network update rate
-  max_replay_buffer_len: 10000        # Maximum replay buffer size
+  max_replay_buffer_len: 100000       # Maximum replay buffer size
 
 # ==============================================================================
 # Training Monitoring

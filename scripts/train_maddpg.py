@@ -2,7 +2,7 @@
 
 """
 Surgical Robot MADDPG Multi-Environment Parallel Training
-Unified dimension management and streamlined configuration
+Unified dimension management with dual protection mechanism
 """
 
 import sys
@@ -22,12 +22,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 from isaaclab.app import AppLauncher
 from utils.training_helpers import (
     CheckpointManager, WandBLogger, TrainingConfiguration,
-    TopKModelManager, TrainingProgressTracker, TrainingLogger,
+    TopKModelManager, UnifiedProgressManager, TrainingLogger,
     create_argument_parser
 )
 
 class MADDPGTrainer:
-    """Main trainer class for MADDPG algorithm in surgical robot environments."""
+    """Main trainer class for MADDPG algorithm in surgical robot environments with dual protection."""
     
     def __init__(self, args):
         self.args = args
@@ -46,6 +46,14 @@ class MADDPGTrainer:
         random.seed(self.args.seed)
         self.config.params['seed'] = self.args.seed
         self.env, self.env_cfg = self._create_environment()
+        
+        # Inject config to avoid env re-reading YAML
+        actual_env = getattr(self.env, 'unwrapped', self.env)
+        if hasattr(actual_env, "params"):
+            actual_env.params = self.config.params
+        else:
+            print("[WARNING] Environment does not support config injection")
+            
         self._configure_reward_logger()
 
     def _setup_logging(self):
@@ -56,11 +64,11 @@ class MADDPGTrainer:
         self.checkpoint_path = os.path.join(log_dir, f"checkpoint_top{self.args.top_k_models}.pth")
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_{self.args.num_envs}envs_{timestamp}"
+            run_name = f"maddpg_dual_protection_{self.args.num_envs}envs_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
 
     def _setup_training_components(self):
-        """Initialize MADDPG trainer and related training components."""
+        """Initialize MADDPG trainer and related training components with dual protection."""
         from surgical_project.algorithms.marl.maddpg import MADDPG
         device = self.config.get_compute_device()
 
@@ -74,13 +82,35 @@ class MADDPGTrainer:
         if self.checkpoint_manager.load_checkpoint():
             self.checkpoint_manager.initialize_agents_from_checkpoint(self.maddpg_trainer)
         
-        # Create single episode counter in TrainingProgressTracker
-        self.progress_tracker = TrainingProgressTracker(self.maddpg_trainer.num_envs, self.args.max_episodes)
+        # Use unified progress manager
+        self.progress = UnifiedProgressManager(
+            self.maddpg_trainer.num_envs,
+            self.args.max_episodes,
+            device=device
+        )
         
-        # Pass counter reference to reward logger
+        # Set up training logger reference for progress manager
+        self.progress.training_logger = self.logger
+        
+        # DUAL PROTECTION SETUP: Register buffer clearing callback (First layer protection)
+        self.progress.register_closure_callback(self.maddpg_trainer.disable_environment)
+        print("[PROTECTION] Dual protection mechanism activated:")
+        print("  - First layer: Immediate buffer clearing on environment closure")
+        print("  - Second layer: Training filtering by active environments only")
+        
+        # Pass to env and logger - handle wrapper case
+        actual_env = getattr(self.env, 'unwrapped', self.env)
+        if hasattr(actual_env, 'set_progress_manager'):
+            actual_env.set_progress_manager(self.progress)
+        else:
+            print("[WARNING] Environment does not support progress manager injection")
+        
         reward_logger = self._get_reward_logger()
         if reward_logger:
-            reward_logger.set_episode_counter(self.progress_tracker.env_episode_counts)
+            # Compatibility for old interface
+            reward_logger.set_episode_counter(self.progress.episode_counts)
+            # For reading step counts
+            reward_logger.set_progress_manager(self.progress)
         
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models)
         self.training_started = False
@@ -168,69 +198,54 @@ class MADDPGTrainer:
         
         self.wandb_logger.log_milestone_completion(self.global_step, milestone, performances)
 
-    def _process_rewards_and_completion(self, active_envs: List[int], terminated: Dict[str, Any], truncated: Dict[str, Any]):
-        """Process rewards and handle environment completion detection."""
-        reward_logger = self._get_reward_logger()
-        if not reward_logger:
-            return
-
-        for env_id in active_envs:
-            current_steps = reward_logger.episode_tracker.current_episode_basic[env_id]['steps']
-            
-            # Detect episode end by explicit done flags OR step count reset (Isaac Lab auto-reset)
-            env_done = any(terminated[agent][env_id] or truncated[agent][env_id] for agent in self.maddpg_trainer.agent_ids)
-            
-            # Isaac Lab auto-resets without setting truncated=True
-            # Detect reset by step count dropping significantly
-            if not hasattr(self, '_prev_steps'):
-                self._prev_steps = {}
-            
-            prev_steps = self._prev_steps.get(env_id, 0)
-            episode_reset = prev_steps > current_steps + 100  # Step count dropped significantly
-            
-            if episode_reset and not env_done:
-                env_done = True
-            
-            self._prev_steps[env_id] = current_steps
-            
-            if env_done and prev_steps > 0:  # Use prev_steps since current_steps may have reset
-                # Process episode metrics and milestones
-                reward_logger.on_episode_end(torch.tensor([env_id], device=self.maddpg_trainer.device))
-                
-                # Increment episode counter
-                reached_max = self.progress_tracker.complete_episode(env_id)
-                
-                if reached_max:
-                    final_episode_count = self.progress_tracker.env_episode_counts[env_id]
-                    final_performance = reward_logger.get_final_evaluation(env_id, final_episode_count)
-                    
-                    self.logger.log_environment_completion(
-                        env_id, final_episode_count,
-                        final_performance, self.progress_tracker.num_completed_envs,
-                        self.maddpg_trainer.num_envs
-                    )
-                    
-                    self.maddpg_trainer.disable_environment(env_id)
+    def _print_buffer_status_debug(self):
+        """Print buffer status for debugging dual protection mechanism."""
+        status = self.maddpg_trainer.get_buffer_status()
+        
+        if status['cleared_but_not_empty']:
+            print(f"[DEBUG] Cleared environments with non-empty buffers: {status['cleared_but_not_empty']}")
+        
+        if len(status['empty_buffers']) > 0:
+            print(f"[DEBUG] Empty buffers count: {len(status['empty_buffers'])}")
 
     def train(self) -> None:
-        """Main training loop."""
+        """Main training loop with dual protection mechanism."""
         self.logger.log_training_start(self.args, self.config.params)
         
         print(f"[INFO] Training with max_episodes={self.args.max_episodes}")
+        print("[INFO] Dual protection mechanism:")
+        print("  1. Buffer clearing: Environments reaching max_episodes have buffers cleared immediately")
+        print("  2. Training filtering: Only active environments participate in training updates")
         
         try:
             obs_dict, _ = self.env.reset()
-            while not self.progress_tracker.is_training_complete():
+            
+            # Use new progress manager
+            while not self.progress.is_training_complete():
                 self.global_step += 1
-                active_envs = self.progress_tracker.get_active_environments()
+                
+                # Get active environments list
+                active_envs = self.progress.get_active_environments()
                 if not active_envs:
                     break
 
-                actions = self.maddpg_trainer.select_actions(obs_dict, active_envs, add_noise=True)
+                # Single step entry point: only count steps for active environments
+                self.progress.on_step(active_envs)
+
+                # Only select actions for active environments (no grad; full batch returned)
+                with torch.no_grad():
+                    actions = self.maddpg_trainer.select_actions(
+                        obs_dict, active_envs, add_noise=True
+                    )
+                # Contract: actions[agent].shape == (num_envs, 3)
                 
                 next_obs, rewards, terminated, truncated, info = self.env.step(actions)
                 
-                self.maddpg_trainer.store_transitions_selective(obs_dict, actions, rewards, next_obs, terminated, active_envs)
+                # Combine terminated and truncated signals for proper TD target calculation
+                done_any = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+                
+                # Only store transitions for active environments
+                self.maddpg_trainer.store_transitions_selective(obs_dict, actions, rewards, next_obs, done_any, active_envs)
                 
                 can_train = any(
                     len(self.maddpg_trainer.env_replay_buffers[i]) >= self.min_buffer_size 
@@ -240,18 +255,37 @@ class MADDPGTrainer:
                 if can_train:
                     if not self.training_started:
                         self.training_started = True
-                        print(f"[Step {self.global_step}] Training Started\n")
-                    algorithm_stats = self.maddpg_trainer.update()
+                        print(f"[Step {self.global_step}] Training Started with dual protection\n")
+                    
+                    # DUAL PROTECTION: Pass active_envs to update method for strict synchronization
+                    algorithm_stats = self.maddpg_trainer.update(active_envs)
                     self.wandb_logger.log_algorithm_statistics(self.global_step, algorithm_stats)
 
-                self._process_rewards_and_completion(active_envs, terminated, truncated)
+                # Episode settlement is completely handled by env._reset_idx()
                 
                 obs_dict = next_obs
 
+                # Progress reporting
                 if self.global_step > 0 and self.global_step % 1000 == 0:
-                    stats = self.progress_tracker.get_progress_statistics()
+                    stats = self.progress.get_progress_statistics()
                     self.logger.log_training_progress(self.global_step, stats, self.top_k_manager)
                     self.wandb_logger.log_training_progress(self.global_step, stats, self.top_k_manager)
+                
+                # Debug buffer status every 5000 steps
+                if self.global_step > 0 and self.global_step % 5000 == 0:
+                    self._print_buffer_status_debug()
+                
+                # Milestone progress reporting every 2000 steps
+                if self.global_step > 0 and self.global_step % 2000 == 0:
+                    reward_logger = self._get_reward_logger()
+                    if reward_logger:
+                        next_milestone, reached, remaining = reward_logger.get_next_milestone_progress()
+                        if next_milestone is not None:
+                            print(f"[Step {self.global_step}] Next Milestone {next_milestone}: "
+                                  f"{reached}/{self.maddpg_trainer.num_envs} environments reached "
+                                  f"({remaining} remaining)")
+                        else:
+                            print(f"[Step {self.global_step}] All environments completed all milestones!")
             
             # Final evaluation of all environments
             print("[TopK Update] Starting final evaluation...")
@@ -259,7 +293,7 @@ class MADDPGTrainer:
             if reward_logger:
                 for env_id in range(self.maddpg_trainer.num_envs):
                     try:
-                        final_episode_count = self.progress_tracker.env_episode_counts[env_id]
+                        final_episode_count = self.progress.env_episode_counts[env_id]
                         performance = reward_logger.get_final_evaluation(env_id, final_episode_count)
                         model_state = self._extract_model_state(env_id)
                         self.top_k_manager.update_model(env_id, performance, model_state)
@@ -267,10 +301,19 @@ class MADDPGTrainer:
                     except Exception as e:
                         print(f"[WARNING] Env {env_id} final evaluation failed: {e}")
 
+            # Final buffer status report
+            print("\n[FINAL STATUS] Dual protection mechanism summary:")
+            status = self.maddpg_trainer.get_buffer_status()
+            print(f"  Total environments: {status['total_envs']}")
+            print(f"  Cleared environments: {status['cleared_envs']}")
+            print(f"  Empty buffers: {len(status['empty_buffers'])}")
+            if status['cleared_but_not_empty']:
+                print(f"  WARNING: Cleared but not empty: {status['cleared_but_not_empty']}")
+
             self.logger.log_training_complete(self.top_k_manager)
             final_path = os.path.join(self.logger.log_directory, "final_top_k_models.pth")
             self.top_k_manager.save_checkpoint(final_path, self.maddpg_trainer)
-            self.logger.save_final_results(self.global_step, self.progress_tracker, self.top_k_manager, self.config.params, self.args)
+            self.logger.save_final_results(self.global_step, self.progress, self.top_k_manager, self.config.params, self.args)
             self.wandb_logger.log_training_completion(self.global_step, self.top_k_manager)
         
         except (KeyboardInterrupt, Exception) as e:
@@ -283,7 +326,7 @@ class MADDPGTrainer:
                 self._get_reward_logger().close_all_files()
             self.env.close()
             self.wandb_logger.finalize_run()
-            print("\nTraining finished")
+            print("\nTraining finished with dual protection mechanism")
 
 def main():
     """Main entry point for training script."""

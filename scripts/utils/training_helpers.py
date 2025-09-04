@@ -12,7 +12,7 @@ import torch
 import numpy as np
 import pickle
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 
 # WandB support
 try:
@@ -30,6 +30,151 @@ try:
 except ImportError:
     HARDWARE_MONITORING_AVAILABLE = False
     print("[WARNING] Hardware monitoring not available. Install with: pip install psutil GPUtil")
+
+
+class UnifiedProgressManager:
+    """Unified progress manager - single source of truth for all progress tracking."""
+    
+    def __init__(self, num_envs: int, max_episodes: int, device="cpu"):
+        self.num_envs = num_envs
+        self.max_episodes = max_episodes
+        self.device = torch.device(device)
+        
+        # Core state tensors
+        self.env_episode_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.env_active_mask = torch.ones(num_envs, dtype=torch.bool, device=self.device)
+        self.hard_disabled_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._episode_started = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        
+        # Completion tracking
+        self.num_completed_envs = 0
+        
+        # Optional training logger reference for file logging
+        self.training_logger = None
+        
+        # Environment closure callbacks for dual-layer protection
+        self.env_closure_callbacks: List[Callable[[int], None]] = []
+
+    def register_closure_callback(self, callback: Callable[[int], None]):
+        """Register callback function to be called when environments are closed."""
+        self.env_closure_callbacks.append(callback)
+        print(f"[PROGRESS] Registered environment closure callback")
+
+    def on_step(self, env_ids):
+        """Single step entry point: only count steps for specified environment IDs."""
+        ids = self._normalize_ids(env_ids)
+        if not ids: 
+            return
+            
+        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
+        live = self.env_active_mask[idx] & (~self.hard_disabled_mask[idx])
+        
+        if torch.any(live):
+            live_idx = idx[live]
+            self.env_step_counts[live_idx] += 1
+            self._episode_started[live_idx] = True
+
+    def on_episode_end(self, env_ids, reason: str = "env_reset"):
+        """Single episode settlement entry point: handle episode completion."""
+        ids = self._normalize_ids(env_ids)
+        if not ids: 
+            return
+            
+        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
+        
+        # Update episode count and reset step count
+        self.env_episode_counts[idx] += 1
+        self.env_step_counts[idx] = 0
+        self._episode_started[idx] = False
+        
+        # Check if any environments reached max episodes
+        newly_done = (self.env_episode_counts[idx] >= self.max_episodes) & self.env_active_mask[idx]
+        done_idx = torch.nonzero(newly_done, as_tuple=False).squeeze(-1)
+        
+        if done_idx.numel() > 0:
+            self.env_active_mask[idx[done_idx]] = False
+            self.num_completed_envs += int(done_idx.numel())
+            
+            # Console logging for environment closures
+            closed = [int(i) for i in idx[done_idx].tolist()]
+            print(f"[PROGRESS] Environments closed (reached max_episodes): {closed} | "
+                  f"Completed {self.num_completed_envs}/{self.num_envs}")
+            
+            # Optional: also stream to TrainingLogger if available
+            if getattr(self, "training_logger", None) is not None:
+                try:
+                    self.training_logger.log_message(
+                        f"Environments closed: {closed} at episodes "
+                        f"{[int(self.env_episode_counts[i].item()) for i in idx[done_idx]]}"
+                    )
+                except Exception:
+                    pass
+            
+            # First layer protection: immediately clear buffers via callbacks
+            for callback in self.env_closure_callbacks:
+                for env_id in closed:
+                    try:
+                        callback(env_id)
+                    except Exception as e:
+                        print(f"[WARNING] Environment {env_id} closure callback failed: {e}")
+
+    def filter_valid_for_episode_end(self, env_ids=None, min_steps: int = 1) -> list[int]:
+        """Unified filtering: only episodes that actually ran can be settled."""
+        ids = self._normalize_ids(env_ids)
+        if not ids: 
+            return []
+            
+        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
+        started = self._episode_started[idx]
+        enough = self.env_step_counts[idx] >= min_steps
+        
+        return [i for i, ok in zip(ids, (started & enough).tolist()) if ok]
+
+    def disable_environments(self, env_ids):
+        """Hard disable environments."""
+        ids = self._normalize_ids(env_ids)
+        if not ids: 
+            return
+            
+        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
+        self.hard_disabled_mask[idx] = True
+        self.env_active_mask[idx] = False
+
+    def get_active_environments(self) -> list[int]:
+        """Get list of environments still in training."""
+        mask = self.env_active_mask & (~self.hard_disabled_mask)
+        return torch.nonzero(mask, as_tuple=False).squeeze(-1).tolist()
+
+    def is_training_complete(self) -> bool:
+        """Check if training is complete."""
+        return (self.env_active_mask & (~self.hard_disabled_mask)).sum().item() == 0
+
+    def get_progress_statistics(self) -> Dict[str, Union[int, float]]:
+        """Get training progress statistics."""
+        active_count = len(self.get_active_environments())
+        return {
+            'active_count': active_count, 
+            'completed_count': self.num_completed_envs
+        }
+
+    @property
+    def episode_counts(self): 
+        return self.env_episode_counts
+    
+    @property
+    def step_counts(self):    
+        return self.env_step_counts
+
+    def _normalize_ids(self, env_ids):
+        """Normalize environment ID input."""
+        if env_ids is None: 
+            return list(range(self.num_envs))
+        if torch.is_tensor(env_ids): 
+            return env_ids.detach().cpu().tolist()
+        if isinstance(env_ids, int): 
+            return [env_ids]
+        return list(env_ids)
 
 
 class CheckpointManager:
@@ -128,7 +273,7 @@ class WandBLogger:
                 name=run_name,
                 config=config,
                 tags=["maddpg", "multi-agent", "surgical-robot"],
-                notes="Multi-environment parallel MADDPG training (Simplified Logging)"
+                notes="Multi-environment parallel MADDPG training (Dual Protection)"
             )
             print(f"[WANDB] Successfully initialized: {self.run.name}")
         except Exception as e:
@@ -288,39 +433,6 @@ class TopKModelManager:
                   f"{self.top_models[0][1]:.2f} ~ {self.top_models[-1][1]:.2f}/100")
 
 
-class TrainingProgressTracker:
-    """Tracks training progress across multiple environments."""
-    
-    def __init__(self, num_envs: int, max_episodes: int):
-        self.num_envs = num_envs
-        self.max_episodes = max_episodes
-        self.env_episode_counts = [0] * num_envs
-        self.env_completed = [False] * num_envs
-        self.num_completed_envs = 0
-    
-    def complete_episode(self, env_id: int) -> bool:
-        """Mark episode completion and check if environment finished training."""
-        self.env_episode_counts[env_id] += 1
-        if self.env_episode_counts[env_id] >= self.max_episodes and not self.env_completed[env_id]:
-            self.env_completed[env_id] = True
-            self.num_completed_envs += 1
-            return True
-        return False
-    
-    def get_active_environments(self) -> List[int]:
-        """Get list of environments still training."""
-        return [i for i in range(self.num_envs) if not self.env_completed[i]]
-    
-    def is_training_complete(self) -> bool:
-        """Check if all environments completed training."""
-        return self.num_completed_envs >= self.num_envs
-    
-    def get_progress_statistics(self) -> Dict[str, Union[int, float]]:
-        """Get training progress statistics."""
-        active_count = len(self.get_active_environments())
-        return {'active_count': active_count, 'completed_count': self.num_completed_envs}
-
-
 class TrainingLogger:
     """Handles training progress logging and file operations."""
     
@@ -328,9 +440,16 @@ class TrainingLogger:
         self.log_directory = log_directory
         os.makedirs(log_directory, exist_ok=True)
     
+    def log_message(self, message: str) -> None:
+        """Log a message to file."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_file = os.path.join(self.log_directory, "training.log")
+        with open(log_file, 'a') as f:
+            f.write(f"[{timestamp}] {message}\n")
+    
     def log_training_start(self, args: argparse.Namespace, params: Dict[str, Any]) -> None:
         """Log training start information."""
-        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training")
+        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Dual Protection)")
         print(f"Environments: {args.num_envs}, Target: {args.max_episodes} episodes per env")
         print(f"Log Directory: {self.log_directory}\n", "="*70)
     
@@ -355,7 +474,7 @@ class TrainingLogger:
             print(f"  #{i+1} Environment {env_id}: {performance:.2f}/100")
         print(f"\nResults saved in: {self.log_directory}")
     
-    def save_final_results(self, global_step: int, progress_tracker: TrainingProgressTracker, 
+    def save_final_results(self, global_step: int, progress_manager: UnifiedProgressManager, 
                           top_k_manager: TopKModelManager, params: Dict[str, Any], args: argparse.Namespace) -> None:
         """Save final training results to disk."""
         stats = {'total_steps': global_step, 'top_k_scores': [(e, p) for e, p, _ in top_k_manager.get_top_models()]}
@@ -373,7 +492,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
     config = TrainingConfiguration(config_path)
-    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training")
+    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with dual protection")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment count from command line overrides cfg default

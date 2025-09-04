@@ -37,7 +37,7 @@ class DDPGAgent:
         # Initialize networks
         self.actor = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
         self.actor_target = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_target.load_state_dict(self.actor.state_dict())  #优化？
         
         self.critic = Critic(total_state_dim, total_action_dim, hidden_dim).to(device)
         self.critic_target = Critic(total_state_dim, total_action_dim, hidden_dim).to(device)
