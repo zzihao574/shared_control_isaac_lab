@@ -220,33 +220,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
         
-
     def _setup_post_scene_creation(self):
         """Post-scene creation setup including physics configuration."""
         super()._setup_post_scene_creation()
         
         # Initialize robot-specific configurations
-        self._configure_robot_physics()
+        self._initialize_body_indices()
 
         # Update managers with robot data
         self._update_managers_with_robot_data()
-        
-    def _configure_robot_physics(self) -> None:
-        """Configure robot physics properties and find body indices."""
-        if not hasattr(self, '_omni_robot'):
-            return
-            
-        # Find stylus/end-effector body index
-        self._initialize_body_indices()
-        
-        # Configure robot for force control (zero stiffness and damping)
-        num_joints = self._omni_robot.num_joints
-        zero_stiffness = torch.zeros(self.num_envs, num_joints, device=self.device)
-        zero_damping = torch.zeros(self.num_envs, num_joints, device=self.device)
-        
-        self._omni_robot.write_joint_stiffness_to_sim(zero_stiffness)
-        self._omni_robot.write_joint_damping_to_sim(zero_damping)
-        
+
     def _update_managers_with_robot_data(self) -> None:
         """Update managers with robot position data."""
         if hasattr(self, '_omni_robot'):
@@ -341,7 +324,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.stylus_vel_t1 = self._get_stylus_velocity()
         
         # Update constraint state (t+1 state after physics)
-        current_base_positions = self.env_base_positions
+        current_base_positions = self._omni_robot.data.root_link_pos_w.clone()
         self.constraint_results_t1 = self.constraint_checker.analyze_constraint_state_batch(
             self.stylus_pos_t1, current_base_positions
         )
@@ -387,7 +370,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Compute final rewards
         rewards = {}
         rewards["robot"] = (
-            trajectory_reward * robot_weights['trajectory_tracking'] * 0.0 +
+            trajectory_reward * robot_weights['trajectory_tracking'] +
             progress_reward * robot_weights['progress'] +
             potential_field_reward * robot_weights['potential_field'] +
             force_penalties['robot'] * robot_weights['force_efficiency'] +
@@ -398,7 +381,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         
         rewards["human"] = (
-            trajectory_reward * human_weights['trajectory_tracking'] * 0.0 +
+            trajectory_reward * human_weights['trajectory_tracking'] +
             progress_reward * human_weights['progress'] +
             potential_field_reward * human_weights['potential_field'] +
             force_penalties['human'] * human_weights['force_efficiency'] +
@@ -435,7 +418,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Vectorized batch update for all environments  
         self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
         
-        # Update extras for logging
+        # Update extras for WandB
         self.extras["log"] = {
             "robot_reward": rewards["robot"].mean().item(),
             "human_reward": rewards["human"].mean().item(),
@@ -470,7 +453,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             outside_deviations = deviations[outside_mask]
             trajectory_reward[outside_mask] = torch.where(
                 outside_deviations < 0.01,  # <1cm: full reward
-                torch.full_like(outside_deviations, 15.0),
+                torch.full_like(outside_deviations, 5.0),
                 torch.where(
                     outside_deviations < 0.025,  # 1-2.5cm: linear decrease
                     15.0 * (1.0 - (outside_deviations - 0.01) / 0.015),

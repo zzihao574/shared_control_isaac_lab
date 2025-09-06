@@ -248,8 +248,6 @@ class StepTracer:
         self.basic_stats = {
             env_id: {
                 'total_episodes': 0,
-                'total_steps': 0,
-                'total_reward': 0.0,
                 'completed_episodes': 0,
                 'collision_episodes': 0,
             } for env_id in range(num_envs)
@@ -389,8 +387,6 @@ class StepTracer:
             # Minimal accumulation
             stats = self.basic_stats[env_id]
             stats['total_episodes'] += 1
-            stats['total_steps'] += basic['steps']
-            stats['total_reward'] += basic['total_reward']
             if basic['completed']:
                 stats['completed_episodes'] += 1
             if basic['collision']:

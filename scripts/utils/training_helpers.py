@@ -98,8 +98,8 @@ class UnifiedProgressManager:
             
             # Console logging for environment closures
             closed = [int(i) for i in idx[done_idx].tolist()]
-            print(f"[PROGRESS] Environments closed (reached max_episodes): {closed} | "
-                  f"Completed {self.num_completed_envs}/{self.num_envs}")
+            print(f"[PROGRESS] Newly closed this step: {closed}")
+            print(f"[PROGRESS] Total closed: {self.num_completed_envs}/{self.num_envs}")
             
             # Optional: also stream to TrainingLogger if available
             if getattr(self, "training_logger", None) is not None:
@@ -130,16 +130,6 @@ class UnifiedProgressManager:
         enough = self.env_step_counts[idx] >= min_steps
         
         return [i for i, ok in zip(ids, (started & enough).tolist()) if ok]
-
-    def disable_environments(self, env_ids):
-        """Hard disable environments."""
-        ids = self._normalize_ids(env_ids)
-        if not ids: 
-            return
-            
-        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
-        self.hard_disabled_mask[idx] = True
-        self.env_active_mask[idx] = False
 
     def get_active_environments(self) -> list[int]:
         """Get list of environments still in training."""
@@ -382,15 +372,10 @@ class TrainingConfiguration:
         with open(self.config_path, 'r') as f:
             self.params = yaml.safe_load(f)
         self.maddpg_cfg = self.params.get('maddpg_config', {})
-        self.hardware_cfg = self.params.get('hardware', {})
     
     def get_compute_device(self) -> str:
         """Get compute device (CUDA if available)."""
         return 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    def get_milestone_episodes(self) -> List[int]:
-        """Get milestone episode numbers."""
-        return self.params.get('training_monitor', {}).get('milestone_episodes', [])
 
 
 class TopKModelManager:
@@ -451,12 +436,7 @@ class TrainingLogger:
         """Log training start information."""
         print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Dual Protection)")
         print(f"Environments: {args.num_envs}, Target: {args.max_episodes} episodes per env")
-        print(f"Log Directory: {self.log_directory}\n", "="*70)
-    
-    def log_environment_completion(self, env_id: int, episode_count: int, performance: float, completed_count: int, total_envs: int) -> None:
-        """Log environment training completion."""
-        print(f"[ENV {env_id}] Training Complete - {episode_count} episodes - Final Score: {performance:.2f}/100")
-        print(f"[Progress] {completed_count}/{total_envs} environments completed\n")
+        print(f"Log Directory: {self.log_directory}\n", "="*70)    
     
     def log_training_progress(self, global_step: int, stats: Dict[str, Any], top_k_manager: TopKModelManager) -> None:
         """Log periodic training progress."""

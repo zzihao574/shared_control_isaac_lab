@@ -132,6 +132,9 @@ class MADDPG:
                                    dones: Dict[str, torch.Tensor], active_envs: List[int]) -> None:
         """Store transitions only for active environments."""
         for env_id in active_envs:
+            if env_id in self.cleared_environments:
+                continue
+
             is_done = dones[self.agent_ids[0]][env_id]
             
             env_obs = {aid: obs[aid][env_id] for aid in self.agent_ids}
@@ -149,7 +152,6 @@ class MADDPG:
         if 0 <= env_id < self.num_envs and env_id in self.env_replay_buffers:
             self.env_replay_buffers[env_id].clear()
             self.cleared_environments.add(env_id)
-            print(f"[BUFFER] Environment {env_id} buffer cleared (First layer protection)")
     
     def update(self, active_envs: List[int]) -> Dict[str, Any]:
         """
@@ -160,9 +162,13 @@ class MADDPG:
         self.training_steps += 1
         
         # Only train on active environments with sufficient data
-        active_and_ready_envs = [i for i in active_envs
-                                 if self.env_replay_buffers[i].is_ready(self.min_buffer_size)]
-        
+        active_and_ready_envs = [
+            i for i in active_envs
+            if (i not in self.cleared_environments)
+            and self.env_replay_buffers[i].is_ready(self.min_buffer_size)
+        ]
+
+
         if not active_and_ready_envs:
             return {"updates": 0, "training_steps": self.training_steps}
 

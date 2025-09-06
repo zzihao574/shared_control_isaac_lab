@@ -11,7 +11,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true  # Enable detailed console logging for milestone episodes
+  enable_console_logging: false  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -93,15 +93,15 @@ termination_conditions:
 # MADDPG Algorithm Configuration
 # ==============================================================================
 maddpg_config:
-  lr_actor: 0.01                      # Actor learning rate
-  lr_critic: 0.01                     # Critic learning rate
+  lr_actor: 0.001                      # Actor learning rate
+  lr_critic: 0.001                     # Critic learning rate
   gamma: 0.95                          # Discount factor
   batch_size: 512                     # Training batch size
   hidden_units: 128                   # Hidden layer units
   num_episodes: 600                   # Target episodes per environment
   update_interval: 100                # Updates every N steps
   min_buffer_size: 1024               # Minimum buffer size to start training
-  tau: 0.01                           # Target network update rate
+  tau: 0.005                           # Target network update rate
   max_replay_buffer_len: 100000       # Maximum replay buffer size
 
 # ==============================================================================
