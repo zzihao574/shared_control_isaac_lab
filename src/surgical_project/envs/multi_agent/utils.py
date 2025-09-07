@@ -282,98 +282,101 @@ class StepTracer:
                 basic['collision'] = True
 
     def maybe_print_step(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, current_step: int, active_envs: Optional[List[int]] = None):
-        """
-        Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
-        Enhanced with active environment filtering for dual protection mechanism.
-        """
-        if not self.enable_console_logging:
-            return
-        if current_step % self.print_every_steps != 0:
-            return
+            """
+            Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
+            Enhanced with active environment filtering for dual protection mechanism.
+            Shows weighted contributions to match actual training.
+            """
+            if not self.enable_console_logging:
+                return
+            if current_step % self.print_every_steps != 0:
+                return
 
-        # Show notifications for newly inactive environments (one time only)
-        if active_envs is not None:
-            current_active_set = set(active_envs)
-            newly_inactive = self.previously_active_envs - current_active_set
-            if newly_inactive:
-                print(f"\n[INACTIVE] Environments {sorted(newly_inactive)} are no longer active (dual protection)")
-            self.previously_active_envs = current_active_set
+            # Show notifications for newly inactive environments (one time only)
+            if active_envs is not None:
+                current_active_set = set(active_envs)
+                newly_inactive = self.previously_active_envs - current_active_set
+                if newly_inactive:
+                    print(f"\n[INACTIVE] Environments {sorted(newly_inactive)} are no longer active (dual protection)")
+                self.previously_active_envs = current_active_set
 
-        # Only show first N active environments to avoid screen flooding
-        print(f"\n{'='*80}")
-        print(f"STEP {current_step} - Environment State (Active Environments Only)")
-        print(f"{'='*80}")
-        
-        if active_envs is None:
-            # Fallback: print all environments
-            ids_to_print = range(min(self.max_envs_to_print, env.num_envs))
-            print("(Fallback mode: showing all environments)")
-        else:
-            ids_to_print = active_envs[:self.max_envs_to_print]
-            print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
-        
-        for env_id in ids_to_print:
-            print(f"\n--- [ACTIVE] Environment {env_id} ---")
+            # Only show first N active environments to avoid screen flooding
+            print(f"\n{'='*80}")
+            print(f"STEP {current_step} - Environment State (Active Environments Only)")
+            print(f"{'='*80}")
             
-            # Position information
-            stylus_pos = env.stylus_pos_t1[env_id]
-            print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
+            if active_envs is None:
+                # Fallback: print all environments
+                ids_to_print = range(min(self.max_envs_to_print, env.num_envs))
+                print("(Fallback mode: showing all environments)")
+            else:
+                ids_to_print = active_envs[:self.max_envs_to_print]
+                print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
             
-            # Trajectory metrics
-            deviation = env.reward_components['deviation'][env_id].item()
-            progress = env.reward_components['progress_ratio'][env_id].item()
-            distance_to_final = env.reward_components['distance_to_final'][env_id].item()
-            print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
-            
-            # Constraint status
-            safety_distance = env.safety_distances_t1[env_id].item()
-            is_overlapping = env.is_violating_t1[env_id].item()
-            normals = env.normal_t1[env_id]
-            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
-            
-            # Force magnitudes
-            robot_force = env.robot_forces_t[env_id]
-            human_force = env.human_forces_t[env_id]
-            robot_force_mag = torch.norm(robot_force).item()
-            human_force_mag = torch.norm(human_force).item()
-            print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
-            
-            # Detailed reward breakdown
-            print(f"\nReward Breakdown:")
-            print(f"Robot Agent:")
-            traj_r = env.reward_components['trajectory_reward'][env_id].item()
-            prog_r = env.reward_components['progress_reward'][env_id].item()
-            potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
-            robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
-            human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
-            z_pen = env.reward_components['z_penalty'][env_id].item()
-            comp_r = env.reward_components['completion_reward'][env_id].item()
-            time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
-            
-            print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
-            print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
-            print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
-            print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
-            print(f"  Z Penalty: {z_pen:.3f}")
-            print(f"  Completion: {comp_r:.3f}")
-            print(f"  Time Efficiency: {time_eff_r:.3f}")
-            robot_total = rewards["robot"][env_id].item()
-            print(f"  ROBOT TOTAL: {robot_total:.3f}")
-            
-            print(f"Human Agent:")
-            print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
-            print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
-            print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
-            print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
-            print(f"  Z Penalty: {z_pen:.3f}")
-            print(f"  Completion: {comp_r:.3f}")
-            print(f"  Time Efficiency: {time_eff_r:.3f}")
-            human_total = rewards["human"][env_id].item()
-            print(f"  HUMAN TOTAL: {human_total:.3f}")
-            
-            print(f"Combined Total Reward: {robot_total + human_total:.3f}")
+            for env_id in ids_to_print:
+                print(f"\n--- [ACTIVE] Environment {env_id} ---")
+                
+                # Position information
+                stylus_pos = env.stylus_pos_t1[env_id]
+                print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
+                
+                # Trajectory metrics
+                deviation = env.reward_components['deviation'][env_id].item()
+                progress = env.reward_components['progress_ratio'][env_id].item()
+                distance_to_final = env.reward_components['distance_to_final'][env_id].item()
+                print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
+                
+                # Constraint status
+                safety_distance = env.safety_distances_t1[env_id].item()
+                is_overlapping = env.is_violating_t1[env_id].item()
+                normals = env.normal_t1[env_id]
+                print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
+                
+                # Force magnitudes
+                robot_force = env.robot_forces_t[env_id]
+                human_force = env.human_forces_t[env_id]
+                robot_force_mag = torch.norm(robot_force).item()
+                human_force_mag = torch.norm(human_force).item()
+                print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
+                
+                # ENHANCED: Detailed reward breakdown with weighted contributions
+                print(f"\nReward Breakdown (Weighted Contributions):")
+                print(f"Robot Agent:")
+                traj_r = env.reward_components['trajectory_reward'][env_id].item()
+                prog_r = env.reward_components['progress_reward'][env_id].item()
+                potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
+                robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
+                human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
+                z_pen = env.reward_components['z_penalty'][env_id].item()
+                comp_r = env.reward_components['completion_reward'][env_id].item()
+                time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
+                
+                print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
+                print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
+                print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
+                print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
+                print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
+                # ENHANCED: Show weighted global components
+                print(f"  Z Penalty: {z_pen:.3f} * {robot_weights.get('z_penalty',0.0):.2f} = {z_pen * robot_weights.get('z_penalty',0.0):.3f}")
+                print(f"  Completion: {comp_r:.3f} * {robot_weights.get('completion_reward',0.0):.2f} = {comp_r * robot_weights.get('completion_reward',0.0):.3f}")
+                print(f"  Time Efficiency: {time_eff_r:.3f} * {robot_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * robot_weights.get('time_efficiency',0.0):.3f}")
+                robot_total = rewards["robot"][env_id].item()
+                print(f"  ROBOT TOTAL: {robot_total:.3f}")
+                
+                print(f"Human Agent:")
+                print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
+                print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
+                print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
+                print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
+                print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
+                # ENHANCED: Show weighted global components
+                print(f"  Z Penalty: {z_pen:.3f} * {human_weights.get('z_penalty',0.0):.2f} = {z_pen * human_weights.get('z_penalty',0.0):.3f}")
+                print(f"  Completion: {comp_r:.3f} * {human_weights.get('completion_reward',0.0):.2f} = {comp_r * human_weights.get('completion_reward',0.0):.3f}")
+                print(f"  Time Efficiency: {time_eff_r:.3f} * {human_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * human_weights.get('time_efficiency',0.0):.3f}")
+                human_total = rewards["human"][env_id].item()
+                print(f"  HUMAN TOTAL: {human_total:.3f}")
+                
+                print(f"Combined Total Reward: {robot_total + human_total:.3f}")
 
     def on_episode_end(self, env_ids):
         """Roll up current-episode stats into basic_stats, then reset episode state."""

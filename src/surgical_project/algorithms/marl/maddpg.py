@@ -1,6 +1,7 @@
 """
 Multi-environment parallel MADDPG algorithm.
 Dual protection mechanism - buffer clearing + training filtering.
+Multi-agent update with single-agent control via select_actions.
 """
 
 import torch
@@ -18,6 +19,7 @@ class MADDPG:
     - Multi-environment parallel training
     - Centralized training, decentralized execution
     - Dual protection: buffer clearing + training filtering
+    - Multi-agent update logic with single-agent control via select_actions
     - Comprehensive debugging and monitoring
     """
     
@@ -32,6 +34,12 @@ class MADDPG:
         self.agent_ids = list(actual_env.cfg.possible_agents)
         self.num_agents = len(self.agent_ids)
         
+        # CRITICAL: Define robot/human indices explicitly
+        self.robot_id = "robot"
+        self.human_id = "human"
+        self.robot_idx = self.agent_ids.index(self.robot_id)
+        self.human_idx = self.agent_ids.index(self.human_id)
+        
         # Get dimensions from environment cfg
         self.obs_dims = [actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
         self.action_dims = [actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
@@ -40,6 +48,8 @@ class MADDPG:
 
         print(f"[INFO] Initializing MADDPG with dual protection: {self.num_envs} environments")
         print(f"[INFO] Agent IDs: {self.agent_ids}")
+        print(f"[INFO] CRITICAL: robot_idx={self.robot_idx}, human_idx={self.human_idx}")
+        print(f"[INFO] Multi-agent update + single-agent control via select_actions")
         print(f"[INFO] Observation dims: {self.obs_dims} (total: {self.total_obs_dim})")
         print(f"[INFO] Action dims: {self.action_dims} (total: {self.total_action_dim})")
 
@@ -110,7 +120,11 @@ class MADDPG:
             )
 
     def select_actions(self, observations: Dict[str, torch.Tensor], active_envs: List[int], add_noise: bool = True) -> Dict[str, torch.Tensor]:
-        """Select actions only for active environments."""
+        """
+        Select actions with single/multi-agent control.
+        Single-agent mode: Skip human actions (they remain zero).
+        Multi-agent mode: Generate actions for all agents.
+        """
         obs_len = observations[self.agent_ids[0]].shape[0]
         assert obs_len == self.num_envs, f"Observation dimension mismatch: {obs_len} vs {self.num_envs}"
 
@@ -121,6 +135,10 @@ class MADDPG:
         
         for env_id in active_envs:
             for i, agent_id in enumerate(self.agent_ids):
+                # SINGLE AGENT CONTROL: Skip human agent (comment out this line to enable multi-agent)
+                if agent_id.lower() == "human":
+                    continue  # Human actions remain zero for single-agent training
+                
                 obs = observations[agent_id][env_id].cpu().numpy()
                 action = self.env_agents[env_id][agent_id].select_action(obs, add_noise)
                 actions[agent_id][env_id] = torch.from_numpy(action).to(self.device)
@@ -130,12 +148,13 @@ class MADDPG:
     def store_transitions_selective(self, obs: Dict[str, torch.Tensor], actions: Dict[str, torch.Tensor], 
                                    rewards: Dict[str, torch.Tensor], next_obs: Dict[str, torch.Tensor], 
                                    dones: Dict[str, torch.Tensor], active_envs: List[int]) -> None:
-        """Store transitions only for active environments."""
+        """Store transitions only for active environments with FIXED agent indexing."""
         for env_id in active_envs:
             if env_id in self.cleared_environments:
                 continue
 
-            is_done = dones[self.agent_ids[0]][env_id]
+            # FIXED: Use robot's done signal (or logical OR of both agents) - keep as tensor
+            is_done = dones[self.robot_id][env_id] | dones[self.human_id][env_id]
             
             env_obs = {aid: obs[aid][env_id] for aid in self.agent_ids}
             env_actions = {aid: actions[aid][env_id] for aid in self.agent_ids}
@@ -155,9 +174,8 @@ class MADDPG:
     
     def update(self, active_envs: List[int]) -> Dict[str, Any]:
         """
-        DUAL PROTECTION TRAINING UPDATE:
-        - First layer: Cleared buffers won't be used
-        - Second layer: Only train on active_envs list
+        Multi-agent update logic (both robot and human networks get updated).
+        Single-agent behavior is controlled by select_actions() skipping human actions.
         """
         self.training_steps += 1
         
@@ -167,7 +185,6 @@ class MADDPG:
             if (i not in self.cleared_environments)
             and self.env_replay_buffers[i].is_ready(self.min_buffer_size)
         ]
-
 
         if not active_and_ready_envs:
             return {"updates": 0, "training_steps": self.training_steps}
@@ -193,6 +210,9 @@ class MADDPG:
             'cleared_envs_count': len(self.cleared_environments)
         }
 
+        # WandB: Algorithm diagnostics collections
+        global_qs, global_qt, global_td = [], [], []
+        
         for env_id in active_and_ready_envs:
             # Additional safety check: skip if environment was cleared
             if env_id in self.cleared_environments and len(self.env_replay_buffers[env_id]) == 0:
@@ -210,33 +230,67 @@ class MADDPG:
                 next_obs_cat = torch.cat(next_obs, dim=-1)
                 act_cat = torch.cat(act, dim=-1)
                 
-                # Target actions
+                # Target actions for centralized training
                 with torch.no_grad():
                     next_actions_list = []
                     for j, agent_id_j in enumerate(self.agent_ids):
-                         next_mean, _ = self.env_agents[env_id][agent_id_j].actor_target(next_obs[j])
-                         next_actions_list.append(next_mean)
+                        next_mean, _ = self.env_agents[env_id][agent_id_j].actor_target(next_obs[j])
+                        next_actions_list.append(next_mean)
                     next_actions_cat = torch.cat(next_actions_list, dim=-1)
 
-                # Update each agent
+                # WandB: Calculate correlation BEFORE agent updates (to avoid variable overwriting)
+                robot_agent = self.env_agents[env_id][self.robot_id]
+                with torch.no_grad():
+                    q_current = robot_agent.critic(obs_cat, act_cat)
+                    q_target_next = robot_agent.critic_target(next_obs_cat, next_actions_cat)
+                    q_target_robot = rew[self.robot_idx] + self.gamma * q_target_next * (1 - done[self.robot_idx])
+                    td_error = (q_current - q_target_robot).detach()
+                
+                # Calculate Pearson correlation coefficient rho(Q, target)
+                qc = q_current.detach().view(-1)
+                qt = q_target_robot.detach().view(-1)
+                qc_centered = qc - qc.mean()
+                qt_centered = qt - qt.mean()
+                cov = (qc_centered * qt_centered).mean()
+                std_qc = qc_centered.square().mean().sqrt() + 1e-8
+                std_qt = qt_centered.square().mean().sqrt() + 1e-8
+                rho = (cov / (std_qc * std_qt)).clamp(min=-1.0, max=1.0)
+                
+                # Also calculate RMSE for alignment with critic_loss
+                rmse = ((q_current - q_target_robot).pow(2).mean()).sqrt()
+                
+                # Debug print for correlation
+                if env_id in (0, 1):
+                    print(f"[DEBUG] Env {env_id}: rho={rho.item():.4f}, rmse={rmse.item():.4f}")
+                
+                # Collect global diagnostics
+                global_qs.append(q_current.mean().item())
+                global_qt.append(q_target_robot.mean().item())
+                global_td.append(td_error.abs().mean().item())
+
+                # Update each agent (multi-agent training)
                 for i, agent_id in enumerate(self.agent_ids):
                     agent = self.env_agents[env_id][agent_id]
                     
-                    # Critic update
+                    # Each agent uses its own reward and done signal for TD target
+                    agent_reward = rew[i]
+                    agent_done = done[i]
+                    
+                    # Critic update - each agent learns its own value function
                     with torch.no_grad():
                         q_next = agent.critic_target(next_obs_cat, next_actions_cat)
-                        q_target = rew[i] + self.gamma * q_next * (1 - done[i])
+                        q_target = agent_reward + self.gamma * q_next * (1 - agent_done)
                     
                     critic_out = agent.update_critic(obs_cat, act_cat, q_target)
                     stats['critic_losses'].append(critic_out['critic_loss'])
                     
-                    # Actor update
+                    # Actor update - CTDE (Centralized Training, Decentralized Execution)
                     actions_pred_list = []
                     for j, agent_id_j in enumerate(self.agent_ids):
-                        if i == j:
+                        if i == j:  # Current agent uses its own actor
                             mean, _ = agent.actor(obs[j])
                             actions_pred_list.append(mean)
-                        else:
+                        else:  # Other agents use actual actions (detached)
                             actions_pred_list.append(act[j].detach())
                     actions_pred_cat = torch.cat(actions_pred_list, dim=-1)
 
@@ -244,14 +298,38 @@ class MADDPG:
                     actor_out = agent.update_actor(actor_loss)
                     stats['actor_losses'].append(actor_out['actor_loss'])
                     
-                # Soft update target networks
-                for agent in self.env_agents[env_id].values():
+                    # Soft update target networks for this agent
                     agent.soft_update()
+                
+                # WandB: Detailed diagnostics for env0 and env1
+                if env_id in (0, 1):
+                    stats[f"env{env_id}/algo/q_mean"] = q_current.mean().item()
+                    stats[f"env{env_id}/algo/q_std"] = q_current.std().item()
+                    stats[f"env{env_id}/algo/q_target_mean"] = q_target_robot.mean().item()
+                    stats[f"env{env_id}/algo/q_target_std"] = q_target_robot.std().item()
+                    stats[f"env{env_id}/algo/td_error_mean"] = td_error.abs().mean().item()
+                    stats[f"env{env_id}/algo/td_error_std"] = td_error.abs().std().item()
+                    stats[f"env{env_id}/algo/q_qt_corr"] = rho.item()
+                    stats[f"env{env_id}/algo/td_rmse"] = rmse.item()
+                    
+                    # WandB: Debug reward sampling for both agents
+                    stats[f"env{env_id}/algo/sample_reward_robot_mean"] = rew[self.robot_idx].mean().item()
+                    stats[f"env{env_id}/algo/sample_reward_human_mean"] = rew[self.human_idx].mean().item()
                     
                 stats['updates'] += 1
 
             except Exception as e:
                 print(f"[WARNING] Environment {env_id} update failed: {e}")
+        
+        # WandB: Global algorithm diagnostics
+        if global_qs:
+            stats["training/updates"] = stats.get("training/updates", 0) + 1
+            stats["algo/q_mean"] = float(np.mean(global_qs))
+            stats["algo/q_std"] = float(np.std(global_qs))
+            stats["algo/q_target_mean"] = float(np.mean(global_qt))
+            stats["algo/q_target_std"] = float(np.std(global_qt))
+            stats["algo/td_error_mean"] = float(np.mean(global_td))
+            stats["algo/td_error_std"] = float(np.std(global_td))
         
         return stats
     

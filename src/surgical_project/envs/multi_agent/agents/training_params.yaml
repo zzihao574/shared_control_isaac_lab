@@ -59,50 +59,56 @@ constraint_geometry:
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# Reward Parameters
+# Reward Parameters - MODIFIED FOR SINGLE AGENT TRAINING
 # ==============================================================================
 reward_parameters:
-  # Robot agent reward weights
+  # Robot agent reward weights - Only enable 3 core components
   robot_weights:
-    trajectory_tracking: 3.0
-    progress: 15.0
-    force_efficiency: 0.5
-    human_awareness: 0.3
-    potential_field: 4.0  # 新增：势场引导权重
+    trajectory_tracking: 6.0
+    progress: 20.0
+    potential_field: 5.0
+    # Disable other components for initial single-agent training
+    z_penalty: 0.0
+    completion_reward: 0.0
+    time_efficiency: 0.0
+    force_efficiency: 0.0
+    human_awareness: 0.0
     
-  # Human agent reward weights  
+  # Human agent reward weights - All disabled for single-agent phase
   human_weights:
-    trajectory_tracking: 3.0
-    progress: 15.0
-    force_efficiency: 0.4
-    robot_awareness: 0.25
-    potential_field: 4.0  # 新增：势场引导权重
+    trajectory_tracking: 0.0
+    progress: 0.0
+    potential_field: 0.0
+    z_penalty: 0.0
+    completion_reward: 0.0
+    time_efficiency: 0.0
+    force_efficiency: 0.0
+    robot_awareness: 0.0
     
   completion_threshold: 0.01          # Distance threshold for completion (meters)
 
-
 # ==============================================================================
-# Termination Conditions
+# Termination Conditions - MODIFIED FOR DIRECT TERMINATION
 # ==============================================================================
 termination_conditions:
-  z_below_zero: false                 # Terminate if Z position < 0
-  edge_collision: false               # Terminate on constraint edge collision
-  safety_distance_threshold: 0.001    # Safety distance termination threshold
-
+  z_below_zero: false                 # Disable Z termination for now
+  edge_collision: true                # Enable direct termination on obstacle entry
+  safety_distance_threshold: 0.0     # Direct termination when entering obstacle
+  
 # ==============================================================================
-# MADDPG Algorithm Configuration
+# MADDPG Algorithm Configuration - OPTIMIZED FOR STABILITY
 # ==============================================================================
 maddpg_config:
   lr_actor: 0.001                      # Actor learning rate
   lr_critic: 0.001                     # Critic learning rate
   gamma: 0.95                          # Discount factor
-  batch_size: 512                     # Training batch size
-  hidden_units: 128                   # Hidden layer units
+  batch_size: 512                     # Training batch size (increased for stability)
+  hidden_units: 512                   # Hidden layer units
   num_episodes: 600                   # Target episodes per environment
   update_interval: 100                # Updates every N steps
-  min_buffer_size: 1024               # Minimum buffer size to start training
-  tau: 0.005                           # Target network update rate
-  max_replay_buffer_len: 100000       # Maximum replay buffer size
+  min_buffer_size: 6000               # Minimum buffer size to start training
+  tau: 0.002                           # Target network update rate (slower for stability)
+  max_replay_buffer_len: 30000        # Maximum replay buffer size
 
 # ==============================================================================
 # Training Monitoring
