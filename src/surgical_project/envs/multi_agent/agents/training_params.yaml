@@ -96,7 +96,7 @@ termination_conditions:
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
   
 # ==============================================================================
-# MADDPG Algorithm Configuration - OPTIMIZED FOR STABILITY
+# MADDPG Algorithm Configuration - OPTIMIZED FOR STABILITY + GROUPED BUFFERS
 # ==============================================================================
 maddpg_config:
   lr_actor: 0.001                      # Actor learning rate
@@ -108,7 +108,8 @@ maddpg_config:
   update_interval: 100                # Updates every N steps
   min_buffer_size: 6000               # Minimum buffer size to start training
   tau: 0.002                           # Target network update rate (slower for stability)
-  max_replay_buffer_len: 30000        # Maximum replay buffer size
+  max_replay_buffer_len: 100000        # Maximum replay buffer size
+  buffer_group_size: 4                # NEW: Number of environments sharing one buffer
 
 # ==============================================================================
 # Training Monitoring

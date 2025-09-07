@@ -23,13 +23,8 @@ except ImportError:
     wandb = None
     print("[WARNING] WandB not available. Install with: pip install wandb")
 
-# Hardware monitoring
-try:
-    import GPUtil
-    HARDWARE_MONITORING_AVAILABLE = True
-except ImportError:
-    HARDWARE_MONITORING_AVAILABLE = False
-    print("[WARNING] Hardware monitoring not available. Install with: pip install psutil GPUtil")
+# Hardware monitoring - DISABLED for minimal logging
+HARDWARE_MONITORING_AVAILABLE = False
 
 
 class UnifiedProgressManager:
@@ -288,145 +283,47 @@ class WandBLogger:
             print(f"[WANDB] Initialization failed: {e}")
             self.enabled = False
 
-    def log_algorithm_statistics(self, global_step: int, algorithm_stats: Dict[str, Any]) -> None:
-        """Log algorithm diagnostics with enhanced Q-value and TD error monitoring."""
+    def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
+        """Log algorithm diagnostics with white-list filtering."""
         if not self.enabled or not algorithm_stats:
             return
+
+        # 如果包含milestone或performance数据，允许绕过training/updates检查
+        has_milestone_data = any(key.startswith(("milestone/", "performance/")) 
+                               for key in algorithm_stats.keys())
+        
+        # 仅当本轮真的发生了 update 时才记录，但milestone/performance数据例外
+        if not has_milestone_data and algorithm_stats.get("training/updates", 0) <= 0:
+            return
+
+        WHITELIST = {
+            # training (6)
+            "training/actor_loss_mean", "training/actor_loss_std",
+            "training/critic_loss_mean", "training/critic_loss_std",
+            "training/avg_buffer_size", "training/updates",
+            # algo global (5)
+            "algo/q_mean", "algo/q_std",
+            "algo/q_target_mean", "algo/q_target_std",
+            "algo/td_error_mean",
+            # env0 / env1 (8)
+            "env0/algo/q_mean", "env0/algo/q_std",
+            "env0/algo/q_target_mean", "env0/algo/q_target_std",
+            "env0/algo/td_error_mean", "env0/algo/q_qt_corr", "env0/algo/td_rmse",
+            "env1/algo/q_mean", "env1/algo/q_std",
+            "env1/algo/q_target_mean", "env1/algo/q_target_std",
+            "env1/algo/td_error_mean", "env1/algo/q_qt_corr", "env1/algo/td_rmse",
+            # performance & milestone (4) - 新增topk_count
+            "performance/topk_best_score", "performance/topk_avg_score",
+            "performance/topk_count",
+            "milestone/latest_completed",
+        }
+
         try:
-            log_data = {}
-            
-            # Existing loss and buffer metrics
-            if 'actor_losses' in algorithm_stats and algorithm_stats['actor_losses']:
-                log_data["training/actor_loss_mean"] = np.mean(algorithm_stats['actor_losses'])
-                log_data["training/actor_loss_std"] = np.std(algorithm_stats['actor_losses'])
-            if 'critic_losses' in algorithm_stats and algorithm_stats['critic_losses']:
-                log_data["training/critic_loss_mean"] = np.mean(algorithm_stats['critic_losses'])
-                log_data["training/critic_loss_std"] = np.std(algorithm_stats['critic_losses'])
-            if 'buffer_sizes' in algorithm_stats and algorithm_stats['buffer_sizes']:
-                log_data["training/avg_buffer_size"] = np.mean(algorithm_stats['buffer_sizes'])
-            
-            # Enhanced: Algorithm diagnostics including correlation
-            for key in [
-                "training/updates",
-                "algo/q_mean", "algo/q_std", "algo/q_target_mean", "algo/q_target_std",
-                "algo/td_error_mean", "algo/td_error_std",
-                "env0/algo/q_mean", "env0/algo/q_std", "env0/algo/q_target_mean", "env0/algo/q_target_std",
-                "env0/algo/td_error_mean", "env0/algo/td_error_std",
-                "env0/algo/q_qt_corr", "env0/algo/td_rmse",  # NEW: correlation and RMSE
-                "env0/algo/sample_reward_robot_mean", "env0/algo/sample_reward_human_mean",
-                "env1/algo/q_mean", "env1/algo/q_std", "env1/algo/q_target_mean", "env1/algo/q_target_std", 
-                "env1/algo/td_error_mean", "env1/algo/td_error_std",
-                "env1/algo/q_qt_corr", "env1/algo/td_rmse",  # NEW: correlation and RMSE
-                "env1/algo/sample_reward_robot_mean", "env1/algo/sample_reward_human_mean",
-            ]:
-                if key in algorithm_stats:
-                    log_data[key] = algorithm_stats[key]
-                    # Debug print for correlation keys specifically
-                    if 'q_qt_corr' in key or 'td_rmse' in key:
-                        print(f"[DEBUG WandB] Logging {key}: {algorithm_stats[key]}")
-            
-            # Hardware monitoring if available
-            if HARDWARE_MONITORING_AVAILABLE:
-                try:
-                    gpus = GPUtil.getGPUs()
-                    if gpus:
-                        log_data["hardware/gpu_utilization"] = gpus[0].load * 100
-                        log_data["hardware/gpu_memory"] = gpus[0].memoryUtil * 100
-                except:
-                    pass
-            
+            log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
             if log_data:
-                wandb.log(log_data, step=global_step)
-                
+                wandb.log(log_data, step=step)
         except Exception as e:
             print(f"[WANDB] Failed to log algorithm statistics: {e}")
-
-    def log_env_statistics(self, global_step: int, env_extras: Dict[str, Any]) -> None:
-        """Log environment statistics: rewards, behavior, and global aggregations."""
-        if not self.enabled:
-            return
-        try:
-            log_data = {}
-            
-            # Global reward components (3 core components)
-            rewards_data = env_extras.get("log", {}).get("rewards", {}).get("robot")
-            if rewards_data:
-                log_data["reward/global/trajectory_mean"] = float(rewards_data["trajectory_contrib"].mean().item())
-                log_data["reward/global/progress_mean"] = float(rewards_data["progress_contrib"].mean().item())
-                log_data["reward/global/potential_mean"] = float(rewards_data["potential_contrib"].mean().item())
-                log_data["reward/global/total_mean"] = float(rewards_data["total"].mean().item())
-            
-            # Global behavior metrics
-            log_extras = env_extras.get("log", {})
-            if "progress_ratio_mean" in log_extras:
-                log_data["env/global/progress_ratio_mean"] = float(log_extras["progress_ratio_mean"])
-            if "safety_distance_mean" in log_extras:
-                log_data["env/global/safety_distance_mean"] = float(log_extras["safety_distance_mean"])
-                log_data["env/global/safety_distance_min"] = float(log_extras.get("safety_distance_min", 0.0))
-            if "violations_rate" in log_extras:
-                log_data["env/global/violations_rate"] = float(log_extras["violations_rate"])
-            if "deviation_mean" in log_extras:
-                log_data["env/global/deviation_mean"] = float(log_extras["deviation_mean"])
-            
-            # Environment status
-            log_data["env/num_active_envs"] = env_extras.get("num_active_envs", 0)
-            
-            if log_data:
-                wandb.log(log_data, step=global_step)
-                
-        except Exception as e:
-            print(f"[WANDB] Failed to log environment statistics: {e}")
-
-    def log_episode_statistics(self, global_step: int, episode_data: Dict[int, Dict[str, Any]]) -> None:
-        """Log episode completion statistics with env0/env1 detail + global aggregation."""
-        if not self.enabled or not episode_data:
-            return
-        try:
-            log_data = {}
-            
-            # Separate detailed environments (0, 1) from others
-            env_ids = sorted(episode_data.keys())
-            detailed_envs = [env_id for env_id in env_ids if int(env_id) in (0, 1)][:2]
-            other_envs = [env_id for env_id in env_ids if env_id not in detailed_envs]
-            
-            # Detailed logging for env0 and env1
-            for env_id in detailed_envs:
-                episode_info = episode_data[env_id]
-                prefix = f"env{env_id}"
-                
-                for metric in ["episode_return", "episode_len", "collision", "success", 
-                             "min_safety_distance", "final_progress"]:
-                    if metric in episode_info:
-                        log_data[f"{prefix}/{metric}"] = float(episode_info[metric])
-            
-            # Aggregated statistics for other environments
-            if other_envs:
-                returns = [episode_data[env_id]["episode_return"] for env_id in other_envs 
-                          if "episode_return" in episode_data[env_id]]
-                lengths = [episode_data[env_id]["episode_len"] for env_id in other_envs 
-                          if "episode_len" in episode_data[env_id]]
-                collisions = [episode_data[env_id]["collision"] for env_id in other_envs 
-                             if "collision" in episode_data[env_id]]
-                successes = [episode_data[env_id]["success"] for env_id in other_envs 
-                            if "success" in episode_data[env_id]]
-                
-                if returns:
-                    log_data["episode/global/return_mean"] = float(np.mean(returns))
-                    log_data["episode/global/return_std"] = float(np.std(returns))
-                if lengths:
-                    log_data["episode/global/len_mean"] = float(np.mean(lengths))
-                if collisions:
-                    log_data["episode/global/collision_rate"] = float(np.mean(collisions))
-                if successes:
-                    log_data["episode/global/success_rate"] = float(np.mean(successes))
-                
-                log_data["env/num_completed_episodes"] = len(env_ids)
-            
-            if log_data:
-                wandb.log(log_data, step=global_step)
-                
-        except Exception as e:
-            print(f"[WANDB] Failed to log episode statistics: {e}")
 
     def update_performance_and_progress(self, global_step: int, episode_data: Dict[int, Dict[str, Any]], 
                                       total_envs: int) -> None:
@@ -448,7 +345,6 @@ class WandBLogger:
                 
                 log_data["performance/topk_best_score"] = float(topk_scores[0])
                 log_data["performance/topk_avg_score"] = float(np.mean(topk_scores))
-                log_data["performance/topk_worst_score"] = float(topk_scores[-1])
                 
                 # Trim leaderboard to prevent memory growth
                 if len(self._leaderboard) > self.topk * 10:
@@ -458,17 +354,9 @@ class WandBLogger:
             self._latest_completed += len(episode_data)
             log_data["milestone/latest_completed"] = self._latest_completed
             
-            # Progress tracking (success rate based)
-            successes = [episode_info.get("success", 0.0) for episode_info in episode_data.values()]
-            if successes:
-                success_rate = float(np.mean(successes))
-                # Calculate completion percentage (0-100%)
-                self._completed_percent = success_rate * 100.0
-                log_data["progress/completed_environments_percent"] = self._completed_percent
-                log_data["progress/current_success_rate"] = success_rate
-            
             if log_data:
-                wandb.log(log_data, step=global_step)
+                # Use same white-list filtering
+                self.log_algorithm_statistics(log_data, global_step)
                 
         except Exception as e:
             print(f"[WANDB] Failed to update performance and progress: {e}")
@@ -478,18 +366,16 @@ class WandBLogger:
         if not self.enabled:
             return
         try:
-            total_envs = progress_stats['active_count'] + progress_stats['completed_count']
-            completion_percent = (progress_stats['completed_count'] / total_envs) * 100 if total_envs > 0 else 0
-            log_data = {"progress/completed_environments_percent": completion_percent}
-            
+            perf_stats = {}
             if top_k_manager.top_models:
                 scores = [model[1] for model in top_k_manager.top_models]
-                log_data.update({
+                perf_stats.update({
                     "performance/topk_best_score": max(scores),
                     "performance/topk_avg_score": np.mean(scores),
                 })
             
-            wandb.log(log_data, step=global_step)
+            if perf_stats:
+                self.log_algorithm_statistics(perf_stats, global_step)
         except Exception as e:
             print(f"[WANDB] Failed to log simplified progress: {e}")
 
@@ -498,38 +384,12 @@ class WandBLogger:
         if not self.enabled or not performances:
             return
         try:
-            scores = [p['score'] for p in performances.values()]
-            completion_rate = sum(1 for p in performances.values() if p['completed']) / len(performances)
-            collision_rate = sum(1 for p in performances.values() if p['collision']) / len(performances)
-
-            # Log trend charts using the milestone number as the x-axis step
-            wandb.log({
-                "milestone/avg_score_trend": np.mean(scores),
-                "milestone/completion_rate_trend": completion_rate,
-                "milestone/collision_rate_trend": collision_rate,
-            }, step=milestone)
-
             # Log the latest completed milestone against the global step
-            wandb.log({"milestone/latest_completed": milestone}, step=global_step)
+            milestone_stats = {"milestone/latest_completed": milestone}
+            self.log_algorithm_statistics(milestone_stats, global_step)
             print(f"[WANDB] Logged trend for Milestone {milestone}")
         except Exception as e:
             print(f"[WANDB] Failed to log milestone trend: {e}")
-
-    def log_training_completion(self, total_steps: int, top_k_manager) -> None:
-        """Log final training results, including a score histogram."""
-        if not self.enabled:
-            return
-        try:
-            final_scores = [model[1] for model in top_k_manager.top_models] if top_k_manager.top_models else [0]
-            wandb.log({
-                "final/total_steps": total_steps,
-                "final/best_score": max(final_scores),
-                "final/avg_topk_score": np.mean(final_scores),
-            })
-            if len(final_scores) > 1:
-                wandb.log({"final/score_distribution": wandb.Histogram(final_scores)})
-        except Exception as e:
-            print(f"[WANDB] Failed to log training completion: {e}")
 
     def finalize_run(self) -> None:
         """Finalize WandB run."""
@@ -539,6 +399,7 @@ class WandBLogger:
                 print("[WANDB] Run finished")
             except Exception as e:
                 print(f"[WANDB] Failed to finish: {e}")
+
 
 class TrainingConfiguration:
     """Training configuration loader and parameter manager."""
