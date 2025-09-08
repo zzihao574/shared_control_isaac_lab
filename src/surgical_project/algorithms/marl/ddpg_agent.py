@@ -16,6 +16,7 @@ class DDPGAgent:
     - Soft target network updates
     - Force constraint compliance
     - Huber loss for improved critic stability
+    MODIFIED: Removed unused save_state() and load_state() methods
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
@@ -88,23 +89,3 @@ class DDPGAgent:
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-
-    def save_state(self) -> Dict[str, Any]:
-        """Save network and optimizer states."""
-        return {
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'actor_target_state_dict': self.actor_target.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-        }
-    
-    def load_state(self, state_dict: Dict[str, Any]) -> None:
-        """Load network and optimizer states."""
-        self.actor.load_state_dict(state_dict['actor_state_dict'])
-        self.critic.load_state_dict(state_dict['critic_state_dict'])
-        self.actor_target.load_state_dict(state_dict['actor_target_state_dict'])
-        self.critic_target.load_state_dict(state_dict['critic_target_state_dict'])
-        self.actor_optimizer.load_state_dict(state_dict['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(state_dict['critic_optimizer_state_dict'])

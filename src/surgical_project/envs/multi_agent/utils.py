@@ -2,7 +2,7 @@
 Environment utilities for surgical robot training.
 Contains constraint checking, trajectory management, and reward logging utilities.
 Modified to support active environment filtering and dual protection mechanism.
-MODIFIED: Added EpisodeAccumulator, updated RewardLogger and MilestoneManager for MetricsHub integration
+MODIFIED: Updated EpisodeAccumulator, simplified StepTracer, updated RewardLogger for MetricsHub integration
 """
 
 import torch
@@ -298,7 +298,7 @@ class EpisodeAccumulator:
 
 class StepTracer:
     """
-    Tracks per-episode lightweight stats with optional step-wise console prints.
+    MODIFIED: Simplified to only handle console printing, no episode caching or settlement.
     Enhanced with active environment filtering for dual protection mechanism.
     """
     
@@ -311,55 +311,9 @@ class StepTracer:
         self.enable_console_logging = enable_console_logging
         self.print_every_steps = print_every_steps
         self.max_envs_to_print = max_envs_to_print
-
-        # Per-environment current episode lightweight scalars
-        self.current_episode_basic = {
-            env_id: {
-                'steps': 0,
-                'total_reward': 0.0,
-                'final_progress': 0.0,
-                'completed': False,
-                'collision': False,
-                'min_safety_distance': float('inf'),
-            } for env_id in range(num_envs)
-        }
-
-        # Minimal cross-episode accumulation
-        self.basic_stats = {
-            env_id: {
-                'total_episodes': 0,
-                'completed_episodes': 0,
-                'collision_episodes': 0,
-            } for env_id in range(num_envs)
-        }
         
         # Track previously active environments to show one-time notifications
         self.previously_active_envs = set(range(num_envs))
-
-    def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
-        """Vectorized batch update for all environments to reduce CPU-GPU sync."""
-        robot_rewards = rewards.get("robot", torch.zeros(self.num_envs, device=self.device))
-        human_rewards = rewards.get("human", torch.zeros(self.num_envs, device=self.device))
-        
-        # Convert tensors to numpy for faster CPU operations
-        robot_rewards_np = robot_rewards.detach().cpu().numpy()
-        human_rewards_np = human_rewards.detach().cpu().numpy()
-        total_rewards_np = robot_rewards_np + human_rewards_np
-        progress_ratios_np = reward_components['progress_ratio'].detach().cpu().numpy()
-        safety_distances_np = safety_distances.detach().cpu().numpy()
-        completion_rewards_np = reward_components['completion_reward'].detach().cpu().numpy()
-        
-        # Batch update all environments
-        for env_id in range(self.num_envs):
-            basic = self.current_episode_basic[env_id]
-            basic['total_reward'] += total_rewards_np[env_id]
-            basic['final_progress'] = progress_ratios_np[env_id]
-            basic['min_safety_distance'] = min(basic['min_safety_distance'], safety_distances_np[env_id])
-            
-            if completion_rewards_np[env_id] > 0:
-                basic['completed'] = True
-            if safety_distances_np[env_id] < 0.001:
-                basic['collision'] = True
 
     def maybe_print_step(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, current_step: int, active_envs: Optional[List[int]] = None):
         """
@@ -457,33 +411,6 @@ class StepTracer:
             print(f"  HUMAN TOTAL: {human_total:.3f}")
             
             print(f"Combined Total Reward: {robot_total + human_total:.3f}")
-
-    def on_episode_end(self, env_ids):
-        """Roll up current-episode stats into basic_stats, then reset episode state."""
-        if not torch.is_tensor(env_ids):
-            env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
-
-        for env_id_t in env_ids:
-            env_id = env_id_t.item()
-            basic = self.current_episode_basic[env_id]
-
-            # Minimal accumulation
-            stats = self.basic_stats[env_id]
-            stats['total_episodes'] += 1
-            if basic['completed']:
-                stats['completed_episodes'] += 1
-            if basic['collision']:
-                stats['collision_episodes'] += 1
-
-            # Reset current episode data
-            self.current_episode_basic[env_id] = {
-                'steps': 0,
-                'total_reward': 0.0,
-                'final_progress': 0.0,
-                'completed': False,
-                'collision': False,
-                'min_safety_distance': float('inf'),
-            }
 
 
 class MilestoneManager:
@@ -705,13 +632,7 @@ class PerformanceEvaluator:
             final_score = np.mean(scores)
         else:
             # Fallback estimation from basic statistics
-            stats = basic_stats[env_id]
-            if stats['total_episodes'] > 0:
-                completion_rate = stats['completed_episodes'] / stats['total_episodes']
-                collision_rate = stats['collision_episodes'] / stats['total_episodes']
-                final_score = (completion_rate * 60) + (1 - collision_rate) * 40
-            else:
-                final_score = 0.0
+            final_score = 50.0  # Default score
         
         return np.clip(final_score, 0, 100)
 
@@ -732,10 +653,10 @@ class RewardLogger:
         # Progress manager reference (set by trainer)
         self.progress_manager = None
         
-        # NEW: Use EpisodeAccumulator instead of StepTracer for episode tracking
+        # NEW: Use EpisodeAccumulator as single source of truth for episode data
         self.episode_acc = EpisodeAccumulator(num_envs)
         
-        # Keep StepTracer for console logging only
+        # Keep StepTracer for console logging only (no episode state)
         self.step_tracer = StepTracer(
             num_envs, device,
             enable_console_logging=enable_console_logging,
@@ -753,9 +674,8 @@ class RewardLogger:
         # External episode counter reference (set by trainer)
         self.external_episode_counter = None
         
-        # Compatibility aliases
-        self.current_episode_basic = self.step_tracer.current_episode_basic
-        self.basic_stats = self.step_tracer.basic_stats
+        # Compatibility aliases - now point to EpisodeAccumulator
+        self.current_episode_basic = self.episode_acc.basic
     
     def set_progress_manager(self, pm):
         """Set progress manager reference."""
@@ -802,15 +722,9 @@ class RewardLogger:
     def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
         """MODIFIED: Update metrics and push to hub"""
         # Update step counts from progress manager
-        steps_batch_np = None
         if self.progress_manager:
             steps_batch = self.progress_manager.step_counts
-            # Write to StepTracer for console logging
-            for env_id in range(self.num_envs):
-                self.step_tracer.current_episode_basic[env_id]['steps'] = int(steps_batch[env_id].item())
-        
-        # Update StepTracer for console logging
-        self.step_tracer.update_step_metrics_batch(reward_components, safety_distances, rewards)
+            # No need to write to StepTracer since it no longer caches episode data
         
         # NEW: Update EpisodeAccumulator with batch data
         env_ids = list(range(self.num_envs))
@@ -896,16 +810,25 @@ class RewardLogger:
             
             # Get episode number from external counter
             current_episode_num = int(self.external_episode_counter[env_id]) if self.external_episode_counter is not None else 1
-            basic = self.step_tracer.current_episode_basic[env_id]
+            
+            # Create basic_data from accumulator for milestone processing
+            basic_data = {
+                'steps': summary['episode_len'],
+                'total_reward': summary['episode_return'],
+                'final_progress': summary['final_progress'],
+                'completed': summary['success'],
+                'collision': summary['collision'],
+                'min_safety_distance': summary['min_safety_distance']
+            }
             
             # Process milestones using hub data
             if self.milestone_manager and self.milestone_manager.is_milestone_episode(current_episode_num):
-                if basic['steps'] > 0:
-                    self.milestone_manager.process_milestone_completion(env_id, current_episode_num, basic)
+                if basic_data['steps'] > 0:
+                    self.milestone_manager.process_milestone_completion(env_id, current_episode_num, basic_data)
         
         # Reset accumulators
         self.episode_acc.reset_envs([e.item() for e in env_ids])
-        self.step_tracer.on_episode_end([e.item() for e in env_ids])
+        # StepTracer no longer needs episode reset since it doesn't cache episode data
     
     def get_final_evaluation(self, env_id: int, target_episodes: int) -> float:
         """Get final evaluation score for environment."""
@@ -914,7 +837,7 @@ class RewardLogger:
             
         return PerformanceEvaluator.get_final_evaluation(
             self.milestone_manager.milestone_performances,
-            self.step_tracer.basic_stats,
+            {},  # No longer using basic_stats from StepTracer
             env_id,
             target_episodes,
             self.milestone_manager.milestones
@@ -950,3 +873,9 @@ class RewardLogger:
     def milestones(self):
         """Access milestone list."""
         return self.milestone_manager.milestones if self.milestone_manager else []
+    
+    @property
+    def basic_stats(self):
+        """Compatibility property - returns empty dict since StepTracer no longer tracks cross-episode stats."""
+        return {env_id: {'total_episodes': 0, 'completed_episodes': 0, 'collision_episodes': 0} 
+                for env_id in range(self.num_envs)}

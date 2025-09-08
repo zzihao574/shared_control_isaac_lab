@@ -2,6 +2,7 @@
 Multi-environment parallel MADDPG algorithm.
 Grouped replay buffers with dual protection mechanism.
 Multi-agent update with single-agent control via select_actions.
+MODIFIED: Unified buffer clearing at single entry point in update()
 """
 
 import torch
@@ -21,6 +22,7 @@ class MADDPG:
     - Centralized training, decentralized execution
     - Dual protection: environment disabling + training filtering
     - Multi-agent update logic with single-agent control via select_actions
+    - MODIFIED: Unified buffer clearing at single entry point
     - Comprehensive debugging and monitoring
     """
     
@@ -235,12 +237,12 @@ class MADDPG:
     
     def update(self, active_envs: List[int]) -> Dict[str, Any]:
         """
-        Multi-agent update logic (both robot and human networks get updated).
+        MODIFIED: Multi-agent update logic with unified buffer clearing at entry point.
         Single-agent behavior is controlled by select_actions() skipping human actions.
         """
         self.training_steps += 1
         
-        # 在训练开头统一处理组buffer清空
+        # UNIFIED ENTRY POINT: Handle group buffer clearing at the beginning of update
         self._handle_group_buffer_clearing()
         
         # Only train on active environments with sufficient data
@@ -402,6 +404,8 @@ class MADDPG:
                 stats[f"env{eid}/algo/q_mean"] = float(q_e.mean().item())
                 stats[f"env{eid}/algo/q_std"] = float(q_e.std().item())
                 stats[f"env{eid}/algo/q_target_mean"] = float(qt_e.mean().item())
+                stats[f"env{eid}/algo/q_std"] = float(q_e.std().item())
+                stats[f"env{eid}/algo/q_target_mean"] = float(qt_e.mean().item())
                 stats[f"env{eid}/algo/q_target_std"] = float(qt_e.std().item())
                 stats[f"env{eid}/algo/td_error_mean"] = float(torch.abs(q_e - qt_e).mean().item())
                 stats[f"env{eid}/algo/q_qt_corr"] = _corrcoef_safe(q_e, qt_e)
@@ -415,7 +419,7 @@ class MADDPG:
         return stats
     
     def _handle_group_buffer_clearing(self) -> None:
-        """在update开头统一处理完成组的buffer清空"""
+        """UNIFIED ENTRY POINT: 在update开头统一处理完成组的buffer清空"""
         groups_to_clear = self.finished_groups - self.cleared_groups
         
         for group_id in groups_to_clear:

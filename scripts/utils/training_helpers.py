@@ -3,7 +3,7 @@
 """
 Training helper utilities for MADDPG multi-environment parallel training.
 Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
-MODIFIED: Added MetricsHub for unified data pipeline
+MODIFIED: Added MetricsHub for unified data pipeline, removed unused WandB methods
 """
 
 import argparse
@@ -302,7 +302,7 @@ class CheckpointManager:
 class WandBLogger:
     """
     Enhanced WandB logger with layered, frequency-based monitoring system.
-    MODIFIED: Added attach_metrics_hub method for unified data pipeline
+    MODIFIED: Removed unused methods, streamlined to use only MetricsHub pipeline
     """
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
@@ -346,7 +346,7 @@ class WandBLogger:
             self.enabled = False
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
-        """NEW METHOD: Attach to MetricsHub for unified data pipeline"""
+        """Attach to MetricsHub for unified data pipeline"""
         if not self.enabled:
             return
 
@@ -418,72 +418,6 @@ class WandBLogger:
                 wandb.log(log_data, step=step)
         except Exception as e:
             print(f"[WANDB] Failed to log algorithm statistics: {e}")
-
-    def update_performance_and_progress(self, global_step: int, episode_data: Dict[int, Dict[str, Any]], 
-                                      total_envs: int) -> None:
-        """Update performance leaderboard and training progress metrics."""
-        if not self.enabled or not episode_data:
-            return
-        try:
-            log_data = {}
-            
-            # Collect scores from completed episodes
-            for env_id, episode_info in episode_data.items():
-                score = episode_info.get("episode_return", 0.0)
-                self._leaderboard.append(score)
-            
-            # Maintain Top-K performance tracking
-            if self._leaderboard:
-                sorted_scores = sorted(self._leaderboard, reverse=True)
-                topk_scores = sorted_scores[:self.topk]
-                
-                log_data["performance/topk_best_score"] = float(topk_scores[0])
-                log_data["performance/topk_avg_score"] = float(np.mean(topk_scores))
-                
-                # Trim leaderboard to prevent memory growth
-                if len(self._leaderboard) > self.topk * 10:
-                    self._leaderboard = sorted_scores[:self.topk * 5]
-            
-            # Milestone tracking (cumulative episodes completed)
-            self._latest_completed += len(episode_data)
-            log_data["milestone/latest_completed"] = self._latest_completed
-            
-            if log_data:
-                # Use same white-list filtering
-                self.log_algorithm_statistics(log_data, global_step)
-                
-        except Exception as e:
-            print(f"[WANDB] Failed to update performance and progress: {e}")
-
-    def log_training_progress(self, global_step: int, progress_stats: Dict[str, Any], top_k_manager) -> None:
-        """Log simplified, high-level training progress (kept for compatibility)."""
-        if not self.enabled:
-            return
-        try:
-            perf_stats = {}
-            if top_k_manager.top_models:
-                scores = [model[1] for model in top_k_manager.top_models]
-                perf_stats.update({
-                    "performance/topk_best_score": max(scores),
-                    "performance/topk_avg_score": np.mean(scores),
-                })
-            
-            if perf_stats:
-                self.log_algorithm_statistics(perf_stats, global_step)
-        except Exception as e:
-            print(f"[WANDB] Failed to log simplified progress: {e}")
-
-    def log_milestone_completion(self, global_step: int, milestone: int, performances: Dict[int, Dict[str, Any]]) -> None:
-        """Log milestone statistics as a single point in a trend line."""
-        if not self.enabled or not performances:
-            return
-        try:
-            # Log the latest completed milestone against the global step
-            milestone_stats = {"milestone/latest_completed": milestone}
-            self.log_algorithm_statistics(milestone_stats, global_step)
-            print(f"[WANDB] Logged trend for Milestone {milestone}")
-        except Exception as e:
-            print(f"[WANDB] Failed to log milestone trend: {e}")
 
     def finalize_run(self) -> None:
         """Finalize WandB run."""

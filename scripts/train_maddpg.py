@@ -3,7 +3,7 @@
 """
 Surgical Robot MADDPG Multi-Environment Parallel Training
 Unified dimension management with grouped replay buffers and dual protection mechanism
-MODIFIED: Added MetricsHub for unified data pipeline
+MODIFIED: Added MetricsHub for unified data pipeline, removed WandB direct logging
 """
 
 import sys
@@ -44,6 +44,15 @@ class MADDPGTrainer:
         self._setup_training_components()
         self.global_step = 0
 
+    def _get_num_envs_from_env(self):
+        """Extract num_envs from environment through wrappers."""
+        actual_env = getattr(self.env, 'unwrapped', self.env)
+        if hasattr(actual_env, 'num_envs'): 
+            return actual_env.num_envs
+        if hasattr(actual_env, '_num_envs'): 
+            return actual_env._num_envs
+        return self.args.num_envs
+
     def _setup_environment(self):
         """Initialize environment with proper seeding and configuration."""
         torch.manual_seed(self.args.seed)
@@ -80,15 +89,8 @@ class MADDPGTrainer:
         from surgical_project.algorithms.marl.maddpg import MADDPG
         device = self.config.get_compute_device()
         
-        # Get num_envs from actual environment through wrappers
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        if hasattr(actual_env, 'num_envs'):
-            num_envs = actual_env.num_envs
-        elif hasattr(actual_env, '_num_envs'):
-            num_envs = actual_env._num_envs
-        else:
-            # Fallback to command line argument
-            num_envs = self.args.num_envs
+        # Use unified num_envs extraction
+        num_envs = self._get_num_envs_from_env()
 
         self.maddpg_trainer = MADDPG(
             num_envs=num_envs,
@@ -107,7 +109,7 @@ class MADDPGTrainer:
             device=device
         )
         
-        # NOW set progress manager in reward logger (after it's created)
+        # Set progress manager in reward logger (single call)
         reward_logger = self._get_reward_logger()
         if reward_logger:
             reward_logger.set_progress_manager(self.progress)
@@ -121,17 +123,18 @@ class MADDPGTrainer:
         self.maddpg_trainer.progress = self.progress
         self.maddpg_trainer.max_episodes = self.args.max_episodes
         
-        # Set up training logger reference for progress manager
+        # Set up training logger reference for progress manager (single call)
         self.progress.training_logger = self.logger
         
-        # DUAL PROTECTION SETUP: Register buffer clearing callback (First layer protection)
+        # DUAL PROTECTION SETUP: Register buffer clearing callback
         self.progress.register_closure_callback(self.maddpg_trainer.disable_environment)
         print("[PROTECTION] Grouped buffer dual protection mechanism activated:")
         print("  - First layer: Immediate environment disabling on closure")
         print("  - Second layer: Training filtering by active environments only")
         print("  - Group buffer management: Shared buffers cleared only when group completes")
         
-        # Pass to env and logger - handle wrapper case
+        # Pass to env (single call)
+        actual_env = getattr(self.env, 'unwrapped', self.env)
         if hasattr(actual_env, 'set_progress_manager'):
             actual_env.set_progress_manager(self.progress)
         else:
@@ -185,22 +188,15 @@ class MADDPGTrainer:
             
             print(f"[INFO] Filtered milestones for max_episodes={self.args.max_episodes}: {filtered_milestones}")
             
-            # Get num_envs from actual environment through wrappers
-            actual_env = getattr(self.env, 'unwrapped', self.env)
-            if hasattr(actual_env, 'num_envs'):
-                num_envs = actual_env.num_envs
-            elif hasattr(actual_env, '_num_envs'):
-                num_envs = actual_env._num_envs
-            else:
-                # Fallback to command line argument
-                num_envs = self.args.num_envs
+            # Use unified num_envs extraction
+            num_envs = self._get_num_envs_from_env()
             
             # NEW: Pass MetricsHub to RewardLogger
             from surgical_project.envs.multi_agent.utils import RewardLogger
             
             # Create new logger with extracted num_envs
             new_logger = RewardLogger(
-                num_envs=num_envs,  # Use the extracted variable
+                num_envs=num_envs,
                 device=self.config.get_compute_device(),
                 metrics_hub=self.metrics,  # NEW: Pass hub
                 enable_console_logging=self.config.params['logging']['enable_console_logging'],
@@ -209,6 +205,7 @@ class MADDPGTrainer:
             # NOTE: Don't set progress manager here, it will be set later in _setup_training_components
             
             # Set the new logger in the appropriate place
+            actual_env = getattr(self.env, 'unwrapped', self.env)
             if hasattr(self.env, 'reward_logger'):
                 self.env.reward_logger = new_logger
             elif hasattr(actual_env, 'reward_logger'):
@@ -348,8 +345,7 @@ class MADDPGTrainer:
                 if self.global_step > 0 and self.global_step % 2000 == 0:
                     stats = self.progress.get_progress_statistics()
                     self.logger.log_training_progress(self.global_step, stats, self.top_k_manager)
-                    # Keep existing WandB progress logging for compatibility
-                    self.wandb_logger.log_training_progress(self.global_step, stats, self.top_k_manager)
+                    # REMOVED: Direct WandB logging call, now handled by MetricsHub
                 
                 # NEW: Push buffer status to hub for console monitoring
                 if self.global_step > 0 and self.global_step % 10000 == 0:
