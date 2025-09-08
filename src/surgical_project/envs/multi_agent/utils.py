@@ -2,6 +2,7 @@
 Environment utilities for surgical robot training.
 Contains constraint checking, trajectory management, and reward logging utilities.
 Modified to support active environment filtering and dual protection mechanism.
+MODIFIED: Added EpisodeAccumulator, updated RewardLogger and MilestoneManager for MetricsHub integration
 """
 
 import torch
@@ -216,6 +217,85 @@ class TrajectoryManager:
         }
 
 
+# === NEW CLASS: EpisodeAccumulator ===
+class EpisodeAccumulator:
+    """Per-episode accumulator per env (no printing, no cross-episode stats)."""
+    def __init__(self, num_envs: int):
+        self.num_envs = num_envs
+        self.reset_all()
+
+    def reset_all(self):
+        self.basic = [{
+            'steps': 0,
+            'total_reward': 0.0,
+            'final_progress': 0.0,
+            'completed': False,
+            'collision': False,
+            'min_safety_distance': float('inf'),
+            'deviation_sum': 0.0,
+        } for _ in range(self.num_envs)]
+
+    def update_batch(self, env_ids, reward_components, safety_distance, deviation, progress):
+        for env_id in env_ids:
+            b = self.basic[env_id]
+            b['steps'] += 1
+            
+            # Handle total reward from reward_components if available
+            if isinstance(reward_components, dict) and 'total' in reward_components:
+                if torch.is_tensor(reward_components['total']):
+                    b['total_reward'] += float(reward_components['total'][env_id].item())
+                else:
+                    b['total_reward'] += float(reward_components['total'][env_id])
+            
+            if progress is not None:
+                if torch.is_tensor(progress):
+                    b['final_progress'] = float(progress[env_id].item())
+                else:
+                    b['final_progress'] = float(progress[env_id])
+            
+            if deviation is not None:
+                if torch.is_tensor(deviation):
+                    b['deviation_sum'] += float(deviation[env_id].item())
+                else:
+                    b['deviation_sum'] += float(deviation[env_id])
+            
+            if safety_distance is not None:
+                if torch.is_tensor(safety_distance):
+                    sd = float(safety_distance[env_id].item())
+                else:
+                    sd = float(safety_distance[env_id])
+                if sd < b['min_safety_distance']:
+                    b['min_safety_distance'] = sd
+
+    def mark_completed(self, env_id, completed: bool):
+        self.basic[env_id]['completed'] = bool(completed)
+
+    def mark_collision(self, env_id, collided: bool):
+        self.basic[env_id]['collision'] = bool(collided)
+
+    def summary(self, env_id: int) -> dict:
+        b = self.basic[env_id]
+        steps = max(1, b['steps'])
+        avg_dev = b['deviation_sum'] / steps
+        return {
+            'episode_len': b['steps'],
+            'episode_return': b['total_reward'],
+            'final_progress': b['final_progress'],
+            'success': b['completed'],
+            'collision': b['collision'],
+            'min_safety_distance': (0.0 if b['min_safety_distance'] == float('inf') else b['min_safety_distance']),
+            'avg_deviation': avg_dev,
+        }
+
+    def reset_envs(self, env_ids):
+        for env_id in env_ids:
+            self.basic[env_id] = {
+                'steps': 0, 'total_reward': 0.0, 'final_progress': 0.0,
+                'completed': False, 'collision': False,
+                'min_safety_distance': float('inf'), 'deviation_sum': 0.0,
+            }
+
+
 class StepTracer:
     """
     Tracks per-episode lightweight stats with optional step-wise console prints.
@@ -282,101 +362,101 @@ class StepTracer:
                 basic['collision'] = True
 
     def maybe_print_step(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, current_step: int, active_envs: Optional[List[int]] = None):
-            """
-            Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
-            Enhanced with active environment filtering for dual protection mechanism.
-            Shows weighted contributions to match actual training.
-            """
-            if not self.enable_console_logging:
-                return
-            if current_step % self.print_every_steps != 0:
-                return
+        """
+        Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
+        Enhanced with active environment filtering for dual protection mechanism.
+        Shows weighted contributions to match actual training.
+        """
+        if not self.enable_console_logging:
+            return
+        if current_step % self.print_every_steps != 0:
+            return
 
-            # Show notifications for newly inactive environments (one time only)
-            if active_envs is not None:
-                current_active_set = set(active_envs)
-                newly_inactive = self.previously_active_envs - current_active_set
-                if newly_inactive:
-                    print(f"\n[INACTIVE] Environments {sorted(newly_inactive)} are no longer active (dual protection)")
-                self.previously_active_envs = current_active_set
+        # Show notifications for newly inactive environments (one time only)
+        if active_envs is not None:
+            current_active_set = set(active_envs)
+            newly_inactive = self.previously_active_envs - current_active_set
+            if newly_inactive:
+                print(f"\n[INACTIVE] Environments {sorted(newly_inactive)} are no longer active (dual protection)")
+            self.previously_active_envs = current_active_set
 
-            # Only show first N active environments to avoid screen flooding
-            print(f"\n{'='*80}")
-            print(f"STEP {current_step} - Environment State (Active Environments Only)")
-            print(f"{'='*80}")
+        # Only show first N active environments to avoid screen flooding
+        print(f"\n{'='*80}")
+        print(f"STEP {current_step} - Environment State (Active Environments Only)")
+        print(f"{'='*80}")
+        
+        if active_envs is None:
+            # Fallback: print all environments
+            ids_to_print = range(min(self.max_envs_to_print, env.num_envs))
+            print("(Fallback mode: showing all environments)")
+        else:
+            ids_to_print = active_envs[:self.max_envs_to_print]
+            print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
+        
+        for env_id in ids_to_print:
+            print(f"\n--- [ACTIVE] Environment {env_id} ---")
             
-            if active_envs is None:
-                # Fallback: print all environments
-                ids_to_print = range(min(self.max_envs_to_print, env.num_envs))
-                print("(Fallback mode: showing all environments)")
-            else:
-                ids_to_print = active_envs[:self.max_envs_to_print]
-                print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
+            # Position information
+            stylus_pos = env.stylus_pos_t1[env_id]
+            print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
             
-            for env_id in ids_to_print:
-                print(f"\n--- [ACTIVE] Environment {env_id} ---")
-                
-                # Position information
-                stylus_pos = env.stylus_pos_t1[env_id]
-                print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
-                
-                # Trajectory metrics
-                deviation = env.reward_components['deviation'][env_id].item()
-                progress = env.reward_components['progress_ratio'][env_id].item()
-                distance_to_final = env.reward_components['distance_to_final'][env_id].item()
-                print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
-                
-                # Constraint status
-                safety_distance = env.safety_distances_t1[env_id].item()
-                is_overlapping = env.is_violating_t1[env_id].item()
-                normals = env.normal_t1[env_id]
-                print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
-                
-                # Force magnitudes
-                robot_force = env.robot_forces_t[env_id]
-                human_force = env.human_forces_t[env_id]
-                robot_force_mag = torch.norm(robot_force).item()
-                human_force_mag = torch.norm(human_force).item()
-                print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
-                
-                # ENHANCED: Detailed reward breakdown with weighted contributions
-                print(f"\nReward Breakdown (Weighted Contributions):")
-                print(f"Robot Agent:")
-                traj_r = env.reward_components['trajectory_reward'][env_id].item()
-                prog_r = env.reward_components['progress_reward'][env_id].item()
-                potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
-                robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
-                human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
-                z_pen = env.reward_components['z_penalty'][env_id].item()
-                comp_r = env.reward_components['completion_reward'][env_id].item()
-                time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
-                
-                print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
-                print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
-                print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
-                print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
-                print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
-                # ENHANCED: Show weighted global components
-                print(f"  Z Penalty: {z_pen:.3f} * {robot_weights.get('z_penalty',0.0):.2f} = {z_pen * robot_weights.get('z_penalty',0.0):.3f}")
-                print(f"  Completion: {comp_r:.3f} * {robot_weights.get('completion_reward',0.0):.2f} = {comp_r * robot_weights.get('completion_reward',0.0):.3f}")
-                print(f"  Time Efficiency: {time_eff_r:.3f} * {robot_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * robot_weights.get('time_efficiency',0.0):.3f}")
-                robot_total = rewards["robot"][env_id].item()
-                print(f"  ROBOT TOTAL: {robot_total:.3f}")
-                
-                print(f"Human Agent:")
-                print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
-                print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
-                print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
-                print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
-                print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
-                # ENHANCED: Show weighted global components
-                print(f"  Z Penalty: {z_pen:.3f} * {human_weights.get('z_penalty',0.0):.2f} = {z_pen * human_weights.get('z_penalty',0.0):.3f}")
-                print(f"  Completion: {comp_r:.3f} * {human_weights.get('completion_reward',0.0):.2f} = {comp_r * human_weights.get('completion_reward',0.0):.3f}")
-                print(f"  Time Efficiency: {time_eff_r:.3f} * {human_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * human_weights.get('time_efficiency',0.0):.3f}")
-                human_total = rewards["human"][env_id].item()
-                print(f"  HUMAN TOTAL: {human_total:.3f}")
-                
-                print(f"Combined Total Reward: {robot_total + human_total:.3f}")
+            # Trajectory metrics
+            deviation = env.reward_components['deviation'][env_id].item()
+            progress = env.reward_components['progress_ratio'][env_id].item()
+            distance_to_final = env.reward_components['distance_to_final'][env_id].item()
+            print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
+            
+            # Constraint status
+            safety_distance = env.safety_distances_t1[env_id].item()
+            is_overlapping = env.is_violating_t1[env_id].item()
+            normals = env.normal_t1[env_id]
+            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
+            
+            # Force magnitudes
+            robot_force = env.robot_forces_t[env_id]
+            human_force = env.human_forces_t[env_id]
+            robot_force_mag = torch.norm(robot_force).item()
+            human_force_mag = torch.norm(human_force).item()
+            print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
+            
+            # ENHANCED: Detailed reward breakdown with weighted contributions
+            print(f"\nReward Breakdown (Weighted Contributions):")
+            print(f"Robot Agent:")
+            traj_r = env.reward_components['trajectory_reward'][env_id].item()
+            prog_r = env.reward_components['progress_reward'][env_id].item()
+            potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
+            robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
+            human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
+            z_pen = env.reward_components['z_penalty'][env_id].item()
+            comp_r = env.reward_components['completion_reward'][env_id].item()
+            time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
+            
+            print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
+            print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
+            print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
+            print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
+            print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
+            # ENHANCED: Show weighted global components
+            print(f"  Z Penalty: {z_pen:.3f} * {robot_weights.get('z_penalty',0.0):.2f} = {z_pen * robot_weights.get('z_penalty',0.0):.3f}")
+            print(f"  Completion: {comp_r:.3f} * {robot_weights.get('completion_reward',0.0):.2f} = {comp_r * robot_weights.get('completion_reward',0.0):.3f}")
+            print(f"  Time Efficiency: {time_eff_r:.3f} * {robot_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * robot_weights.get('time_efficiency',0.0):.3f}")
+            robot_total = rewards["robot"][env_id].item()
+            print(f"  ROBOT TOTAL: {robot_total:.3f}")
+            
+            print(f"Human Agent:")
+            print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
+            print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
+            print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
+            print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
+            print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
+            # ENHANCED: Show weighted global components
+            print(f"  Z Penalty: {z_pen:.3f} * {human_weights.get('z_penalty',0.0):.2f} = {z_pen * human_weights.get('z_penalty',0.0):.3f}")
+            print(f"  Completion: {comp_r:.3f} * {human_weights.get('completion_reward',0.0):.2f} = {comp_r * human_weights.get('completion_reward',0.0):.3f}")
+            print(f"  Time Efficiency: {time_eff_r:.3f} * {human_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * human_weights.get('time_efficiency',0.0):.3f}")
+            human_total = rewards["human"][env_id].item()
+            print(f"  HUMAN TOTAL: {human_total:.3f}")
+            
+            print(f"Combined Total Reward: {robot_total + human_total:.3f}")
 
     def on_episode_end(self, env_ids):
         """Roll up current-episode stats into basic_stats, then reset episode state."""
@@ -407,7 +487,7 @@ class StepTracer:
 
 
 class MilestoneManager:
-    """Manages milestone episode detection and performance tracking."""
+    """MODIFIED: Manages milestone episode detection and performance tracking using MetricsHub."""
     
     def __init__(self, num_envs: int, milestones: List[int]):
         self.num_envs = num_envs
@@ -416,8 +496,11 @@ class MilestoneManager:
         self.milestone_completion_status = {m: {'completed_envs': 0, 'reported': False} for m in milestones}
         self.topk_update_callback = None
         
-        # Detailed step data (recorded only at milestone episodes)
-        self.milestone_detailed_data = {}
+        # NEW: Reference to MetricsHub (will be injected)
+        self.metrics_hub = None
+        
+        # NEW: Reference to progress manager (will be injected)
+        self.progress_manager = None
     
     def set_topk_update_callback(self, callback_fn):
         """Set callback function triggered at milestone completion."""
@@ -427,42 +510,40 @@ class MilestoneManager:
         """Check if episode number is a milestone."""
         return episode_num in self.milestones
     
-    def record_milestone_detailed_step(self, env_id: int, episode_num: int, reward_components: Dict, 
-                                     rewards: Dict, safety_distance: torch.Tensor):
-        """Record detailed step data for milestone episodes."""
-        if episode_num not in self.milestone_detailed_data:
-            self.milestone_detailed_data[episode_num] = {}
+    def _compute_score_from_episode(self, ep: dict) -> float:
+        """NEW: Calculate score based on episode summary instead of detailed data"""
+        # completion 40, progress 20, trajectory 20, safety 20
+        score = 0.0
+        score += 40.0 if ep.get('success', False) else 0.0
+        score += 20.0 * max(0.0, min(1.0, float(ep.get('final_progress', 0.0))))
         
-        if env_id not in self.milestone_detailed_data[episode_num]:
-            self.milestone_detailed_data[episode_num][env_id] = {
-                'rewards': [],
-                'deviations': [],
-                'safety_distances': [],
-                'progress_ratios': []
-            }
+        # Use avg_deviation from episode summary
+        dev = float(ep.get('avg_deviation', 0.0))
+        traj_term = max(0.0, min(1.0, (0.05 - dev) / 0.04))  # Same formula as before
+        score += 20.0 * traj_term
         
-        robot_reward = rewards["robot"][env_id].item() if "robot" in rewards else 0
-        human_reward = rewards["human"][env_id].item() if "human" in rewards else 0
-        total_reward = robot_reward + human_reward
+        msd = float(ep.get('min_safety_distance', 0.0))
+        safety_term = max(0.0, min(1.0, msd / 0.02))
+        score += 20.0 * safety_term
         
-        detailed = self.milestone_detailed_data[episode_num][env_id]
-        detailed['rewards'].append(total_reward)
-        detailed['deviations'].append(reward_components['deviation'][env_id].item())
-        detailed['safety_distances'].append(safety_distance[env_id].item())
-        detailed['progress_ratios'].append(reward_components['progress_ratio'][env_id].item())
+        return max(0.0, min(100.0, score))
     
     def process_milestone_completion(self, env_id: int, episode_num: int, basic_data: Dict):
-        """Process milestone episode completion and calculate performance."""
+        """MODIFIED: Process milestone using episode summary from MetricsHub"""
         if not self.is_milestone_episode(episode_num):
             return
         
-        # Get detailed data if available
-        detailed_data = None
-        if episode_num in self.milestone_detailed_data and env_id in self.milestone_detailed_data[episode_num]:
-            detailed_data = self.milestone_detailed_data[episode_num][env_id]
-        
-        # Calculate performance score
-        score = PerformanceEvaluator.calculate_performance_score(basic_data, detailed_data)
+        # Get episode summary from MetricsHub if available
+        if self.metrics_hub:
+            ep_summary = self.metrics_hub.get_episode_state(env_id)
+            if ep_summary:
+                score = self._compute_score_from_episode(ep_summary)
+            else:
+                # Fallback: estimate from basic_data
+                score = PerformanceEvaluator.calculate_performance_score(basic_data, None)
+        else:
+            # Fallback: use old method
+            score = PerformanceEvaluator.calculate_performance_score(basic_data, None)
         
         # Log milestone completion
         print(f"[MILESTONE {episode_num}] Env {env_id}: "
@@ -487,7 +568,7 @@ class MilestoneManager:
         self._check_milestone_completion(episode_num)
     
     def _check_milestone_completion(self, milestone: int):
-        """Check if milestone is complete across all environments."""
+        """MODIFIED: Check if milestone is complete and push to MetricsHub"""
         status = self.milestone_completion_status[milestone]
         
         # Trigger callback when all environments reach milestone
@@ -496,13 +577,28 @@ class MilestoneManager:
                 print(f"[CALLBACK] Triggering Top-K update for milestone {milestone}...")
                 self.topk_update_callback(milestone)
 
+            # Push milestone summary to MetricsHub
+            if self.metrics_hub:
+                scores = {}
+                for env_id in range(self.num_envs):
+                    if env_id in self.milestone_performances[milestone]:
+                        scores[env_id] = self.milestone_performances[milestone][env_id]['score']
+                
+                if self.progress_manager:
+                    step = getattr(self.progress_manager, 'global_step', 0)
+                else:
+                    step = 0
+                
+                self.metrics_hub.push_milestone_summary(milestone, {
+                    "scores": scores,
+                    "completed_envs": len(scores),
+                    "total_envs": self.num_envs,
+                    "step": step,
+                    "milestone": milestone
+                })
+
             self._report_milestone_summary(milestone)
             status['reported'] = True
-            
-            # Clear milestone detailed data cache after processing
-            if milestone in self.milestone_detailed_data:
-                del self.milestone_detailed_data[milestone]
-                print(f"[CLEANUP] Cleared detailed data cache for milestone {milestone}")
     
     def _report_milestone_summary(self, milestone: int):
         """Generate milestone completion summary report."""
@@ -622,37 +718,50 @@ class PerformanceEvaluator:
 
 class RewardLogger:
     """
-    Optimized reward logger using external episode counter for tracking.
-    Enhanced with active environment support for dual protection mechanism.
+    MODIFIED: Optimized reward logger using MetricsHub for data pipeline
     """
 
-    def __init__(self, num_envs: int, device: torch.device):
+    def __init__(self, num_envs: int, device: torch.device, metrics_hub=None, 
+                 enable_console_logging: bool = False, milestones: List[int] = None):
         self.num_envs = num_envs
         self.device = device
+        
+        # NEW: MetricsHub reference
+        self.metrics_hub = metrics_hub
         
         # Progress manager reference (set by trainer)
         self.progress_manager = None
         
-        # Initialize StepTracer with active environment filtering support
+        # NEW: Use EpisodeAccumulator instead of StepTracer for episode tracking
+        self.episode_acc = EpisodeAccumulator(num_envs)
+        
+        # Keep StepTracer for console logging only
         self.step_tracer = StepTracer(
             num_envs, device,
-            enable_console_logging=False,   # Default off, will be overridden in configure_logging
+            enable_console_logging=enable_console_logging,
             print_every_steps=10,
             max_envs_to_print=2
         )
         
-        self.milestone_manager = None  # Set in configure_logging
+        # Initialize milestone manager with hub reference
+        if milestones:
+            self.milestone_manager = MilestoneManager(num_envs, milestones)
+            self.milestone_manager.metrics_hub = metrics_hub
+        else:
+            self.milestone_manager = None
         
         # External episode counter reference (set by trainer)
         self.external_episode_counter = None
         
-        # Compatibility aliases (maintain external interface compatibility)
+        # Compatibility aliases
         self.current_episode_basic = self.step_tracer.current_episode_basic
         self.basic_stats = self.step_tracer.basic_stats
     
     def set_progress_manager(self, pm):
         """Set progress manager reference."""
         self.progress_manager = pm
+        if self.milestone_manager:
+            self.milestone_manager.progress_manager = pm
     
     def set_episode_counter(self, counter_reference):
         """Set reference to external episode counter."""
@@ -674,8 +783,10 @@ class RewardLogger:
             milestones = [2, 10, 20, 30, 50, 100]
             print(f"[INFO] Using default milestones: {milestones}")
         
-        # Initialize milestone manager
-        self.milestone_manager = MilestoneManager(self.num_envs, milestones)
+        # Initialize milestone manager if not already done
+        if not self.milestone_manager:
+            self.milestone_manager = MilestoneManager(self.num_envs, milestones)
+            self.milestone_manager.metrics_hub = self.metrics_hub
         
         # Override StepTracer's console logging setting
         self.step_tracer.enable_console_logging = enable_console_logging
@@ -689,32 +800,71 @@ class RewardLogger:
             self.milestone_manager.set_topk_update_callback(callback_fn)
     
     def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
-        """Vectorized batch update for all environments to reduce CPU-GPU sync."""
-        # Batch read step counts from progress manager
+        """MODIFIED: Update metrics and push to hub"""
+        # Update step counts from progress manager
         steps_batch_np = None
         if self.progress_manager:
-            steps_batch_np = self.progress_manager.step_counts.detach().cpu().numpy()
-            # Write to StepTracer's current step counts
+            steps_batch = self.progress_manager.step_counts
+            # Write to StepTracer for console logging
             for env_id in range(self.num_envs):
-                self.step_tracer.current_episode_basic[env_id]['steps'] = int(steps_batch_np[env_id])
+                self.step_tracer.current_episode_basic[env_id]['steps'] = int(steps_batch[env_id].item())
         
-        # Batch update StepTracer
+        # Update StepTracer for console logging
         self.step_tracer.update_step_metrics_batch(reward_components, safety_distances, rewards)
         
-        # Handle milestone recording
-        if self.external_episode_counter is not None and self.milestone_manager:
+        # NEW: Update EpisodeAccumulator with batch data
+        env_ids = list(range(self.num_envs))
+        
+        # Calculate total rewards for accumulator
+        robot_rewards = rewards.get("robot", torch.zeros(self.num_envs, device=self.device))
+        human_rewards = rewards.get("human", torch.zeros(self.num_envs, device=self.device))
+        total_rewards = robot_rewards + human_rewards
+        
+        # Create reward_components dict with total field for accumulator
+        reward_comp_with_total = dict(reward_components)
+        reward_comp_with_total['total'] = total_rewards
+        
+        self.episode_acc.update_batch(
+            env_ids, 
+            reward_comp_with_total,
+            safety_distances,
+            reward_components.get('deviation'),
+            reward_components.get('progress_ratio')
+        )
+        
+        # Check for completion/collision markers
+        if 'completion_reward' in reward_components:
+            completion_rewards = reward_components['completion_reward']
             for env_id in range(self.num_envs):
-                current_episode = int(self.external_episode_counter[env_id]) + 1
-                if self.milestone_manager.is_milestone_episode(current_episode):
-                    self.milestone_manager.record_milestone_detailed_step(
-                        env_id, current_episode, reward_components, rewards, safety_distances
-                    )
+                if completion_rewards[env_id] > 0:
+                    self.episode_acc.mark_completed(env_id, True)
+        
+        if safety_distances is not None:
+            for env_id in range(self.num_envs):
+                if safety_distances[env_id] < 0.001:
+                    self.episode_acc.mark_collision(env_id, True)
+        
+        # Push step data to hub if available
+        if self.metrics_hub and self.progress_manager:
+            # Get global step from trainer's progress manager
+            global_step = getattr(self.progress_manager, 'global_step', 0)
+            if hasattr(self.progress_manager, 'training_logger'):
+                # Try to get from trainer
+                global_step = getattr(self.progress_manager.training_logger, 'global_step', global_step)
+            
+            self.metrics_hub.push_step(
+                step=global_step,
+                env_ids=env_ids,
+                payload={
+                    "reward_components": reward_components,
+                    "safety_distance": safety_distances,
+                    "progress_ratio": reward_components.get('progress_ratio'),
+                    "deviation": reward_components.get('deviation'),
+                }
+            )
     
     def log_console_if_enabled(self, env, rewards: Dict, robot_weights: dict, human_weights: dict):
-        """
-        Log to console if enabled (controlled by StepTracer) with active environment filtering.
-        Enhanced for dual protection mechanism.
-        """
+        """Log to console if enabled with active environment filtering."""
         # Get active environments from progress manager if available
         active_envs = None
         if self.progress_manager:
@@ -725,23 +875,36 @@ class RewardLogger:
         self.step_tracer.maybe_print_step(env, rewards, robot_weights, human_weights, current_step, active_envs)
     
     def on_episode_end(self, env_ids):
-        """Handle episode completion using external counter."""
+        """MODIFIED: Handle episode completion using MetricsHub"""
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
         
         for env_id_t in env_ids:
             env_id = env_id_t.item()
             
-            # Get episode number from external counter (remove +1)
+            # Get episode summary from accumulator
+            summary = self.episode_acc.summary(env_id)
+            
+            # Push to MetricsHub
+            if self.metrics_hub and self.progress_manager:
+                # Get global step
+                global_step = 0
+                if hasattr(self.progress_manager, 'training_logger'):
+                    global_step = getattr(self.progress_manager.training_logger, 'global_step', 0)
+                
+                self.metrics_hub.push_episode(global_step, env_id, summary)
+            
+            # Get episode number from external counter
             current_episode_num = int(self.external_episode_counter[env_id]) if self.external_episode_counter is not None else 1
             basic = self.step_tracer.current_episode_basic[env_id]
             
-            # Process milestones first (using current episode's aggregated scalars)
+            # Process milestones using hub data
             if self.milestone_manager and self.milestone_manager.is_milestone_episode(current_episode_num):
                 if basic['steps'] > 0:
                     self.milestone_manager.process_milestone_completion(env_id, current_episode_num, basic)
         
-        # Then reset/accumulate
+        # Reset accumulators
+        self.episode_acc.reset_envs([e.item() for e in env_ids])
         self.step_tracer.on_episode_end([e.item() for e in env_ids])
     
     def get_final_evaluation(self, env_id: int, target_episodes: int) -> float:

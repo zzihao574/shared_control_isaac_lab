@@ -3,6 +3,7 @@
 """
 Training helper utilities for MADDPG multi-environment parallel training.
 Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
+MODIFIED: Added MetricsHub for unified data pipeline
 """
 
 import argparse
@@ -12,7 +13,8 @@ import torch
 import numpy as np
 import pickle
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable, DefaultDict, Deque
+from collections import defaultdict, deque
 
 # WandB support
 try:
@@ -25,6 +27,66 @@ except ImportError:
 
 # Hardware monitoring - DISABLED for minimal logging
 HARDWARE_MONITORING_AVAILABLE = False
+
+
+# === NEW CLASS: MetricsHub ===
+class MetricsHub:
+    """Single-exit metrics bus. Modules push; sinks subscribe. No IO here."""
+    def __init__(self, ring: int = 100):
+        self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)
+        self.episode_state: dict[int, dict] = {}
+        self.milestone_scores: DefaultDict[int, dict] = defaultdict(dict)
+        self.update_ring: Deque[dict] = deque(maxlen=ring)
+
+    def subscribe(self, event: str, handler: Callable[[dict], None]) -> None:
+        """Subscribe to an event type with a handler function."""
+        self.subs[event].append(handler)
+
+    def _emit(self, event: str, payload: dict) -> None:
+        """Emit an event to all subscribers."""
+        for h in self.subs.get(event, []):
+            try:
+                h(payload)
+            except Exception as e:
+                print(f"[MetricsHub] handler error on '{event}': {e}")
+
+    # ---- Pushers ----
+    def push_step(self, step: int, env_ids: list[int], payload: dict) -> None:
+        """Push step-level data."""
+        self._emit("step", {"step": step, "env_ids": env_ids, **payload})
+
+    def push_episode(self, step: int, env_id: int, summary: dict) -> None:
+        """Push episode completion data."""
+        self.episode_state[env_id] = summary
+        self._emit("episode", {"step": step, "env_id": env_id, **summary})
+
+    def push_update(self, step: int, stats: dict) -> None:
+        """Push training update statistics."""
+        if not stats:
+            return
+        data = {"step": step, **stats}
+        self.update_ring.append(data)
+        self._emit("update", data)
+
+    def push_milestone_summary(self, milestone: int, summary: dict) -> None:
+        """Push milestone completion summary."""
+        scores = summary.get("scores", {})
+        for eid, sc in scores.items():
+            self.milestone_scores[milestone][eid] = sc
+        self._emit("milestone_summary", {"milestone": milestone, **summary})
+
+    def push_buffer_status(self, step: int, status: dict) -> None:
+        """Push buffer status information."""
+        self._emit("buffer_status", {"step": step, **status})
+
+    # ---- Getters ----
+    def get_episode_state(self, env_id: int) -> dict:
+        """Get the latest episode state for an environment."""
+        return self.episode_state.get(env_id, {})
+
+    def get_milestone_scores(self) -> dict:
+        """Get all milestone scores."""
+        return self.milestone_scores
 
 
 class UnifiedProgressManager:
@@ -240,7 +302,7 @@ class CheckpointManager:
 class WandBLogger:
     """
     Enhanced WandB logger with layered, frequency-based monitoring system.
-    Supports global lightweight monitoring + detailed env0/env1 tracking.
+    MODIFIED: Added attach_metrics_hub method for unified data pipeline
     """
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
@@ -283,16 +345,48 @@ class WandBLogger:
             print(f"[WANDB] Initialization failed: {e}")
             self.enabled = False
 
+    def attach_metrics_hub(self, hub: "MetricsHub"):
+        """NEW METHOD: Attach to MetricsHub for unified data pipeline"""
+        if not self.enabled:
+            return
+
+        # 1) Training update level: use existing 19 whitelist items
+        hub.subscribe("update", lambda data: self.log_algorithm_statistics(data, data["step"]))
+
+        # 2) Episode level: currently not used but available for future
+        def _on_episode(ep):
+            # Could aggregate episode-level metrics here if needed
+            pass
+        hub.subscribe("episode", _on_episode)
+
+        # 3) Milestone completion: calculate and upload topk_best / topk_avg
+        def _on_ms(ms):
+            scores = ms.get("scores", {})
+            if not scores:
+                return
+            score_values = list(scores.values())
+            best = max(score_values) if score_values else 0.0
+            avg = sum(score_values) / len(score_values) if score_values else 0.0
+            self.log_algorithm_statistics({
+                "performance/topk_best_score": best,
+                "performance/topk_avg_score": avg,
+                "performance/topk_count": len(score_values),
+                "milestone/latest_completed": ms.get("milestone", 0),
+            }, ms.get("step", 0))
+        hub.subscribe("milestone_summary", _on_ms)
+        
+        print("[WANDB] Attached to MetricsHub with subscriptions: update, episode, milestone_summary")
+
     def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
         """Log algorithm diagnostics with white-list filtering."""
         if not self.enabled or not algorithm_stats:
             return
 
-        # 如果包含milestone或performance数据，允许绕过training/updates检查
+        # Allow milestone/performance data to bypass training/updates check
         has_milestone_data = any(key.startswith(("milestone/", "performance/")) 
                                for key in algorithm_stats.keys())
         
-        # 仅当本轮真的发生了 update 时才记录，但milestone/performance数据例外
+        # Only log when actual update occurred, except for milestone/performance data
         if not has_milestone_data and algorithm_stats.get("training/updates", 0) <= 0:
             return
 
@@ -312,7 +406,7 @@ class WandBLogger:
             "env1/algo/q_mean", "env1/algo/q_std",
             "env1/algo/q_target_mean", "env1/algo/q_target_std",
             "env1/algo/td_error_mean", "env1/algo/q_qt_corr", "env1/algo/td_rmse",
-            # performance & milestone (4) - 新增topk_count
+            # performance & milestone (4)
             "performance/topk_best_score", "performance/topk_avg_score",
             "performance/topk_count",
             "milestone/latest_completed",
@@ -461,6 +555,7 @@ class TrainingLogger:
     def __init__(self, log_directory: str):
         self.log_directory = log_directory
         os.makedirs(log_directory, exist_ok=True)
+        self.global_step = 0  # Track global step for metrics hub
     
     def log_message(self, message: str) -> None:
         """Log a message to file."""
@@ -477,6 +572,7 @@ class TrainingLogger:
     
     def log_training_progress(self, global_step: int, stats: Dict[str, Any], top_k_manager: TopKModelManager) -> None:
         """Log periodic training progress."""
+        self.global_step = global_step  # Update global step
         total_envs = stats['active_count'] + stats['completed_count']
         print(f"[Step {global_step}] Completed: {stats['completed_count']}/{total_envs}")
         if top_k_manager.top_models:

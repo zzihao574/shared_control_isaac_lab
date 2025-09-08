@@ -1,4 +1,4 @@
-# surgical_direct_marl_env.py - Modified for unified progress management
+# surgical_direct_marl_env.py - Modified for unified progress management and MetricsHub
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from .utils import CompleteConstraintChecker, TrajectoryManager, RewardLogger
 class SurgicalDirectMARLEnv(DirectMARLEnv):
     """
     Human-robot collaborative surgical MARL environment.
+    MODIFIED: Removed extras['episode'] and extras['log'] dependencies for MetricsHub integration
     
     Features:
     - Multi-agent force control for surgical tasks
@@ -66,7 +67,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
     def _setup_core_configuration(self) -> None:
         """Load and setup core configuration parameters."""
-        # 如果 trainer 已注入 self.params，就直接使用；否则回退到本地 YAML
+        # If trainer already injected self.params, use it directly; otherwise fallback to local YAML
         if not hasattr(self, "params") or not isinstance(getattr(self, "params", None), dict):
             self.params = self._load_training_params()
             
@@ -350,107 +351,72 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return observations
         
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-            """Reward system with WandB integration for detailed monitoring."""
-            # Calculate individual reward components
-            trajectory_reward = self._calculate_adaptive_trajectory_reward()
-            progress_reward = self._calculate_progress_reward()
-            potential_field_reward = self._calculate_potential_field_reward()
-            force_penalties = self._calculate_force_penalties()
-            z_penalty = self._calculate_z_penalty()
-            completion_reward = self._calculate_completion_reward()
-            time_efficiency_reward = self._calculate_time_efficiency_reward()
-            
-            # Get reward weights from configuration
-            robot_weights = self.params['reward_parameters']['robot_weights']
-            human_weights = self.params['reward_parameters']['human_weights']
-            
-            # Calculate weighted contributions for WandB monitoring
-            rw = robot_weights
-            traj_contrib = trajectory_reward * rw.get("trajectory_tracking", 0.0)
-            prog_contrib = progress_reward * rw.get("progress", 0.0)
-            pot_contrib = potential_field_reward * rw.get("potential_field", 0.0)
-            
-            # Apply weights to ALL components including global ones
-            rewards = {}
-            rewards["robot"] = (
-                traj_contrib +
-                prog_contrib +
-                pot_contrib +
-                force_penalties['robot'] * robot_weights['force_efficiency'] +
-                force_penalties['human'] * robot_weights['human_awareness'] +
-                z_penalty * robot_weights.get('z_penalty', 0.0) +
-                completion_reward * robot_weights.get('completion_reward', 0.0) +
-                time_efficiency_reward * robot_weights.get('time_efficiency', 0.0)
-            )
-            
-            rewards["human"] = (
-                trajectory_reward * human_weights['trajectory_tracking'] +
-                progress_reward * human_weights['progress'] +
-                potential_field_reward * human_weights['potential_field'] +
-                force_penalties['human'] * human_weights['force_efficiency'] +
-                force_penalties['robot'] * human_weights['robot_awareness'] +
-                z_penalty * human_weights.get('z_penalty', 0.0) +
-                completion_reward * human_weights.get('completion_reward', 0.0) +
-                time_efficiency_reward * human_weights.get('time_efficiency', 0.0)
-            )
-            
-            # Cache reward components for logging
-            deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-            progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-            distance_to_final = torch.norm(
-                self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), dim=-1
-            )
-            
-            self.reward_components = {
-                'trajectory_reward': trajectory_reward,
-                'progress_reward': progress_reward,
-                'potential_field_reward': potential_field_reward,
-                'robot_force_penalty': force_penalties['robot'],
-                'human_force_penalty': force_penalties['human'],
-                'z_penalty': z_penalty,
-                'completion_reward': completion_reward,
-                'time_efficiency_reward': time_efficiency_reward,
-                'deviation': deviations,
-                'progress_ratio': progress_ratio,
-                'distance_to_final': distance_to_final
-            }
+        """MODIFIED: Reward system without extras dependencies."""
+        # Calculate individual reward components
+        trajectory_reward = self._calculate_adaptive_trajectory_reward()
+        progress_reward = self._calculate_progress_reward()
+        potential_field_reward = self._calculate_potential_field_reward()
+        force_penalties = self._calculate_force_penalties()
+        z_penalty = self._calculate_z_penalty()
+        completion_reward = self._calculate_completion_reward()
+        time_efficiency_reward = self._calculate_time_efficiency_reward()
+        
+        # Get reward weights from configuration
+        robot_weights = self.params['reward_parameters']['robot_weights']
+        human_weights = self.params['reward_parameters']['human_weights']
+        
+        # Apply weights to ALL components including global ones
+        rewards = {}
+        rewards["robot"] = (
+            trajectory_reward * robot_weights['trajectory_tracking'] +
+            progress_reward * robot_weights['progress'] +
+            potential_field_reward * robot_weights['potential_field'] +
+            force_penalties['robot'] * robot_weights['force_efficiency'] +
+            force_penalties['human'] * robot_weights['human_awareness'] +
+            z_penalty * robot_weights.get('z_penalty', 0.0) +
+            completion_reward * robot_weights.get('completion_reward', 0.0) +
+            time_efficiency_reward * robot_weights.get('time_efficiency', 0.0)
+        )
+        
+        rewards["human"] = (
+            trajectory_reward * human_weights['trajectory_tracking'] +
+            progress_reward * human_weights['progress'] +
+            potential_field_reward * human_weights['potential_field'] +
+            force_penalties['human'] * human_weights['force_efficiency'] +
+            force_penalties['robot'] * human_weights['robot_awareness'] +
+            z_penalty * human_weights.get('z_penalty', 0.0) +
+            completion_reward * human_weights.get('completion_reward', 0.0) +
+            time_efficiency_reward * human_weights.get('time_efficiency', 0.0)
+        )
+        
+        # Cache reward components for logging
+        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+        distance_to_final = torch.norm(
+            self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), dim=-1
+        )
+        
+        self.reward_components = {
+            'trajectory_reward': trajectory_reward,
+            'progress_reward': progress_reward,
+            'potential_field_reward': potential_field_reward,
+            'robot_force_penalty': force_penalties['robot'],
+            'human_force_penalty': force_penalties['human'],
+            'z_penalty': z_penalty,
+            'completion_reward': completion_reward,
+            'time_efficiency_reward': time_efficiency_reward,
+            'deviation': deviations,
+            'progress_ratio': progress_ratio,
+            'distance_to_final': distance_to_final
+        }
 
-            # WandB Integration: Record detailed reward decomposition and behavior
-            log = self.extras.setdefault("log", {})
-            log.setdefault("rewards", {})["robot"] = {
-                "trajectory_contrib": traj_contrib.detach(),
-                "progress_contrib": prog_contrib.detach(),
-                "potential_contrib": pot_contrib.detach(),
-                "total": (traj_contrib + prog_contrib + pot_contrib).detach(),
-            }
-            
-            # Step-level behavior metrics for WandB
-            log["progress_ratio_mean"] = float(progress_ratio.mean().item())
-            log["safety_distance_min"] = float(self.safety_distances_t1.min().item())
-            log["safety_distance_mean"] = float(self.safety_distances_t1.mean().item())
-            log["violations_rate"] = float((self.safety_distances_t1 <= 0.0).float().mean().item())
-            log["deviation_mean"] = float(deviations.mean().item())
-
-            # Console logging via utils (controlled by YAML)
-            self.reward_logger.log_console_if_enabled(self, rewards, robot_weights, human_weights)
-            
-            # Vectorized batch update for all environments  
-            self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
-            
-            # Update extras for WandB with additional metrics
-            self.extras["log"].update({
-                "robot_reward": rewards["robot"].mean().item(),
-                "human_reward": rewards["human"].mean().item(),
-                "trajectory_reward": trajectory_reward.mean().item(),
-                "progress_reward": progress_reward.mean().item(),
-                "potential_field_reward": potential_field_reward.mean().item(),
-                "deviation": deviations.mean().item(),
-                "progress": progress_ratio.mean().item(),
-                "safety_distance": self.safety_distances_t1.mean().item(),
-                "time_efficiency": time_efficiency_reward.mean().item(),
-            })
-            
-            return rewards
+        # Console logging via utils (controlled by YAML)
+        self.reward_logger.log_console_if_enabled(self, rewards, robot_weights, human_weights)
+        
+        # Vectorized batch update for all environments  
+        self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
+        
+        return rewards
 
     def _calculate_adaptive_trajectory_reward(self) -> torch.Tensor:
         """
@@ -596,12 +562,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return terminated, truncated
         
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments with episode completion recording."""
+        """MODIFIED: Reset specified environments without extras['episode'] handling."""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
-
-        # Record episode completion data before reset
-        self._record_episode_completion(env_ids)
 
         # Unified filtering: only episodes that actually ran can be settled
         valid_env_ids = self.progress_manager.filter_valid_for_episode_end(env_ids, min_steps=1)
@@ -641,40 +604,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.safety_distances_t1[env_ids] = 0.01
         self.is_violating_t1[env_ids] = False
         self.normal_t1[env_ids] = torch.zeros((num_resets, 3), device=self.device)
-
-    
-    def _record_episode_completion(self, env_ids):
-        """Record episode completion data for WandB monitoring."""
-        if not torch.is_tensor(env_ids):
-            env_ids = torch.tensor([env_ids] if isinstance(env_ids, int) else env_ids, device=self.device)
-        
-        # Initialize episode data structure
-        ep_data = self.extras.setdefault("episode", {})
-        
-        for env_id_t in env_ids:
-            env_id = env_id_t.item()
-            
-            # Get episode data from reward logger if available
-            if hasattr(self.reward_logger, 'current_episode_basic'):
-                episode_data = self.reward_logger.current_episode_basic[env_id]
-                
-                # Calculate episode return (robot only since we're in single-agent mode)
-                episode_return = episode_data.get('total_reward', 0.0)
-                episode_len = episode_data.get('steps', 0)
-                had_collision = episode_data.get('collision', False)
-                reached_goal = episode_data.get('completed', False)
-                min_safety_dist = episode_data.get('min_safety_distance', float('inf'))
-                final_progress = episode_data.get('final_progress', 0.0)
-                
-                # Store episode summary for WandB
-                ep_data[env_id] = {
-                    "episode_return": float(episode_return),
-                    "episode_len": int(episode_len),
-                    "collision": float(int(had_collision)),
-                    "success": float(int(reached_goal)),
-                    "min_safety_distance": float(min_safety_dist) if min_safety_dist != float('inf') else 0.0,
-                    "final_progress": float(final_progress),
-                }
 
     def _get_stylus_position(self) -> torch.Tensor:
         """Get stylus position relative to robot base."""
