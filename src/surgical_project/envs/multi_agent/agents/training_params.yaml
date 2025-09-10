@@ -59,26 +59,86 @@ constraint_geometry:
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# Reward Parameters - MODIFIED FOR SINGLE AGENT TRAINING
+# Reward Parameters - NEW FOUR-ZONE SYSTEM
 # ==============================================================================
 reward_parameters:
-  # Robot agent reward weights - Only enable 3 core components
+  # Robot agent reward weights - Four-zone system
   robot_weights:
-    trajectory_tracking: 6.0
-    progress: 20.0
-    potential_field: 5.0
-    # Disable other components for initial single-agent training
+    components:         # Global component default weights (fallback when zone doesn't specify)
+      progress: 1.0
+      deviation: 1.0
+      rejoin_speed: 1.0
+      gap: 1.0
+      surf_tangent: 1.0
+      inward_penalty: 1.0
+      off_penalty: 1.0
+    zones:
+      track:            # Zone A - Outside obstacle (d >= 1.5cm)
+        weight: 1.0
+        components:
+          progress: 1.0
+          deviation: 1.0
+      surface:          # Zone B - Near obstacle (0.75cm < d < 1.5cm)
+        weight: 1.0
+        components:
+          gap: 1.0
+          surf_tangent: 1.0
+          inward_penalty: 1.0
+      danger:           # Zone C - Inside obstacle (d <= 0.75cm)
+        weight: 1.0
+        components:
+          off_penalty: 1.0
+          inward_penalty: 1.0
+      rejoin:           # Zone D - Transition zone with geometric conditions
+        weight: 1.0
+        components:
+          progress: 1.0
+          rejoin_speed: 1.0
+          deviation: 1.0      # Will be mixed with α
+          gap: 0.5            # Will be mixed with (1-α)
+          inward_penalty: 1.0
+    # Global rewards (preserved from original system)
     z_penalty: 0.0
     completion_reward: 0.0
     time_efficiency: 0.0
     force_efficiency: 0.0
     human_awareness: 0.0
-    
+
   # Human agent reward weights - All disabled for single-agent phase
   human_weights:
-    trajectory_tracking: 0.0
-    progress: 0.0
-    potential_field: 0.0
+    components:
+      progress: 0.0
+      deviation: 0.0
+      rejoin_speed: 0.0
+      gap: 0.0
+      surf_tangent: 0.0
+      inward_penalty: 0.0
+      off_penalty: 0.0
+    zones:
+      track:   
+        weight: 0.0
+        components: 
+          progress: 0.0
+          deviation: 0.0
+      surface: 
+        weight: 0.0
+        components: 
+          gap: 0.0
+          surf_tangent: 0.0
+          inward_penalty: 0.0
+      danger:  
+        weight: 0.0
+        components: 
+          off_penalty: 0.0
+          inward_penalty: 0.0
+      rejoin:  
+        weight: 0.0
+        components: 
+          progress: 0.0
+          rejoin_speed: 0.0
+          deviation: 0.0
+          gap: 0.0
+          inward_penalty: 0.0
     z_penalty: 0.0
     completion_reward: 0.0
     time_efficiency: 0.0

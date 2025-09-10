@@ -1,6 +1,5 @@
 # surgical_direct_marl_env.py - Modified for unified progress management and MetricsHub
 # NEW: Four-zone reward system with A/B/C/D regions (preserving Isaac Lab method names)
-# NEW: Actor debug info collection for console display
 
 from __future__ import annotations
 
@@ -25,7 +24,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     """
     Human-robot collaborative surgical MARL environment.
     MODIFIED: NEW Four-zone reward system (A/B/C/D) with robot/human symmetric rewards
-    MODIFIED: Actor debug info collection for console display
     
     Features:
     - Multi-agent force control for surgical tasks
@@ -34,7 +32,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Comprehensive reward system with safety considerations
     - Performance evaluation and milestone tracking
     - Console logging via utils (configured by YAML)
-    - Actor network debug information display
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -165,16 +162,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Initialize physics interaction state variables (forces at time t)."""
         self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        # NEW: Cache for actor network outputs (for debugging display)
-        self.actor_mean_forces = {
-            agent: torch.zeros(self.num_envs, 3, device=self.device)
-            for agent in self.cfg.possible_agents
-        }
-        self.actor_noise_forces = {
-            agent: torch.zeros(self.num_envs, 3, device=self.device)  
-            for agent in self.cfg.possible_agents
-        }
     
     def _initialize_observation_cache(self) -> None:
         """Initialize state caching variables (updated in _get_observations)."""
@@ -304,14 +291,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing including action validation and force application."""
-        # NEW: Extract actor debug info if available (passed from MADDPG)
-        if hasattr(self, '_debug_actor_info') and self._debug_actor_info is not None:
-            for agent in self.cfg.possible_agents:
-                if agent in self._debug_actor_info['mean_actions']:
-                    self.actor_mean_forces[agent] = self._debug_actor_info['mean_actions'][agent].clone()
-                if agent in self._debug_actor_info['noise_actions']:
-                    self.actor_noise_forces[agent] = self._debug_actor_info['noise_actions'][agent].clone()
-        
         # Process and validate actions - expect (num_envs, 3) from trainer
         for agent, action in actions.items():
             if agent in self.cfg.possible_agents:
@@ -331,10 +310,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         # Enforce joint constraints and fix end joints
         self._enforce_joint_constraints()
-    
-    def set_debug_actor_info(self, debug_info: Dict[str, Any]) -> None:
-        """Set debug information from MADDPG actor outputs."""
-        self._debug_actor_info = debug_info
         
     def _apply_external_forces(self) -> None:
         """Apply external forces to the robot end-effector."""
@@ -841,11 +816,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.prev_progress[env_ids] = 0.0
         self.best_progress[env_ids] = 0.0
         self.rejoin_streak[env_ids] = 0
-
-        # NEW: Reset actor debug info caches
-        for agent in self.cfg.possible_agents:
-            self.actor_mean_forces[agent][env_ids] = 0.0
-            self.actor_noise_forces[agent][env_ids] = 0.0
 
     def _get_stylus_position(self) -> torch.Tensor:
         """Get stylus position relative to robot base."""

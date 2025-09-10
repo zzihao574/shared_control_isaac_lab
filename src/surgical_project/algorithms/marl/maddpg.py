@@ -3,6 +3,7 @@ Multi-environment parallel MADDPG algorithm.
 Grouped replay buffers with dual protection mechanism.
 Multi-agent update with single-agent control via select_actions.
 MODIFIED: Unified buffer clearing at single entry point in update()
+MODIFIED: Added debug info collection for actor network outputs
 """
 
 import torch
@@ -23,6 +24,7 @@ class MADDPG:
     - Dual protection: environment disabling + training filtering
     - Multi-agent update logic with single-agent control via select_actions
     - MODIFIED: Unified buffer clearing at single entry point
+    - MODIFIED: Debug info collection for console display
     - Comprehensive debugging and monitoring
     """
     
@@ -69,7 +71,7 @@ class MADDPG:
         self.training_steps = 0
         self.disabled_environments = set()  # Track disabled environments (don't clear shared buffers)
         
-        # 累计计数器
+        # 累积计数器
         self.update_count = 0
         
         # 将在trainer中注入这些依赖
@@ -182,9 +184,10 @@ class MADDPG:
 
     def select_actions(self, observations: Dict[str, torch.Tensor], active_envs: List[int], add_noise: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Select actions with single/multi-agent control.
+        Select actions with single/multi-agent control and debug info collection.
         Single-agent mode: Skip human actions (they remain zero).
         Multi-agent mode: Generate actions for all agents.
+        MODIFIED: Collect actor debug information for console display.
         """
         obs_len = observations[self.agent_ids[0]].shape[0]
         assert obs_len == self.num_envs, f"Observation dimension mismatch: {obs_len} vs {self.num_envs}"
@@ -194,6 +197,14 @@ class MADDPG:
             for i, agent_id in enumerate(self.agent_ids)
         }
         
+        # NEW: Collect debug information for console display
+        debug_info = {
+            'mean_actions': {agent_id: torch.zeros(self.num_envs, self.action_dims[i], device=self.device) 
+                            for i, agent_id in enumerate(self.agent_ids)},
+            'noise_actions': {agent_id: torch.zeros(self.num_envs, self.action_dims[i], device=self.device)
+                             for i, agent_id in enumerate(self.agent_ids)}
+        }
+        
         for env_id in active_envs:
             for i, agent_id in enumerate(self.agent_ids):
                 # SINGLE AGENT CONTROL: Skip human agent (comment out this line to enable multi-agent)
@@ -201,8 +212,16 @@ class MADDPG:
                     continue  # Human actions remain zero for single-agent training
                 
                 obs = observations[agent_id][env_id].cpu().numpy()
-                action = self.env_agents[env_id][agent_id].select_action(obs, add_noise)
-                actions[agent_id][env_id] = torch.from_numpy(action).to(self.device)
+                
+                # Get detailed action info from agent
+                action_info = self.env_agents[env_id][agent_id].select_action_with_debug(obs, add_noise)
+                actions[agent_id][env_id] = torch.from_numpy(action_info['action']).to(self.device)
+                debug_info['mean_actions'][agent_id][env_id] = torch.from_numpy(action_info['mean']).to(self.device)
+                debug_info['noise_actions'][agent_id][env_id] = torch.from_numpy(action_info['noise']).to(self.device)
+        
+        # NEW: Pass debug info to environment for console display
+        if hasattr(self.env, 'set_debug_actor_info'):
+            self.env.set_debug_actor_info(debug_info)
                 
         return actions
     
@@ -253,10 +272,10 @@ class MADDPG:
         ]
 
         if not active_and_ready_envs:
-            return {"updates": 0, "training_steps": self.training_steps}
+            return {"training/updates": 0, "training_steps": self.training_steps}
 
         if self.training_steps % self.update_interval != 0:
-            return {"updates": 0, "training_steps": self.training_steps}
+            return {"training/updates": 0, "training_steps": self.training_steps}
         
         # Debug information for dual protection
         disabled_but_active = [env_id for env_id in active_envs 
@@ -402,8 +421,6 @@ class MADDPG:
                 qt_e = torch.cat(per_env_q_targets_robot[eid], dim=0)
 
                 stats[f"env{eid}/algo/q_mean"] = float(q_e.mean().item())
-                stats[f"env{eid}/algo/q_std"] = float(q_e.std().item())
-                stats[f"env{eid}/algo/q_target_mean"] = float(qt_e.mean().item())
                 stats[f"env{eid}/algo/q_std"] = float(q_e.std().item())
                 stats[f"env{eid}/algo/q_target_mean"] = float(qt_e.mean().item())
                 stats[f"env{eid}/algo/q_target_std"] = float(qt_e.std().item())

@@ -3,6 +3,7 @@ Environment utilities for surgical robot training.
 Contains constraint checking, trajectory management, and reward logging utilities.
 Modified to support active environment filtering and dual protection mechanism.
 MODIFIED: Updated EpisodeAccumulator, simplified StepTracer, updated RewardLogger for MetricsHub integration
+MODIFIED: NEW Four-zone reward system console printing (A/B/C/D regions) with actor debug info
 """
 
 import torch
@@ -298,7 +299,7 @@ class EpisodeAccumulator:
 
 class StepTracer:
     """
-    MODIFIED: Simplified to only handle console printing, no episode caching or settlement.
+    MODIFIED: NEW Four-zone reward system console printing with A/B/C/D region breakdown and actor debug info.
     Enhanced with active environment filtering for dual protection mechanism.
     """
     
@@ -317,9 +318,10 @@ class StepTracer:
 
     def maybe_print_step(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, current_step: int, active_envs: Optional[List[int]] = None):
         """
+        NEW: Four-zone console printing (A/B/C/D) with component breakdowns and actor debug info.
         Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
         Enhanced with active environment filtering for dual protection mechanism.
-        Shows weighted contributions to match actual training.
+        Shows weighted contributions for each zone and component.
         """
         if not self.enable_console_logging:
             return
@@ -336,7 +338,7 @@ class StepTracer:
 
         # Only show first N active environments to avoid screen flooding
         print(f"\n{'='*80}")
-        print(f"STEP {current_step} - Environment State (Active Environments Only)")
+        print(f"STEP {current_step} - Four-Zone Reward System (A/B/C/D) - Active Environments Only")
         print(f"{'='*80}")
         
         if active_envs is None:
@@ -348,69 +350,190 @@ class StepTracer:
             print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
         
         for env_id in ids_to_print:
-            print(f"\n--- [ACTIVE] Environment {env_id} ---")
+            self._print_environment_four_zones(env, env_id, rewards, robot_weights, human_weights)
+
+    def _print_environment_four_zones(self, env, env_id: int, rewards: Dict, robot_weights: dict, human_weights: dict):
+        """NEW: Print four-zone reward breakdown for a single environment with actor debug info."""
+        
+        # Header with basic environment state including normal vector
+        stylus = env.stylus_pos_t1[env_id]
+        dev = env.reward_components['deviation'][env_id].item()
+        prog = env.reward_components['progress_ratio'][env_id].item()
+        dist = env.reward_components['distance_to_final'][env_id].item()
+        safety = env.safety_distances_t1[env_id].item()
+        normal = env.normal_t1[env_id]
+        
+        print(f"\n--- [ACTIVE] Environment {env_id} ---")
+        print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
+        print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
+        
+        # NEW: Display actor network outputs and noise
+        self._print_actor_debug_info(env, env_id)
+        
+        print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
+        
+        # Determine which zone is currently active
+        D, O = 0.0075, 0.015
+        if safety >= O:
+            active_zone = "A (Track)"
+        elif safety <= D:
+            active_zone = "C (Danger)"
+        else:
+            # Check if in rejoin zone (simplified check for display)
+            if hasattr(env, 'rejoin_streak') and env.rejoin_streak[env_id] >= 10:
+                active_zone = "D (Rejoin)"
+            else:
+                active_zone = "B (Surface)"
+        
+        print(f"Active Zone: {active_zone} | Safety Distance: {safety:.4f}m")
+        
+        # Print robot zone rewards and global rewards together
+        self._print_agent_zones_with_globals(env, env_id, 'ROBOT', robot_weights)
+        self._print_agent_zones_with_globals(env, env_id, 'HUMAN', human_weights)
+        
+        # Final totals
+        robot_total = rewards['robot'][env_id].item()
+        human_total = rewards['human'][env_id].item()
+        combined_total = robot_total + human_total
+        print(f"\n[TOTALS] Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
+
+    def _print_actor_debug_info(self, env, env_id: int):
+        """NEW: Print actor network outputs and noise information."""
+        if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
+            return
             
-            # Position information
-            stylus_pos = env.stylus_pos_t1[env_id]
-            print(f"Stylus Position (local): [{stylus_pos[0]:.4f}, {stylus_pos[1]:.4f}, {stylus_pos[2]:.4f}]")
+        # Get robot forces (mean and noise)
+        robot_mean = env.actor_mean_forces.get('robot')
+        robot_noise = env.actor_noise_forces.get('robot')
+        
+        # Get human forces (mean and noise) 
+        human_mean = env.actor_mean_forces.get('human')
+        human_noise = env.actor_noise_forces.get('human')
+        
+        if robot_mean is not None and robot_noise is not None:
+            rm = robot_mean[env_id]
+            rn = robot_noise[env_id]
+            print(f"Forces (Robot): Fx={rm[0]:+.3f}, Fy={rm[1]:+.3f}, Fz={rm[2]:+.3f}")
+            print(f"  Noise: Nx={rn[0]:+.3f}, Ny={rn[1]:+.3f}, Nz={rn[2]:+.3f}")
+        
+        if human_mean is not None and human_noise is not None:
+            hm = human_mean[env_id]
+            hn = human_noise[env_id]
+            print(f"Forces (Human): Fx={hm[0]:+.3f}, Fy={hm[1]:+.3f}, Fz={hm[2]:+.3f}")
+            print(f"  Noise: Nx={hn[0]:+.3f}, Ny={hn[1]:+.3f}, Nz={hn[2]:+.3f}")
+
+    def _print_agent_zones_with_globals(self, env, env_id: int, agent_label: str, weights: dict):
+        """Print zone breakdown and global rewards for a single agent."""
+        agent_key = agent_label.lower()
+        
+        print(f"\n[{agent_label}] ZONE REWARDS:")
+        
+        # Zone totals with zone weights
+        zones = ['A_track', 'B_surface', 'C_danger', 'D_rejoin']
+        zone_names = ['A Track  ', 'B Surface', 'C Danger ', 'D Rejoin ']
+        zone_config_names = ['track', 'surface', 'danger', 'rejoin']
+        
+        for zone, zone_name, config_name in zip(zones, zone_names, zone_config_names):
+            zone_weight = self._get_zone_weight(weights, config_name)
+            total_key = f'{agent_key}_{zone}_total'
             
-            # Trajectory metrics
-            deviation = env.reward_components['deviation'][env_id].item()
-            progress = env.reward_components['progress_ratio'][env_id].item()
-            distance_to_final = env.reward_components['distance_to_final'][env_id].item()
-            print(f"Trajectory - Deviation: {deviation:.4f}m, Progress: {progress:.1%}, Distance to Final: {distance_to_final:.4f}m")
-            
-            # Constraint status
-            safety_distance = env.safety_distances_t1[env_id].item()
-            is_overlapping = env.is_violating_t1[env_id].item()
-            normals = env.normal_t1[env_id]
-            print(f"Constraint - Safety Distance: {safety_distance:.4f}m, Overlapping: {is_overlapping}, Normals: {normals}")
-            
-            # Force magnitudes
-            robot_force = env.robot_forces_t[env_id]
-            human_force = env.human_forces_t[env_id]
-            robot_force_mag = torch.norm(robot_force).item()
-            human_force_mag = torch.norm(human_force).item()
-            print(f"Forces - Robot: {robot_force_mag:.3f}N, Human: {human_force_mag:.3f}N")
-            
-            # ENHANCED: Detailed reward breakdown with weighted contributions
-            print(f"\nReward Breakdown (Weighted Contributions):")
-            print(f"Robot Agent:")
-            traj_r = env.reward_components['trajectory_reward'][env_id].item()
-            prog_r = env.reward_components['progress_reward'][env_id].item()
-            potential_r = env.reward_components.get('potential_field_reward', env.reward_components['trajectory_reward'])[env_id].item()
-            robot_force_pen = env.reward_components['robot_force_penalty'][env_id].item()
-            human_force_pen = env.reward_components['human_force_penalty'][env_id].item()
-            z_pen = env.reward_components['z_penalty'][env_id].item()
-            comp_r = env.reward_components['completion_reward'][env_id].item()
-            time_eff_r = env.reward_components.get('time_efficiency_reward', env.reward_components['trajectory_reward'])[env_id].item()
-            
-            print(f"  Trajectory: {traj_r:.3f} * {robot_weights['trajectory_tracking']:.2f} = {traj_r * robot_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {robot_weights['progress']:.2f} = {prog_r * robot_weights['progress']:.3f}")
-            print(f"  Potential Field: {potential_r:.3f} * {robot_weights['potential_field']:.2f} = {potential_r * robot_weights['potential_field']:.3f}")
-            print(f"  Robot Force: {robot_force_pen:.3f} * {robot_weights['force_efficiency']:.2f} = {robot_force_pen * robot_weights['force_efficiency']:.3f}")
-            print(f"  Human Awareness: {human_force_pen:.3f} * {robot_weights['human_awareness']:.2f} = {human_force_pen * robot_weights['human_awareness']:.3f}")
-            # ENHANCED: Show weighted global components
-            print(f"  Z Penalty: {z_pen:.3f} * {robot_weights.get('z_penalty',0.0):.2f} = {z_pen * robot_weights.get('z_penalty',0.0):.3f}")
-            print(f"  Completion: {comp_r:.3f} * {robot_weights.get('completion_reward',0.0):.2f} = {comp_r * robot_weights.get('completion_reward',0.0):.3f}")
-            print(f"  Time Efficiency: {time_eff_r:.3f} * {robot_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * robot_weights.get('time_efficiency',0.0):.3f}")
-            robot_total = rewards["robot"][env_id].item()
-            print(f"  ROBOT TOTAL: {robot_total:.3f}")
-            
-            print(f"Human Agent:")
-            print(f"  Trajectory: {traj_r:.3f} * {human_weights['trajectory_tracking']:.2f} = {traj_r * human_weights['trajectory_tracking']:.3f}")
-            print(f"  Progress: {prog_r:.3f} * {human_weights['progress']:.2f} = {prog_r * human_weights['progress']:.3f}")
-            print(f"  Potential Field: {potential_r:.3f} * {human_weights['potential_field']:.2f} = {potential_r * human_weights['potential_field']:.3f}")
-            print(f"  Human Force: {human_force_pen:.3f} * {human_weights['force_efficiency']:.2f} = {human_force_pen * human_weights['force_efficiency']:.3f}")
-            print(f"  Robot Awareness: {robot_force_pen:.3f} * {human_weights['robot_awareness']:.2f} = {robot_force_pen * human_weights['robot_awareness']:.3f}")
-            # ENHANCED: Show weighted global components
-            print(f"  Z Penalty: {z_pen:.3f} * {human_weights.get('z_penalty',0.0):.2f} = {z_pen * human_weights.get('z_penalty',0.0):.3f}")
-            print(f"  Completion: {comp_r:.3f} * {human_weights.get('completion_reward',0.0):.2f} = {comp_r * human_weights.get('completion_reward',0.0):.3f}")
-            print(f"  Time Efficiency: {time_eff_r:.3f} * {human_weights.get('time_efficiency',0.0):.2f} = {time_eff_r * human_weights.get('time_efficiency',0.0):.3f}")
-            human_total = rewards["human"][env_id].item()
-            print(f"  HUMAN TOTAL: {human_total:.3f}")
-            
-            print(f"Combined Total Reward: {robot_total + human_total:.3f}")
+            if total_key in env.reward_components:
+                total = env.reward_components[total_key][env_id].item()
+                print(f"  {zone_name} (zone_w={zone_weight:.2f}): {total:+.3f}")
+                
+                # Print component breakdowns for this zone
+                self._print_zone_components(env, env_id, zone[0], agent_key, weights, config_name)
+        
+        # Print global rewards for this agent
+        print(f"  Global Rewards:")
+        self._print_global_rewards_inline(env, env_id, agent_label, weights)
+
+    def _print_zone_components(self, env, env_id: int, zone_letter: str, agent_key: str, weights: dict, config_name: str):
+        """Print all components for a given zone (for one agent)."""
+
+        # === fixed mappings ===
+        component_mappings = {
+            'A': [
+                ('progress', 'Progress    '),
+                ('deviation', 'Deviation   ')
+            ],
+            'B': [
+                ('gap', 'Gap         '),
+                ('surf_tangent', 'Surf_Tangent'),
+                ('inward_penalty', 'Inward_Pen  ')
+            ],
+            'C': [
+                ('off_penalty', 'Off_Penalty '),
+                ('inward_penalty', 'Inward_Pen  ')
+            ],
+            'D': [
+                ('progress', 'Progress    '),
+                ('rejoin_speed', 'Rejoin_Speed'),
+                ('deviation', 'α·Deviation '),
+                ('gap', '(1-α)·Gap   '),
+                ('inward_penalty', 'Inward_Pen  ')
+            ],
+        }
+
+        if zone_letter not in component_mappings:
+            return
+
+        for comp_key, comp_label in component_mappings[zone_letter]:
+            # get weight
+            comp_weight = self._get_component_weight(weights, config_name, comp_key, default=0.0)
+            # get cached value
+            comp_dict = getattr(env, "reward_components", {})
+            comp_value = 0.0
+            if agent_key in comp_dict and comp_key in comp_dict[agent_key]:
+                val = comp_dict[agent_key][comp_key]
+                if hasattr(val, "__getitem__"):  # tensor
+                    comp_value = float(val[env_id].item())
+                else:
+                    comp_value = float(val)
+            print(f"    {comp_label} * {comp_weight:>4.2f}: {comp_value:+.3f}")
+
+    def _print_global_rewards_inline(self, env, env_id: int, agent_label: str, weights: dict):
+        """Print global reward components inline for an agent."""
+        agent_key = agent_label.lower()
+        
+        # Global component mappings
+        global_components = [
+            ('z_penalty', 'Z Penalty      ', 'z_penalty'),
+            ('completion_reward', 'Completion     ', 'completion_reward'),
+            ('time_efficiency_reward', 'Time Efficiency', 'time_efficiency'),
+            (f'{agent_key}_force_penalty', f'{agent_label} Force   ', 'force_efficiency'),
+        ]
+        
+        # Add awareness component (robot aware of human, human aware of robot)
+        if agent_key == 'robot':
+            global_components.append(('human_force_penalty', 'Human Aware    ', 'human_awareness'))
+        else:
+            global_components.append(('robot_force_penalty', 'Robot Aware    ', 'robot_awareness'))
+        
+        for comp_key, comp_label, weight_key in global_components:
+            if comp_key in env.reward_components:
+                raw_value = env.reward_components[comp_key][env_id].item()
+                weight = weights.get(weight_key, 0.0)
+                weighted_value = raw_value * weight
+                print(f"    {comp_label} *{weight:>5.2f}: {weighted_value:+.3f}")
+
+    def _get_zone_weight(self, weights: dict, zone_name: str, default: float = 0.0) -> float:
+        """Get zone weight with safe default (0.0 if missing)."""
+        zones = weights.get("zones", {})
+        if zone_name in zones:
+            return float(zones[zone_name].get("weight", default))
+        return default
+
+    def _get_component_weight(self, weights: dict, zone_name: str, comp_key: str, default: float = 0.0) -> float:
+        """Get component weight with safe default (0.0 if missing)."""
+        zones = weights.get("zones", {})
+        if zone_name in zones:
+            comps = zones[zone_name].get("components", {})
+            if comp_key in comps:
+                return float(comps[comp_key])
+        # fall back to global components
+        comps = weights.get("components", {})
+        return float(comps.get(comp_key, default))
 
 
 class MilestoneManager:
@@ -713,6 +836,7 @@ class RewardLogger:
         print(f"[INFO] Console logging {'enabled' if enable_console_logging else 'disabled'} (via StepTracer)")
         print(f"[INFO] RewardLogger initialized: {self.num_envs} environments")
         print(f"[INFO] Performance evaluation at episodes: {milestones}")
+        print(f"[INFO] Four-zone reward system: A(Track)/B(Surface)/C(Danger)/D(Rejoin)")
     
     def set_topk_update_callback(self, callback_fn):
         """Set callback for Top-K model updates at milestones."""

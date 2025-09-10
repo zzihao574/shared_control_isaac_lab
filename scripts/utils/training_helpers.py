@@ -328,7 +328,8 @@ class WandBLogger:
                 name=run_name,
                 config=config,
                 tags=["maddpg", "multi-agent", "surgical-robot", "single-agent-training"],
-                notes="Multi-environment parallel MADDPG training (Dual Protection + Single Agent)"
+                notes="Multi-environment parallel MADDPG training (Dual Protection + Single Agent)",
+                settings=wandb.Settings(start_method="thread")
             )
             
             # Log key configuration for dashboard
