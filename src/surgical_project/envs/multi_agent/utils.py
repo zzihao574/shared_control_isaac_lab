@@ -3,7 +3,7 @@ Environment utilities for surgical robot training.
 Contains constraint checking, trajectory management, and reward logging utilities.
 Modified to support active environment filtering and dual protection mechanism.
 MODIFIED: Updated EpisodeAccumulator, simplified StepTracer, updated RewardLogger for MetricsHub integration
-MODIFIED: NEW Four-zone reward system console printing (A/B/C/D regions) with flat keys
+MODIFIED: Simplified Zone D console printing (A/B/C/D regions) with unified inward and removed rejoinspeed/gap
 MODIFIED: Enhanced StepTracer with force consistency checks
 """
 
@@ -300,7 +300,7 @@ class EpisodeAccumulator:
 
 class StepTracer:
     """
-    MODIFIED: NEW Four-zone reward system console printing with A/B/C/D region breakdown.
+    MODIFIED: Simplified Zone D console printing with unified inward and removed rejoinspeed/gap.
     Enhanced with active environment filtering for dual protection mechanism.
     MODIFIED: Enhanced with force consistency checks and detailed actor debug output.
     MODIFIED: Uses flat keys aligned with environment reward_components.
@@ -318,7 +318,7 @@ class StepTracer:
 
     def maybe_print_step(self, env, rewards: Dict, current_step: int, active_envs: Optional[List[int]] = None):
         """
-        NEW: Four-zone console printing (A/B/C/D) with component breakdowns and actor debug info.
+        MODIFIED: Simplified Zone D console printing with unified inward and removed rejoinspeed/gap.
         Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
         """
         if not self.enable_console_logging:
@@ -401,17 +401,18 @@ class StepTracer:
             print(f"  Noise: Nx={hn[0]:+.3f}, Ny={hn[1]:+.3f}, Nz={hn[2]:+.3f}")
 
     def _print_agent_zones_with_globals_flat(self, env, env_id: int, agent_label: str):
-        """Print zone breakdown and global rewards for a single agent using flat keys."""
+        """Print zone breakdown and global rewards for a single agent using flat keys with simplified Zone D."""
         agent_key = agent_label.lower()
         print(f"\n[{agent_label}] ZONE REWARDS:")
 
         zone_title = {'A':'A Track   ', 'B':'B Surface ', 'C':'C Danger  ', 'D':'D Rejoin  '}
+        
+        # MODIFIED: Simplified Zone D mapping - removed rejoinspeed and gap
         mapping = {
             'A': [('progress','Progress'), ('deviation','Deviation')],
             'B': [('gap','Gap'), ('surftangent','Surf_Tangent'), ('inward','Inward_Pen')],
             'C': [('offpen','Off_Penalty'), ('inward','Inward_Pen')],
-            'D': [('progress','Progress'), ('rejoinspeed','Rejoin_Speed'),
-                  ('deviation','α·Deviation'), ('gap','(1-α)·Gap'), ('inward','Inward_Pen')],
+            'D': [('progress','Progress'), ('deviation','Deviation'), ('inward','Inward_Pen')],  # SIMPLIFIED
         }
 
         def _val(x):
@@ -759,7 +760,7 @@ class RewardLogger:
         print(f"[INFO] Console logging {'enabled' if enable_console_logging else 'disabled'} (via StepTracer)")
         print(f"[INFO] RewardLogger initialized: {self.num_envs} environments")
         print(f"[INFO] Performance evaluation at episodes: {milestones}")
-        print(f"[INFO] Four-zone reward system: A(Track)/B(Surface)/C(Danger)/D(Rejoin)")
+        print(f"[INFO] Four-zone reward system: A(Track)/B(Surface)/C(Danger)/D(Rejoin) - Simplified Zone D")
     
     def set_topk_update_callback(self, callback_fn):
         """Set callback for Top-K model updates at milestones."""

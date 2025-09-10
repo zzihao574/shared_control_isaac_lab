@@ -11,7 +11,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true  # Enable detailed console logging for milestone episodes
+  enable_console_logging: false  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -59,7 +59,7 @@ constraint_geometry:
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# Reward Parameters - NEW FOUR-ZONE SYSTEM (FLAT STRUCTURE)
+# Reward Parameters - SIMPLIFIED FOUR-ZONE SYSTEM (FLAT STRUCTURE)
 # ==============================================================================
 reward_parameters:
   weights:
@@ -77,12 +77,12 @@ reward_parameters:
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
 
+    # SIMPLIFIED Zone D: Only Progress + Deviation + Inward
     zoneD_weight_robot: 1.0
     zoneD_progress_robot: 1.0
-    zoneD_rejoinspeed_robot: 1.0
-    zoneD_deviation_robot: 1.0   # α·Deviation
-    zoneD_gap_robot: 0.5         # (1-α)·Gap
+    zoneD_deviation_robot: 1.0
     zoneD_inward_robot: 1.0
+    # REMOVED: zoneD_rejoinspeed_robot, zoneD_gap_robot
 
     zpenalty_robot: 0.0
     completion_robot: 0.0
@@ -104,12 +104,12 @@ reward_parameters:
     zoneC_offpen_human: 0.0
     zoneC_inward_human: 0.0
 
+    # SIMPLIFIED Zone D: Only Progress + Deviation + Inward
     zoneD_weight_human: 0.0
     zoneD_progress_human: 0.0
-    zoneD_rejoinspeed_human: 0.0
     zoneD_deviation_human: 0.0
-    zoneD_gap_human: 0.0
     zoneD_inward_human: 0.0
+    # REMOVED: zoneD_rejoinspeed_human, zoneD_gap_human
 
     zpenalty_human: 0.0
     completion_human: 0.0
