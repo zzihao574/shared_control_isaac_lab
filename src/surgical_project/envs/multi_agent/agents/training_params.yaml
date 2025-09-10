@@ -59,91 +59,63 @@ constraint_geometry:
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# Reward Parameters - NEW FOUR-ZONE SYSTEM
+# Reward Parameters - NEW FOUR-ZONE SYSTEM (FLAT STRUCTURE)
 # ==============================================================================
 reward_parameters:
-  # Robot agent reward weights - Four-zone system
-  robot_weights:
-    components:         # Global component default weights (fallback when zone doesn't specify)
-      progress: 1.0
-      deviation: 1.0
-      rejoin_speed: 1.0
-      gap: 1.0
-      surf_tangent: 1.0
-      inward_penalty: 1.0
-      off_penalty: 1.0
-    zones:
-      track:            # Zone A - Outside obstacle (d >= 1.5cm)
-        weight: 1.0
-        components:
-          progress: 1.0
-          deviation: 1.0
-      surface:          # Zone B - Near obstacle (0.75cm < d < 1.5cm)
-        weight: 1.0
-        components:
-          gap: 1.0
-          surf_tangent: 1.0
-          inward_penalty: 1.0
-      danger:           # Zone C - Inside obstacle (d <= 0.75cm)
-        weight: 1.0
-        components:
-          off_penalty: 1.0
-          inward_penalty: 1.0
-      rejoin:           # Zone D - Transition zone with geometric conditions
-        weight: 1.0
-        components:
-          progress: 1.0
-          rejoin_speed: 1.0
-          deviation: 1.0      # Will be mixed with α
-          gap: 0.5            # Will be mixed with (1-α)
-          inward_penalty: 1.0
-    # Global rewards (preserved from original system)
-    z_penalty: 0.0
-    completion_reward: 0.0
-    time_efficiency: 0.0
-    force_efficiency: 0.0
-    human_awareness: 0.0
+  weights:
+    # ===== ROBOT =====
+    zoneA_weight_robot: 1.0
+    zoneA_progress_robot: 1.0
+    zoneA_deviation_robot: 1.0
 
-  # Human agent reward weights - All disabled for single-agent phase
-  human_weights:
-    components:
-      progress: 0.0
-      deviation: 0.0
-      rejoin_speed: 0.0
-      gap: 0.0
-      surf_tangent: 0.0
-      inward_penalty: 0.0
-      off_penalty: 0.0
-    zones:
-      track:   
-        weight: 0.0
-        components: 
-          progress: 0.0
-          deviation: 0.0
-      surface: 
-        weight: 0.0
-        components: 
-          gap: 0.0
-          surf_tangent: 0.0
-          inward_penalty: 0.0
-      danger:  
-        weight: 0.0
-        components: 
-          off_penalty: 0.0
-          inward_penalty: 0.0
-      rejoin:  
-        weight: 0.0
-        components: 
-          progress: 0.0
-          rejoin_speed: 0.0
-          deviation: 0.0
-          gap: 0.0
-          inward_penalty: 0.0
-    z_penalty: 0.0
-    completion_reward: 0.0
-    time_efficiency: 0.0
-    force_efficiency: 0.0
-    robot_awareness: 0.0
+    zoneB_weight_robot: 1.0
+    zoneB_gap_robot: 1.0
+    zoneB_surftangent_robot: 1.0
+    zoneB_inward_robot: 1.0
+
+    zoneC_weight_robot: 1.0
+    zoneC_offpen_robot: 1.0
+    zoneC_inward_robot: 1.0
+
+    zoneD_weight_robot: 1.0
+    zoneD_progress_robot: 1.0
+    zoneD_rejoinspeed_robot: 1.0
+    zoneD_deviation_robot: 1.0   # α·Deviation
+    zoneD_gap_robot: 0.5         # (1-α)·Gap
+    zoneD_inward_robot: 1.0
+
+    zpenalty_robot: 0.0
+    completion_robot: 0.0
+    timeeff_robot: 0.0
+    forceeff_robot: 0.0
+    humanaware_robot: 0.0
+
+    # ===== HUMAN =====
+    zoneA_weight_human: 0.0
+    zoneA_progress_human: 0.0
+    zoneA_deviation_human: 0.0
+
+    zoneB_weight_human: 0.0
+    zoneB_gap_human: 0.0
+    zoneB_surftangent_human: 0.0
+    zoneB_inward_human: 0.0
+
+    zoneC_weight_human: 0.0
+    zoneC_offpen_human: 0.0
+    zoneC_inward_human: 0.0
+
+    zoneD_weight_human: 0.0
+    zoneD_progress_human: 0.0
+    zoneD_rejoinspeed_human: 0.0
+    zoneD_deviation_human: 0.0
+    zoneD_gap_human: 0.0
+    zoneD_inward_human: 0.0
+
+    zpenalty_human: 0.0
+    completion_human: 0.0
+    timeeff_human: 0.0
+    forceeff_human: 0.0
+    robotaware_human: 0.0
     
   completion_threshold: 0.01          # Distance threshold for completion (meters)
 

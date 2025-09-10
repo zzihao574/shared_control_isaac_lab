@@ -4,6 +4,7 @@ Grouped replay buffers with dual protection mechanism.
 Multi-agent update with single-agent control via select_actions.
 MODIFIED: Unified buffer clearing at single entry point in update()
 MODIFIED: Added debug info collection for actor network outputs
+MODIFIED: Added actor debug info injection to unwrapped env + reward consistency check
 """
 
 import torch
@@ -25,11 +26,14 @@ class MADDPG:
     - Multi-agent update logic with single-agent control via select_actions
     - MODIFIED: Unified buffer clearing at single entry point
     - MODIFIED: Debug info collection for console display
+    - MODIFIED: Actor debug info injection to unwrapped env + reward consistency check
     - Comprehensive debugging and monitoring
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
         self.env = env
+        # NEW: Always hold the true env for debug hooks (Gym wrapper safe)
+        self.actual_env = getattr(env, 'unwrapped', env)
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
@@ -188,6 +192,7 @@ class MADDPG:
         Single-agent mode: Skip human actions (they remain zero).
         Multi-agent mode: Generate actions for all agents.
         MODIFIED: Collect actor debug information for console display.
+        MODIFIED: Pass debug info to the actual env (unwrapped), so StepTracer can read it.
         """
         obs_len = observations[self.agent_ids[0]].shape[0]
         assert obs_len == self.num_envs, f"Observation dimension mismatch: {obs_len} vs {self.num_envs}"
@@ -219,9 +224,9 @@ class MADDPG:
                 debug_info['mean_actions'][agent_id][env_id] = torch.from_numpy(action_info['mean']).to(self.device)
                 debug_info['noise_actions'][agent_id][env_id] = torch.from_numpy(action_info['noise']).to(self.device)
         
-        # NEW: Pass debug info to environment for console display
-        if hasattr(self.env, 'set_debug_actor_info'):
-            self.env.set_debug_actor_info(debug_info)
+        # NEW: Pass debug info to the actual env (unwrapped), so StepTracer can read it
+        if hasattr(self.actual_env, 'set_debug_actor_info'):
+            self.actual_env.set_debug_actor_info(debug_info)
                 
         return actions
     
@@ -241,6 +246,20 @@ class MADDPG:
             env_rewards = {aid: rewards[aid][env_id] for aid in self.agent_ids}
             env_next_obs = {aid: next_obs[aid][env_id] for aid in self.agent_ids}
             env_dones = {aid: is_done for aid in self.agent_ids}
+            
+            # === NEW: reward consistency check (console prints vs buffer) ===
+            try:
+                actual_env = self.actual_env
+                if hasattr(actual_env, "debug_last_rewards"):
+                    dbg = actual_env.debug_last_rewards  # dict {'robot': tensor[num_envs], 'human': ...}
+                    for aid in self.agent_ids:
+                        r_buf = float(env_rewards[aid].detach().cpu().numpy())
+                        r_dbg = float(dbg[aid][env_id].detach().cpu().numpy())
+                        if abs(r_buf - r_dbg) > 1e-6:
+                            print(f"[WARN][RewardMismatch] env{env_id} {aid}: buffer={r_buf:+.6f}, console_src={r_dbg:+.6f}")
+            except Exception as _e:
+                # 纯调试：不影响训练
+                pass
             
             # 由于别名绑定，同组env会自动写入同一个shared buffer
             self.env_replay_buffers[env_id].add(env_obs, env_actions, env_rewards, env_next_obs, env_dones)

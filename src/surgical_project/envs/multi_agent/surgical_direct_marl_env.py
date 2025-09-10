@@ -1,6 +1,7 @@
-# surgical_direct_marl_env.py - Modified for unified progress management and MetricsHub
+# surgical_direct_marl_env.py - Simplified Zone Functions with Inline Component Calculations
 # NEW: Four-zone reward system with A/B/C/D regions (preserving Isaac Lab method names)
 # NEW: Actor debug info collection for console display
+# MODIFIED: Simplified zone functions with inline calculations, maintaining console display support
 
 from __future__ import annotations
 
@@ -24,8 +25,9 @@ from .utils import CompleteConstraintChecker, TrajectoryManager, RewardLogger
 class SurgicalDirectMARLEnv(DirectMARLEnv):
     """
     Human-robot collaborative surgical MARL environment.
-    MODIFIED: NEW Four-zone reward system (A/B/C/D) with robot/human symmetric rewards
+    MODIFIED: Simplified four-zone reward system (A/B/C/D) with inline component calculations
     MODIFIED: Actor debug info collection for console display
+    MODIFIED: Reduced code redundancy while maintaining console display support
     
     Features:
     - Multi-agent force control for surgical tasks
@@ -35,6 +37,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Performance evaluation and milestone tracking
     - Console logging via utils (configured by YAML)
     - Actor network debug information display
+    - Simplified zone functions with inline calculations
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -192,6 +195,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.prev_progress = torch.zeros(self.num_envs, device=self.device)
         self.best_progress = torch.zeros(self.num_envs, device=self.device)
         
+        # NEW: t-1时刻的stylus位置缓存
+        self.stylus_pos_t0 = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # NEW: 原地/后退步数累计器
+        self.stall_back_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        
         # Rejoin zone "10-step stability gate"
         self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         
@@ -301,6 +310,25 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if len(self._omni_robot.body_names) > 0:
             self.stylus_body_idx = len(self._omni_robot.body_names) - 1
             print(f"[INFO] Using fallback stylus body index: {self.stylus_body_idx}")
+    
+    # =========================================================================
+    # NEW: Weight accessor methods (replaces _zweight/_zcw)
+    # =========================================================================
+    
+    def _w(self, key: str, default: float = 0.0) -> float:
+        """Get weight from flat YAML structure with fallback."""
+        try:
+            return float(self.params['reward_parameters']['weights'].get(key, default))
+        except Exception:
+            return float(default)
+
+    def _zone_w(self, zone_letter: str, agent: str) -> float:
+        """Get zone weight (e.g., zoneA_weight_robot)."""
+        return self._w(f'zone{zone_letter}_weight_{agent}', 0.0)
+
+    def _comp_w(self, zone_letter: str, comp: str, agent: str) -> float:
+        """Get component weight (e.g., zoneA_progress_robot)."""
+        return self._w(f'zone{zone_letter}_{comp}_{agent}', 0.0)
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing including action validation and force application."""
@@ -374,6 +402,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """Compute observations for all agents and update state cache."""
+        # NEW: 在更新t+1状态前，先缓存当前t+1状态作为下一步的t0
+        if hasattr(self, 'stylus_pos_t1'):
+            self.stylus_pos_t0 = self.stylus_pos_t1.clone()
+        else:
+            self.stylus_pos_t0 = torch.zeros(self.num_envs, 3, device=self.device)
+        
         # Update all state cache (t+1 state after physics)
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
@@ -449,61 +483,99 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         return outside, surface, danger, rejoin, alpha
 
-    def _zweight(self, W: dict, zone: str, default: float = 1.0) -> float:
-        """Get zone total weight with fallback."""
-        z = W.get('zones', {}).get(zone, default)
-        if isinstance(z, dict):
-            return float(z.get('weight', default))
-        return float(z)
-
-    def _zcw(self, W: dict, zone: str, comp_key: str, default: float = 1.0) -> float:
-        """Get zone-component weight with fallback to global components."""
-        z = W.get('zones', {}).get(zone, {})
-        if isinstance(z, dict):
-            cz = z.get('components', {})
-            if comp_key in cz:
-                return float(cz[comp_key])
-        return float(W.get('components', {}).get(comp_key, default))
-
     # =========================================================================
-    # Component reward functions (raw scores with physical coefficients)
+    # SIMPLIFIED ZONE REWARD FUNCTIONS (inline calculations)
     # =========================================================================
 
-    def _comp_progress(self):
-        """Progress component: effective progress delta."""
-        s_t = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-        baseline = torch.maximum(self.best_progress, self.prev_progress)
-        delta = (s_t - baseline).clamp(min=0.0)
-        kappa = 600.0
-        raw = kappa * delta
+    def _zone_A_reward(self, masks, agent: str):
+        """Zone A (Track): Outside obstacle boundary (d >= 1.5cm) - Inline calculations."""
+        outside, surface, danger, rejoin, alpha = masks
         
-        # Update best progress
-        advanced = delta > 0
-        if torch.any(advanced):
-            self.best_progress[advanced] = torch.maximum(self.best_progress[advanced], s_t[advanced])
-        return raw
-
-    def _comp_deviation(self):
-        """Deviation component: trajectory precision."""
-        eta = 33.3
+        # === INLINE PROGRESS CALCULATION ===
+        T = 1200.0  # Total steps in episode
+        eps = 1e-6  # Epsilon for floating point comparison
+        
+        # Get current and previous progress ratios (clamped to valid range)
+        p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
+        p_tm1 = self.trajectory_manager.get_progress(self.stylus_pos_t0).clamp(0.0, 1.0)
+        best_p_tm1 = self.best_progress.clone()
+        
+        # 1) Forward reward (strict proportional, capped at 4 points)
+        # Only reward progress that beats historical best
+        delta_p = p_t - best_p_tm1
+        reward_forward = torch.clamp(delta_p * T, min=0.0, max=4.0)
+        
+        # 2) Stall/backward detection and step accumulation
+        # Stall: no movement AND no improvement over best
+        is_stall = (torch.abs(p_t - p_tm1) <= eps) & (p_t <= best_p_tm1 + eps)
+        # Backward: clear regression from previous step
+        is_back = (p_t < p_tm1 - eps)
+        
+        # Calculate backward step penalty (proportional to regression)
+        back_steps = torch.floor(torch.clamp((p_tm1 - p_t) * T, min=0.0))
+        
+        # Increment counter: +1 for stall, +max(1, back_steps) for backward
+        incr = torch.where(is_back, torch.clamp(back_steps, min=1.0),
+                           torch.where(is_stall, torch.ones_like(back_steps), 
+                                       torch.zeros_like(back_steps)))
+        
+        # Only accumulate penalty when no new best is achieved
+        no_new_best = (reward_forward <= 0)
+        self.stall_back_count = torch.where(
+            no_new_best,
+            self.stall_back_count + incr.to(self.stall_back_count.dtype),
+            torch.zeros_like(self.stall_back_count)  # Reset counter on new best
+        )
+        
+        # Penalty: -0.5 per accumulated step, capped at -4 points
+        penalty = -0.5 * torch.clamp(self.stall_back_count.float(), max=8.0)
+        
+        # 3) Combine final raw score
+        prog_raw = torch.where(reward_forward > 0, reward_forward, penalty)
+        
+        # 4) Update historical best progress
+        self.best_progress = torch.maximum(best_p_tm1, p_t)
+        
+        # === INLINE DEVIATION CALCULATION ===
+        # Linear penalty: 1cm = -0.5, 2cm = -1, max penalty = -4
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        return eta * torch.clamp(0.025 - deviations, min=-0.05, max=0.015)
+        dev_raw = -torch.clamp(deviations * 50.0, min=0.0, max=4.0)  # 0.01m * 50 = 0.5
+        
+        # === ZONE A COMBINATION ===
+        wp = self._comp_w('A', 'progress', agent)
+        wd = self._comp_w('A', 'deviation', agent)
+        zw = self._zone_w('A', agent)
 
-    def _comp_rejoin_speed(self):
-        """Rejoin speed component: velocity along trajectory."""
-        mu = 8.0
-        t = self.trajectory_manager.line_direction
-        v_t = (self.stylus_vel_t1 * t.unsqueeze(0)).sum(dim=-1)
-        return mu * v_t
+        prog_contrib = wp * prog_raw
+        dev_contrib = wd * dev_raw
+        zone_total = zw * (prog_contrib + dev_contrib)
 
-    def _comp_surface_gap(self):
-        """Surface gap component: maintain optimal distance."""
+        out = torch.zeros_like(prog_raw)
+        out[outside] = zone_total[outside]
+
+        # Store for console display
+        RC, device = self.reward_components, prog_raw.device
+        RC[f'zoneA_weight_{agent}'] = torch.tensor(zw, device=device)
+        RC[f'zoneA_total_{agent}'] = zone_total
+        RC[f'zoneA_progress_{agent}_raw'] = prog_raw
+        RC[f'zoneA_progress_{agent}_weight'] = torch.tensor(wp, device=device)
+        RC[f'zoneA_progress_{agent}_contrib'] = prog_contrib
+        RC[f'zoneA_deviation_{agent}_raw'] = dev_raw
+        RC[f'zoneA_deviation_{agent}_weight'] = torch.tensor(wd, device=device)
+        RC[f'zoneA_deviation_{agent}_contrib'] = dev_contrib
+
+        return out
+
+    def _zone_B_reward(self, masks, agent: str):
+        """Zone B (Surface): Near obstacle (0.75cm < d < 1.5cm), not in rejoin - Inline calculations."""
+        outside, surface, danger, rejoin, alpha = masks
+        
+        # === INLINE GAP CALCULATION ===
         beta = 8.0e4
         d = self.safety_distances_t1
-        return -beta * (d - 0.010) ** 2
-
-    def _comp_surface_tangent(self):
-        """Surface tangent component: move along surface."""
+        gap_raw = -beta * (d - 0.010) ** 2
+        
+        # === INLINE SURFACE TANGENT CALCULATION ===
         gamma = 10.0
         t = self.trajectory_manager.line_direction
         n = self.normal_t1
@@ -515,114 +587,230 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         # Velocity along surface tangent
         v_surf = (self.stylus_vel_t1 * t_surf).sum(dim=-1)
-        return gamma * v_surf
-
-    def _comp_inward_penalty(self):
-        """Inward penalty component: penalize moving into obstacle."""
+        surf_raw = gamma * v_surf
+        
+        # === INLINE INWARD CALCULATION ===
         lam = 30.0
         v_in = (-(self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)).clamp(min=0.0)
-        return -lam * v_in  # Returns negative values
-
-    # =========================================================================
-    # Zone reward functions (mutually exclusive, only active in respective masks)
-    # =========================================================================
-
-    def _zone_track_reward(self, masks, W):
-        """Zone A (Track): Outside obstacle boundary (d >= 1.5cm)."""
-        outside, surface, danger, rejoin, alpha = masks
+        inward_raw = -lam * v_in  # Returns negative values
         
-        prog = self._comp_progress()
-        dev = self._comp_deviation()
+        # === ZONE B COMBINATION ===
+        wg = self._comp_w('B', 'gap', agent)
+        ws = self._comp_w('B', 'surftangent', agent)
+        wi = self._comp_w('B', 'inward', agent)
+        zw = self._zone_w('B', agent)
         
-        w_prog = self._zcw(W, 'track', 'progress')
-        w_dev = self._zcw(W, 'track', 'deviation')
+        gap_contrib = wg * gap_raw
+        surf_contrib = ws * surf_raw
+        inward_contrib = wi * inward_raw
+        zone_total = zw * (gap_contrib + surf_contrib + inward_contrib)
         
-        raw = w_prog * prog + w_dev * dev
-        out = torch.zeros_like(prog)
-        out[outside] = raw[outside]
-        
-        zw = self._zweight(W, 'track')
-        return zw * out, {
-            'A_progress_w': w_prog * prog,
-            'A_deviation_w': w_dev * dev
-        }
-
-    def _zone_surface_reward(self, masks, W):
-        """Zone B (Surface): Near obstacle (0.75cm < d < 1.5cm), not in rejoin."""
-        outside, surface, danger, rejoin, alpha = masks
-        
-        gap = self._comp_surface_gap()
-        surf = self._comp_surface_tangent()
-        inwd = self._comp_inward_penalty()
-        
-        w_gap = self._zcw(W, 'surface', 'gap')
-        w_surf = self._zcw(W, 'surface', 'surf_tangent')
-        w_in = self._zcw(W, 'surface', 'inward_penalty')
-        
-        raw = w_gap * gap + w_surf * surf + w_in * inwd
-        out = torch.zeros_like(gap)
+        out = torch.zeros_like(gap_raw)
         surface_only = surface & (~rejoin)
-        out[surface_only] = raw[surface_only]
+        out[surface_only] = zone_total[surface_only]
         
-        zw = self._zweight(W, 'surface')
-        return zw * out, {
-            'B_gap_w': w_gap * gap,
-            'B_surf_tangent_w': w_surf * surf,
-            'B_inward_w': w_in * inwd
-        }
+        # Store for console display
+        RC, device = self.reward_components, gap_raw.device
+        RC[f'zoneB_weight_{agent}'] = torch.tensor(zw, device=device)
+        RC[f'zoneB_total_{agent}'] = zone_total
+        RC[f'zoneB_gap_{agent}_raw'] = gap_raw
+        RC[f'zoneB_gap_{agent}_weight'] = torch.tensor(wg, device=device)
+        RC[f'zoneB_gap_{agent}_contrib'] = gap_contrib
+        RC[f'zoneB_surftangent_{agent}_raw'] = surf_raw
+        RC[f'zoneB_surftangent_{agent}_weight'] = torch.tensor(ws, device=device)
+        RC[f'zoneB_surftangent_{agent}_contrib'] = surf_contrib
+        RC[f'zoneB_inward_{agent}_raw'] = inward_raw
+        RC[f'zoneB_inward_{agent}_weight'] = torch.tensor(wi, device=device)
+        RC[f'zoneB_inward_{agent}_contrib'] = inward_contrib
 
-    def _zone_danger_reward(self, masks, W):
-        """Zone C (Danger): Inside obstacle (d <= 0.75cm)."""
+        return out
+
+    def _zone_C_reward(self, masks, agent: str):
+        """Zone C (Danger): Inside obstacle (d <= 0.75cm) - Inline calculations."""
         outside, surface, danger, rejoin, alpha = masks
         
+        # === INLINE OFF-PENALTY CALCULATION ===
         R_off = -0.6
-        inwd = self._comp_inward_penalty()
+        offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
         
-        w_off = self._zcw(W, 'danger', 'off_penalty')
-        w_in = self._zcw(W, 'danger', 'inward_penalty')
+        # === INLINE INWARD CALCULATION ===
+        lam = 30.0
+        v_in = (-(self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)).clamp(min=0.0)
+        inward_raw = -lam * v_in  # Returns negative values
         
-        raw = w_off * (R_off * torch.ones_like(inwd)) + w_in * inwd
-        out = torch.zeros_like(inwd)
-        out[danger] = raw[danger]
+        # === ZONE C COMBINATION ===
+        wo = self._comp_w('C', 'offpen', agent)
+        wi = self._comp_w('C', 'inward', agent)
+        zw = self._zone_w('C', agent)
         
-        zw = self._zweight(W, 'danger')
-        return zw * out, {
-            'C_off_w': w_off * (R_off * torch.ones_like(inwd)),
-            'C_inward_w': w_in * inwd
-        }
+        offpen_contrib = wo * offpen_raw
+        inward_contrib = wi * inward_raw
+        zone_total = zw * (offpen_contrib + inward_contrib)
+        
+        out = torch.zeros_like(offpen_raw)
+        out[danger] = zone_total[danger]
+        
+        # Store for console display
+        RC, device = self.reward_components, offpen_raw.device
+        RC[f'zoneC_weight_{agent}'] = torch.tensor(zw, device=device)
+        RC[f'zoneC_total_{agent}'] = zone_total
+        RC[f'zoneC_offpen_{agent}_raw'] = offpen_raw
+        RC[f'zoneC_offpen_{agent}_weight'] = torch.tensor(wo, device=device)
+        RC[f'zoneC_offpen_{agent}_contrib'] = offpen_contrib
+        RC[f'zoneC_inward_{agent}_raw'] = inward_raw
+        RC[f'zoneC_inward_{agent}_weight'] = torch.tensor(wi, device=device)
+        RC[f'zoneC_inward_{agent}_contrib'] = inward_contrib
 
-    def _zone_rejoin_reward(self, masks, W):
-        """Zone D (Rejoin): Transition zone with geometric conditions and 10-step gate."""
+        return out
+
+    def _zone_D_reward(self, masks, agent: str):
+        """Zone D (Rejoin): Transition zone with geometric conditions and 10-step gate - Inline calculations."""
         outside, surface, danger, rejoin, alpha = masks
         
-        prog = self._comp_progress()
-        rspd = self._comp_rejoin_speed()
-        dev = self._comp_deviation()
-        gap = self._comp_surface_gap()
-        inwd = self._comp_inward_penalty()
+        # === INLINE PROGRESS CALCULATION (same as Zone A) ===
+        T = 1200.0  # Total steps in episode
+        eps = 1e-6  # Epsilon for floating point comparison
         
-        # Alpha mixing
-        dev_mix = alpha * dev
-        gap_mix = (1.0 - alpha) * gap
+        # Get current and previous progress ratios (clamped to valid range)
+        p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
+        p_tm1 = self.trajectory_manager.get_progress(self.stylus_pos_t0).clamp(0.0, 1.0)
+        best_p_tm1 = self.best_progress.clone()
         
-        w_prog = self._zcw(W, 'rejoin', 'progress')
-        w_rspd = self._zcw(W, 'rejoin', 'rejoin_speed')
-        w_dev = self._zcw(W, 'rejoin', 'deviation')
-        w_gap = self._zcw(W, 'rejoin', 'gap')
-        w_in = self._zcw(W, 'rejoin', 'inward_penalty')
+        # 1) Forward reward (strict proportional, capped at 4 points)
+        delta_p = p_t - best_p_tm1
+        reward_forward = torch.clamp(delta_p * T, min=0.0, max=4.0)
         
-        raw = w_prog * prog + w_rspd * rspd + w_dev * dev_mix + w_gap * gap_mix + w_in * inwd
-        out = torch.zeros_like(prog)
-        out[rejoin] = raw[rejoin]
+        # 2) Stall/backward detection and step accumulation
+        is_stall = (torch.abs(p_t - p_tm1) <= eps) & (p_t <= best_p_tm1 + eps)
+        is_back = (p_t < p_tm1 - eps)
         
-        zw = self._zweight(W, 'rejoin')
-        return zw * out, {
-            'D_progress_w': w_prog * prog,
-            'D_rejoin_speed_w': w_rspd * rspd,
-            'D_deviation_w': w_dev * dev_mix,
-            'D_gap_w': w_gap * gap_mix,
-            'D_inward_w': w_in * inwd,
-        }
+        back_steps = torch.floor(torch.clamp((p_tm1 - p_t) * T, min=0.0))
+        incr = torch.where(is_back, torch.clamp(back_steps, min=1.0),
+                           torch.where(is_stall, torch.ones_like(back_steps), 
+                                       torch.zeros_like(back_steps)))
+        
+        no_new_best = (reward_forward <= 0)
+        self.stall_back_count = torch.where(
+            no_new_best,
+            self.stall_back_count + incr.to(self.stall_back_count.dtype),
+            torch.zeros_like(self.stall_back_count)
+        )
+        
+        penalty = -0.5 * torch.clamp(self.stall_back_count.float(), max=8.0)
+        prog_raw = torch.where(reward_forward > 0, reward_forward, penalty)
+        self.best_progress = torch.maximum(best_p_tm1, p_t)
+        
+        # === INLINE REJOIN SPEED CALCULATION ===
+        mu = 8.0
+        t = self.trajectory_manager.line_direction
+        v_t = (self.stylus_vel_t1 * t.unsqueeze(0)).sum(dim=-1)
+        rjs_raw = mu * v_t
+        
+        # === INLINE DEVIATION CALCULATION ===
+        eta = 33.3
+        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        dev_raw = eta * torch.clamp(0.025 - deviations, min=-0.05, max=0.015)
+        
+        # === INLINE GAP CALCULATION ===
+        beta = 8.0e4
+        d = self.safety_distances_t1
+        gap_raw = -beta * (d - 0.010) ** 2
+        
+        # === INLINE INWARD CALCULATION ===
+        lam = 30.0
+        v_in = (-(self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)).clamp(min=0.0)
+        inward_raw = -lam * v_in
+        
+        # === ALPHA MIXING ===
+        dev_raw_mixed = alpha * dev_raw
+        gap_raw_mixed = (1.0 - alpha) * gap_raw
+        
+        # === ZONE D COMBINATION ===
+        wp = self._comp_w('D', 'progress', agent)
+        wr = self._comp_w('D', 'rejoinspeed', agent)
+        wd = self._comp_w('D', 'deviation', agent)
+        wg = self._comp_w('D', 'gap', agent)
+        wi = self._comp_w('D', 'inward', agent)
+        zw = self._zone_w('D', agent)
+        
+        prog_contrib = wp * prog_raw
+        rjs_contrib = wr * rjs_raw
+        dev_contrib = wd * dev_raw_mixed
+        gap_contrib = wg * gap_raw_mixed
+        inw_contrib = wi * inward_raw
+        
+        zone_total = zw * (prog_contrib + rjs_contrib + dev_contrib + gap_contrib + inw_contrib)
+        
+        out = torch.zeros_like(prog_raw)
+        out[rejoin] = zone_total[rejoin]
+        
+        # Store for console display
+        RC, device = self.reward_components, prog_raw.device
+        RC[f'zoneD_weight_{agent}'] = torch.tensor(zw, device=device)
+        RC[f'zoneD_total_{agent}'] = zone_total
+        RC[f'zoneD_progress_{agent}_raw'] = prog_raw
+        RC[f'zoneD_progress_{agent}_weight'] = torch.tensor(wp, device=device)
+        RC[f'zoneD_progress_{agent}_contrib'] = prog_contrib
+        RC[f'zoneD_rejoinspeed_{agent}_raw'] = rjs_raw
+        RC[f'zoneD_rejoinspeed_{agent}_weight'] = torch.tensor(wr, device=device)
+        RC[f'zoneD_rejoinspeed_{agent}_contrib'] = rjs_contrib
+        RC[f'zoneD_deviation_{agent}_raw'] = dev_raw_mixed
+        RC[f'zoneD_deviation_{agent}_weight'] = torch.tensor(wd, device=device)
+        RC[f'zoneD_deviation_{agent}_contrib'] = dev_contrib
+        RC[f'zoneD_gap_{agent}_raw'] = gap_raw_mixed
+        RC[f'zoneD_gap_{agent}_weight'] = torch.tensor(wg, device=device)
+        RC[f'zoneD_gap_{agent}_contrib'] = gap_contrib
+        RC[f'zoneD_inward_{agent}_raw'] = inward_raw
+        RC[f'zoneD_inward_{agent}_weight'] = torch.tensor(wi, device=device)
+        RC[f'zoneD_inward_{agent}_contrib'] = inw_contrib
+
+        return out
+
+    # =========================================================================
+    # Global reward functions with three-piece structure
+    # =========================================================================
+
+    def _globals_for_agent(self, agent: str):
+        """Calculate global rewards for agent with three-piece structure."""
+        RC, dev = self.reward_components, self.device
+
+        # Z penalty
+        z_raw = self._calculate_z_penalty()
+        zw = self._w(f'zpenalty_{agent}', 0.0)
+        RC[f'global_zpenalty_{agent}_raw'] = z_raw
+        RC[f'global_zpenalty_{agent}_weight'] = torch.tensor(zw, device=dev)
+        RC[f'global_zpenalty_{agent}_contrib'] = z_raw * zw
+
+        # completion
+        c_raw = self._calculate_completion_reward()
+        cw = self._w(f'completion_{agent}', 0.0)
+        RC[f'global_completion_{agent}_raw'] = c_raw
+        RC[f'global_completion_{agent}_weight'] = torch.tensor(cw, device=dev)
+        RC[f'global_completion_{agent}_contrib'] = c_raw * cw
+
+        # time efficiency
+        t_raw = self._calculate_time_efficiency_reward()
+        tw = self._w(f'timeeff_{agent}', 0.0)
+        RC[f'global_timeeff_{agent}_raw'] = t_raw
+        RC[f'global_timeeff_{agent}_weight'] = torch.tensor(tw, device=dev)
+        RC[f'global_timeeff_{agent}_contrib'] = t_raw * tw
+
+        # own force
+        f_raw = self._calculate_force_penalties()[agent]
+        fw = self._w(f'forceeff_{agent}', 0.0)
+        RC[f'{agent}force_raw'] = f_raw
+        RC[f'{agent}force_weight'] = torch.tensor(fw, device=dev)
+        RC[f'{agent}force_contrib'] = f_raw * fw
+
+        # awareness (other agent)
+        other = 'human' if agent == 'robot' else 'robot'
+        aw_key = 'humanaware_robot' if agent == 'robot' else 'robotaware_human'
+        aw_raw = self._calculate_force_penalties()[other]
+        aw_w = self._w(aw_key, 0.0)
+        label = 'humanaware' if agent == 'robot' else 'robotaware'
+        RC[f'{label}_raw'] = aw_raw
+        RC[f'{label}_weight'] = torch.tensor(aw_w, device=dev)
+        RC[f'{label}_contrib'] = aw_raw * aw_w
 
     # =========================================================================
     # Isaac Lab required method name: _get_rewards (CANNOT be changed)
@@ -630,89 +818,49 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
         """NEW: Four-zone reward system with robot/human symmetric rewards (Isaac Lab required method)."""
-        # 1) Get reward weights
-        robot_w = self.params['reward_parameters']['robot_weights']
-        human_w = self.params['reward_parameters']['human_weights']
-
-        # 2) Build zone masks and alpha
+        self.reward_components = {}  # Reset each step
         masks = self._build_zone_masks()
 
-        # 3) Calculate four-zone rewards for both agents
-        A_r, A_parts_r = self._zone_track_reward(masks, robot_w)
-        B_r, B_parts_r = self._zone_surface_reward(masks, robot_w)
-        C_r, C_parts_r = self._zone_danger_reward(masks, robot_w)
-        D_r, D_parts_r = self._zone_rejoin_reward(masks, robot_w)
+        def _agent_zone_sum(agent: str):
+            ZA = self._zone_A_reward(masks, agent)
+            ZB = self._zone_B_reward(masks, agent)
+            ZC = self._zone_C_reward(masks, agent)
+            ZD = self._zone_D_reward(masks, agent)
+            return ZA + ZB + ZC + ZD
 
-        A_h, A_parts_h = self._zone_track_reward(masks, human_w)
-        B_h, B_parts_h = self._zone_surface_reward(masks, human_w)
-        C_h, C_parts_h = self._zone_danger_reward(masks, human_w)
-        D_h, D_parts_h = self._zone_rejoin_reward(masks, human_w)
+        robot_zones = _agent_zone_sum('robot')
+        human_zones = _agent_zone_sum('human')
 
-        # 4) Calculate global rewards (preserved from original system)
-        force_pen = self._calculate_force_penalties()   # {'robot': tensor, 'human': tensor}
-        z_pen = self._calculate_z_penalty()             # tensor[num_envs]
-        completion = self._calculate_completion_reward()  # tensor[num_envs]
-        time_eff = self._calculate_time_efficiency_reward()  # tensor[num_envs]
+        self._globals_for_agent('robot')
+        self._globals_for_agent('human')
 
-        # 5) Aggregate final rewards for each agent
-        rewards = {}
-        rewards["robot"] = (
-            A_r + B_r + C_r + D_r
-            + force_pen['robot'] * robot_w.get('force_efficiency', 0.0)
-            + force_pen['human'] * robot_w.get('human_awareness', 0.0)
-            + z_pen * robot_w.get('z_penalty', 0.0)
-            + completion * robot_w.get('completion_reward', 0.0)
-            + time_eff * robot_w.get('time_efficiency', 0.0)
-        )
-        rewards["human"] = (
-            A_h + B_h + C_h + D_h
-            + force_pen['human'] * human_w.get('force_efficiency', 0.0)
-            + force_pen['robot'] * human_w.get('robot_awareness', 0.0)  # Note: robot_awareness for human
-            + z_pen * human_w.get('z_penalty', 0.0)
-            + completion * human_w.get('completion_reward', 0.0)
-            + time_eff * human_w.get('time_efficiency', 0.0)
-        )
+        def _agent_total(agent: str):
+            RC = self.reward_components
+            globals_sum = (
+                RC[f'global_zpenalty_{agent}_contrib'] +
+                RC[f'global_completion_{agent}_contrib'] +
+                RC[f'global_timeeff_{agent}_contrib'] +
+                RC[f'{agent}force_contrib'] +
+                (RC['humanaware_contrib'] if agent=='robot' else RC['robotaware_contrib'])
+            )
+            return (robot_zones if agent=='robot' else human_zones) + globals_sum
 
-        # 6) Calculate observables (required by update_step_metrics_batch)
+        rewards = {'robot': _agent_total('robot'), 'human': _agent_total('human')}
+
+        # Public indicators for RewardLogger
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         distance_to_final = torch.norm(
             self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), dim=-1
         )
+        self.reward_components['deviation'] = deviations
+        self.reward_components['progress_ratio'] = progress_ratio
+        self.reward_components['distance_to_final'] = distance_to_final
 
-        # 7) Build comprehensive reward_components for logging (robot & human dual-copy)
-        self.reward_components = {
-            # ---- Zone totals (robot) ----
-            'robot_A_track_total': A_r,
-            'robot_B_surface_total': B_r,
-            'robot_C_danger_total': C_r,
-            'robot_D_rejoin_total': D_r,
-            # ---- Zone totals (human) ----
-            'human_A_track_total': A_h,
-            'human_B_surface_total': B_h,
-            'human_C_danger_total': C_h,
-            'human_D_rejoin_total': D_h,
-
-            # ---- Robot component breakdowns ----
-            **{k.replace('_w', '_robot_w'): v for k, v in {**A_parts_r, **B_parts_r, **C_parts_r, **D_parts_r}.items()},
-            # ---- Human component breakdowns ----
-            **{k.replace('_w', '_human_w'): v for k, v in {**A_parts_h, **B_parts_h, **C_parts_h, **D_parts_h}.items()},
-
-            # ---- Global components (raw values) ----
-            'robot_force_penalty': force_pen['robot'],
-            'human_force_penalty': force_pen['human'],
-            'z_penalty': z_pen,
-            'completion_reward': completion,
-            'time_efficiency_reward': time_eff,
-
-            # ---- Observables (required by update_step_metrics_batch) ----
-            'deviation': deviations,
-            'progress_ratio': progress_ratio,
-            'distance_to_final': distance_to_final,
-        }
-
-        # 8) Logging and batch updates (unchanged interface)
-        self.reward_logger.log_console_if_enabled(self, rewards, robot_w, human_w)
+        # Call utils with new signature (no robot_weights/human_weights parameters)
+        current_step = getattr(self, 'step_counter', getattr(self, '_sim_step_counter', 0))
+        active_envs = getattr(self, 'active_env_ids', None)
+        self.reward_logger.log_console_if_enabled(self, rewards, current_step, active_envs)
         self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
         
         return rewards
@@ -841,6 +989,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.prev_progress[env_ids] = 0.0
         self.best_progress[env_ids] = 0.0
         self.rejoin_streak[env_ids] = 0
+
+        # NEW: Reset strict progress tracking variables
+        self.stylus_pos_t0[env_ids] = torch.zeros((num_resets, 3), device=self.device)
+        self.stall_back_count[env_ids] = 0
 
         # NEW: Reset actor debug info caches
         for agent in self.cfg.possible_agents:

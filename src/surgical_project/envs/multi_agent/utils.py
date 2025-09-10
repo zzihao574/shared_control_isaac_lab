@@ -3,7 +3,8 @@ Environment utilities for surgical robot training.
 Contains constraint checking, trajectory management, and reward logging utilities.
 Modified to support active environment filtering and dual protection mechanism.
 MODIFIED: Updated EpisodeAccumulator, simplified StepTracer, updated RewardLogger for MetricsHub integration
-MODIFIED: NEW Four-zone reward system console printing (A/B/C/D regions) with actor debug info
+MODIFIED: NEW Four-zone reward system console printing (A/B/C/D regions) with flat keys
+MODIFIED: Enhanced StepTracer with force consistency checks
 """
 
 import torch
@@ -299,8 +300,10 @@ class EpisodeAccumulator:
 
 class StepTracer:
     """
-    MODIFIED: NEW Four-zone reward system console printing with A/B/C/D region breakdown and actor debug info.
+    MODIFIED: NEW Four-zone reward system console printing with A/B/C/D region breakdown.
     Enhanced with active environment filtering for dual protection mechanism.
+    MODIFIED: Enhanced with force consistency checks and detailed actor debug output.
+    MODIFIED: Uses flat keys aligned with environment reward_components.
     """
     
     def __init__(self, num_envs: int, device: torch.device,
@@ -312,93 +315,68 @@ class StepTracer:
         self.enable_console_logging = enable_console_logging
         self.print_every_steps = print_every_steps
         self.max_envs_to_print = max_envs_to_print
-        
-        # Track previously active environments to show one-time notifications
-        self.previously_active_envs = set(range(num_envs))
 
-    def maybe_print_step(self, env, rewards: Dict, robot_weights: dict, human_weights: dict, current_step: int, active_envs: Optional[List[int]] = None):
+    def maybe_print_step(self, env, rewards: Dict, current_step: int, active_envs: Optional[List[int]] = None):
         """
         NEW: Four-zone console printing (A/B/C/D) with component breakdowns and actor debug info.
         Console print (zero storage) - only for active environments when enabled and throttled by step frequency.
-        Enhanced with active environment filtering for dual protection mechanism.
-        Shows weighted contributions for each zone and component.
         """
         if not self.enable_console_logging:
             return
         if current_step % self.print_every_steps != 0:
             return
 
-        # Show notifications for newly inactive environments (one time only)
-        if active_envs is not None:
-            current_active_set = set(active_envs)
-            newly_inactive = self.previously_active_envs - current_active_set
-            if newly_inactive:
-                print(f"\n[INACTIVE] Environments {sorted(newly_inactive)} are no longer active (dual protection)")
-            self.previously_active_envs = current_active_set
-
-        # Only show first N active environments to avoid screen flooding
-        print(f"\n{'='*80}")
-        print(f"STEP {current_step} - Four-Zone Reward System (A/B/C/D) - Active Environments Only")
-        print(f"{'='*80}")
-        
         if active_envs is None:
-            # Fallback: print all environments
-            ids_to_print = range(min(self.max_envs_to_print, env.num_envs))
-            print("(Fallback mode: showing all environments)")
-        else:
-            ids_to_print = active_envs[:self.max_envs_to_print]
-            print(f"Active environments: {len(active_envs)}/{env.num_envs} | Showing first {min(len(active_envs), self.max_envs_to_print)}")
-        
-        for env_id in ids_to_print:
-            self._print_environment_four_zones(env, env_id, rewards, robot_weights, human_weights)
+            active_envs = list(range(self.num_envs))
+        if not active_envs:
+            return
 
-    def _print_environment_four_zones(self, env, env_id: int, rewards: Dict, robot_weights: dict, human_weights: dict):
-        """NEW: Print four-zone reward breakdown for a single environment with actor debug info."""
-        
-        # Header with basic environment state including normal vector
+        to_show = active_envs[:self.max_envs_to_print]
+
+        print("=" * 80)
+        print(f"STEP {current_step} - Four-Zone Reward System (A/B/C/D) - Active Environments Only")
+        print("=" * 80)
+        print(f"Active environments: {len(active_envs)}/{self.num_envs} | Showing first {len(to_show)}")
+
+        for env_id in to_show:
+            self._print_env_snapshot(env, env_id)
+
+        robot_total = rewards.get("robot", torch.zeros(self.num_envs, device=self.device))[active_envs].mean().item()
+        human_total = rewards.get("human", torch.zeros(self.num_envs, device=self.device))[active_envs].mean().item()
+        print(f"\n[TOTALS] Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {robot_total + human_total:+.3f}")
+
+    def _print_env_snapshot(self, env, env_id: int):
+        """Print four-zone reward breakdown for a single environment."""
         stylus = env.stylus_pos_t1[env_id]
-        dev = env.reward_components['deviation'][env_id].item()
-        prog = env.reward_components['progress_ratio'][env_id].item()
-        dist = env.reward_components['distance_to_final'][env_id].item()
-        safety = env.safety_distances_t1[env_id].item()
+        safety = float(env.safety_distances_t1[env_id].item())
         normal = env.normal_t1[env_id]
-        
+        dev = float(env.reward_components['deviation'][env_id].item())
+        prog = float(env.reward_components['progress_ratio'][env_id].item())
+        dist = float(env.reward_components['distance_to_final'][env_id].item())
+
         print(f"\n--- [ACTIVE] Environment {env_id} ---")
         print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
         print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
-        
-        # NEW: Display actor network outputs and noise
+
         self._print_actor_debug_info(env, env_id)
-        
+
         print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
-        
-        # Determine which zone is currently active
+
         D, O = 0.0075, 0.015
-        if safety >= O:
-            active_zone = "A (Track)"
-        elif safety <= D:
-            active_zone = "C (Danger)"
+        if safety >= O:      active_zone = "A (Track)"
+        elif safety <= D:    active_zone = "C (Danger)"
         else:
-            # Check if in rejoin zone (simplified check for display)
             if hasattr(env, 'rejoin_streak') and env.rejoin_streak[env_id] >= 10:
                 active_zone = "D (Rejoin)"
             else:
                 active_zone = "B (Surface)"
-        
-        print(f"Active Zone: {active_zone} | Safety Distance: {safety:.4f}m")
-        
-        # Print robot zone rewards and global rewards together
-        self._print_agent_zones_with_globals(env, env_id, 'ROBOT', robot_weights)
-        self._print_agent_zones_with_globals(env, env_id, 'HUMAN', human_weights)
-        
-        # Final totals
-        robot_total = rewards['robot'][env_id].item()
-        human_total = rewards['human'][env_id].item()
-        combined_total = robot_total + human_total
-        print(f"\n[TOTALS] Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
+        print(f"Active Zone: {active_zone}")
+
+        self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
+        self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
 
     def _print_actor_debug_info(self, env, env_id: int):
-        """NEW: Print actor network outputs and noise information."""
+        """Print actor network outputs and noise information with force consistency check."""
         if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
             return
             
@@ -422,118 +400,62 @@ class StepTracer:
             print(f"Forces (Human): Fx={hm[0]:+.3f}, Fy={hm[1]:+.3f}, Fz={hm[2]:+.3f}")
             print(f"  Noise: Nx={hn[0]:+.3f}, Ny={hn[1]:+.3f}, Nz={hn[2]:+.3f}")
 
-    def _print_agent_zones_with_globals(self, env, env_id: int, agent_label: str, weights: dict):
-        """Print zone breakdown and global rewards for a single agent."""
+    def _print_agent_zones_with_globals_flat(self, env, env_id: int, agent_label: str):
+        """Print zone breakdown and global rewards for a single agent using flat keys."""
         agent_key = agent_label.lower()
-        
         print(f"\n[{agent_label}] ZONE REWARDS:")
-        
-        # Zone totals with zone weights
-        zones = ['A_track', 'B_surface', 'C_danger', 'D_rejoin']
-        zone_names = ['A Track  ', 'B Surface', 'C Danger ', 'D Rejoin ']
-        zone_config_names = ['track', 'surface', 'danger', 'rejoin']
-        
-        for zone, zone_name, config_name in zip(zones, zone_names, zone_config_names):
-            zone_weight = self._get_zone_weight(weights, config_name)
-            total_key = f'{agent_key}_{zone}_total'
-            
-            if total_key in env.reward_components:
-                total = env.reward_components[total_key][env_id].item()
-                print(f"  {zone_name} (zone_w={zone_weight:.2f}): {total:+.3f}")
-                
-                # Print component breakdowns for this zone
-                self._print_zone_components(env, env_id, zone[0], agent_key, weights, config_name)
-        
-        # Print global rewards for this agent
-        print(f"  Global Rewards:")
-        self._print_global_rewards_inline(env, env_id, agent_label, weights)
 
-    def _print_zone_components(self, env, env_id: int, zone_letter: str, agent_key: str, weights: dict, config_name: str):
-        """Print all components for a given zone (for one agent)."""
-
-        # === fixed mappings ===
-        component_mappings = {
-            'A': [
-                ('progress', 'Progress    '),
-                ('deviation', 'Deviation   ')
-            ],
-            'B': [
-                ('gap', 'Gap         '),
-                ('surf_tangent', 'Surf_Tangent'),
-                ('inward_penalty', 'Inward_Pen  ')
-            ],
-            'C': [
-                ('off_penalty', 'Off_Penalty '),
-                ('inward_penalty', 'Inward_Pen  ')
-            ],
-            'D': [
-                ('progress', 'Progress    '),
-                ('rejoin_speed', 'Rejoin_Speed'),
-                ('deviation', 'α·Deviation '),
-                ('gap', '(1-α)·Gap   '),
-                ('inward_penalty', 'Inward_Pen  ')
-            ],
+        zone_title = {'A':'A Track   ', 'B':'B Surface ', 'C':'C Danger  ', 'D':'D Rejoin  '}
+        mapping = {
+            'A': [('progress','Progress'), ('deviation','Deviation')],
+            'B': [('gap','Gap'), ('surftangent','Surf_Tangent'), ('inward','Inward_Pen')],
+            'C': [('offpen','Off_Penalty'), ('inward','Inward_Pen')],
+            'D': [('progress','Progress'), ('rejoinspeed','Rejoin_Speed'),
+                  ('deviation','α·Deviation'), ('gap','(1-α)·Gap'), ('inward','Inward_Pen')],
         }
 
-        if zone_letter not in component_mappings:
-            return
+        def _val(x):
+            if torch.is_tensor(x):
+                return float(x[env_id].item()) if x.ndim>0 else float(x.item())
+            return float(x)
 
-        for comp_key, comp_label in component_mappings[zone_letter]:
-            # get weight
-            comp_weight = self._get_component_weight(weights, config_name, comp_key, default=0.0)
-            # get cached value
-            comp_dict = getattr(env, "reward_components", {})
-            comp_value = 0.0
-            if agent_key in comp_dict and comp_key in comp_dict[agent_key]:
-                val = comp_dict[agent_key][comp_key]
-                if hasattr(val, "__getitem__"):  # tensor
-                    comp_value = float(val[env_id].item())
-                else:
-                    comp_value = float(val)
-            print(f"    {comp_label} * {comp_weight:>4.2f}: {comp_value:+.3f}")
+        for Z in ['A','B','C','D']:
+            zw_key = f'zone{Z}_weight_{agent_key}'
+            zt_key = f'zone{Z}_total_{agent_key}'
+            zone_w = env.reward_components.get(zw_key, 0.0)
+            zone_total = env.reward_components.get(zt_key, 0.0)
+            print(f"  {zone_title[Z]} (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
 
-    def _print_global_rewards_inline(self, env, env_id: int, agent_label: str, weights: dict):
-        """Print global reward components inline for an agent."""
-        agent_key = agent_label.lower()
-        
-        # Global component mappings
-        global_components = [
-            ('z_penalty', 'Z Penalty      ', 'z_penalty'),
-            ('completion_reward', 'Completion     ', 'completion_reward'),
-            ('time_efficiency_reward', 'Time Efficiency', 'time_efficiency'),
-            (f'{agent_key}_force_penalty', f'{agent_label} Force   ', 'force_efficiency'),
-        ]
-        
-        # Add awareness component (robot aware of human, human aware of robot)
-        if agent_key == 'robot':
-            global_components.append(('human_force_penalty', 'Human Aware    ', 'human_awareness'))
-        else:
-            global_components.append(('robot_force_penalty', 'Robot Aware    ', 'robot_awareness'))
-        
-        for comp_key, comp_label, weight_key in global_components:
-            if comp_key in env.reward_components:
-                raw_value = env.reward_components[comp_key][env_id].item()
-                weight = weights.get(weight_key, 0.0)
-                weighted_value = raw_value * weight
-                print(f"    {comp_label} *{weight:>5.2f}: {weighted_value:+.3f}")
+            for comp_key, comp_label in mapping[Z]:
+                base = f"zone{Z}_{comp_key}_{agent_key}"
+                raw     = env.reward_components.get(f"{base}_raw", 0.0)
+                weight  = env.reward_components.get(f"{base}_weight", 0.0)
+                contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+                print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
 
-    def _get_zone_weight(self, weights: dict, zone_name: str, default: float = 0.0) -> float:
-        """Get zone weight with safe default (0.0 if missing)."""
-        zones = weights.get("zones", {})
-        if zone_name in zones:
-            return float(zones[zone_name].get("weight", default))
-        return default
+        print("  Global Rewards:")
+        for gk, glabel in [('zpenalty','Z Penalty      '),
+                           ('completion','Completion     '),
+                           ('timeeff','Time Efficiency')]:
+            base = f"global_{gk}_{agent_key}"
+            raw     = env.reward_components.get(f"{base}_raw", 0.0)
+            weight  = env.reward_components.get(f"{base}_weight", 0.0)
+            contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+            print(f"    {glabel:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
 
-    def _get_component_weight(self, weights: dict, zone_name: str, comp_key: str, default: float = 0.0) -> float:
-        """Get component weight with safe default (0.0 if missing)."""
-        zones = weights.get("zones", {})
-        if zone_name in zones:
-            comps = zones[zone_name].get("components", {})
-            if comp_key in comps:
-                return float(comps[comp_key])
-        # fall back to global components
-        comps = weights.get("components", {})
-        return float(comps.get(comp_key, default))
+        # Self force
+        raw     = env.reward_components.get(f"{agent_key}force_raw", 0.0)
+        weight  = env.reward_components.get(f"{agent_key}force_weight", 0.0)
+        contrib = env.reward_components.get(f"{agent_key}force_contrib", 0.0)
+        print(f"    {agent_label} Force   {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+
+        # Awareness of other agent
+        aware_key = 'humanaware' if agent_key == 'robot' else 'robotaware'
+        raw     = env.reward_components.get(f"{aware_key}_raw", 0.0)
+        weight  = env.reward_components.get(f"{aware_key}_weight", 0.0)
+        contrib = env.reward_components.get(f"{aware_key}_contrib", 0.0)
+        label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
+        print(f"    {label:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
 
 
 class MilestoneManager:
@@ -763,6 +685,7 @@ class PerformanceEvaluator:
 class RewardLogger:
     """
     MODIFIED: Optimized reward logger using MetricsHub for data pipeline
+    MODIFIED: Updated for new flat key structure and simplified console logging
     """
 
     def __init__(self, num_envs: int, device: torch.device, metrics_hub=None, 
@@ -848,7 +771,6 @@ class RewardLogger:
         # Update step counts from progress manager
         if self.progress_manager:
             steps_batch = self.progress_manager.step_counts
-            # No need to write to StepTracer since it no longer caches episode data
         
         # NEW: Update EpisodeAccumulator with batch data
         env_ids = list(range(self.num_envs))
@@ -901,16 +823,14 @@ class RewardLogger:
                 }
             )
     
-    def log_console_if_enabled(self, env, rewards: Dict, robot_weights: dict, human_weights: dict):
-        """Log to console if enabled with active environment filtering."""
+    def log_console_if_enabled(self, env, rewards: Dict, current_step: int, active_envs=None):
+        """MODIFIED: Log to console with new signature (no weights parameters)."""
         # Get active environments from progress manager if available
-        active_envs = None
-        if self.progress_manager:
+        if active_envs is None and self.progress_manager:
             active_envs = self.progress_manager.get_active_environments()
         
         # StepTracer controls whether to print and frequency throttling
-        current_step = env.common_step_counter
-        self.step_tracer.maybe_print_step(env, rewards, robot_weights, human_weights, current_step, active_envs)
+        self.step_tracer.maybe_print_step(env, rewards, current_step, active_envs)
     
     def on_episode_end(self, env_ids):
         """MODIFIED: Handle episode completion using MetricsHub"""
@@ -952,7 +872,6 @@ class RewardLogger:
         
         # Reset accumulators
         self.episode_acc.reset_envs([e.item() for e in env_ids])
-        # StepTracer no longer needs episode reset since it doesn't cache episode data
     
     def get_final_evaluation(self, env_id: int, target_episodes: int) -> float:
         """Get final evaluation score for environment."""
