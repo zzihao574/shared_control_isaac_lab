@@ -73,66 +73,31 @@ class DDPGAgent:
         
         print(f"[INFO] DDPG Agent {agent_id} initialized successfully")
 
-    def select_action(self, observation: np.ndarray, add_noise: bool = True) -> np.ndarray:
+    def select_action(self, observation: np.ndarray, add_noise: bool = True) -> Dict[str, np.ndarray]:
         """
-        Select action using stochastic policy (legacy interface).
-        
-        Args:
-            observation: Agent's observation as numpy array
-            add_noise: Whether to add exploration noise
-            
-        Returns:
-            Action as numpy array
+        统一接口：选择动作并返回调试信息（mean / noise）。
+        返回:
+            {
+              "action": np.ndarray,  # 最终动作 (mean + noise)
+              "mean":   np.ndarray,  # actor 均值输出
+              "noise":  np.ndarray,  # 探索噪声（若 add_noise=False 则为 0）
+            }
         """
-        obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+        obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            mean, std = self.actor(obs_tensor)
-        
-        action = mean
-        if add_noise:
-            noise = std * torch.randn_like(mean)
-            action += noise
-            
-        return action.cpu().numpy().flatten()
-    
-    def select_action_with_debug(self, observation: np.ndarray, add_noise: bool = True) -> Dict[str, np.ndarray]:
-        """
-        Select action using stochastic policy and return detailed debug information.
-        
-        This method provides the same functionality as select_action but additionally
-        returns the mean action (deterministic policy output) and noise separately
-        for debugging and console display purposes.
-        
-        Args:
-            observation: Agent's observation as numpy array
-            add_noise: Whether to add exploration noise
-            
-        Returns:
-            Dictionary containing:
-                - 'action': Final action (mean + noise)
-                - 'mean': Deterministic policy output (no noise)
-                - 'noise': Exploration noise that was added
-        """
-        obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            # Get stochastic policy outputs
-            mean, std = self.actor(obs_tensor)
-            
-            # Calculate noise and final action
+            mean, std = self.actor(obs_tensor)        # 形状 [1, act_dim]
             if add_noise:
                 noise = std * torch.randn_like(mean)
-                action = mean + noise
             else:
                 noise = torch.zeros_like(mean)
-                action = mean.clone()
-        
-        # Return debug information for console display
+            action = mean + noise
+
         return {
-            'action': action.cpu().numpy().flatten(),
-            'mean': mean.cpu().numpy().flatten(),
-            'noise': noise.cpu().numpy().flatten()
+            "action": action.squeeze(0).cpu().numpy(),
+            "mean":   mean.squeeze(0).cpu().numpy(),
+            "noise":  noise.squeeze(0).cpu().numpy(),
         }
+
     
     def update_actor(self, loss: torch.Tensor) -> Dict[str, float]:
         """
@@ -151,7 +116,7 @@ class DDPGAgent:
         loss.backward()
         
         # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=3.0)
         
         # Update parameters
         self.actor_optimizer.step()
@@ -185,7 +150,7 @@ class DDPGAgent:
         critic_loss.backward()
         
         # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
         
         # Update parameters
         self.critic_optimizer.step()
@@ -217,87 +182,3 @@ class DDPGAgent:
                 self.tau * param.data + (1.0 - self.tau) * target_param.data
             )
     
-    def get_network_info(self) -> Dict[str, Any]:
-        """
-        Get information about network architectures and parameters.
-        
-        Returns:
-            Dictionary containing network information
-        """
-        def count_parameters(model):
-            return sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
-        return {
-            'agent_id': self.agent_id,
-            'actor_params': count_parameters(self.actor),
-            'critic_params': count_parameters(self.critic),
-            'total_params': count_parameters(self.actor) + count_parameters(self.critic),
-            'learning_rates': {
-                'actor': self.lr_actor,
-                'critic': self.lr_critic
-            },
-            'tau': self.tau,
-            'device': str(self.device)
-        }
-    
-    def save_networks(self, filepath: str) -> None:
-        """
-        Save all network states to file.
-        
-        Args:
-            filepath: Path to save the networks
-        """
-        torch.save({
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'actor_target_state_dict': self.actor_target.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'agent_id': self.agent_id,
-            'hyperparameters': {
-                'lr_actor': self.lr_actor,
-                'lr_critic': self.lr_critic,
-                'tau': self.tau
-            }
-        }, filepath)
-        print(f"[INFO] Networks saved for agent {self.agent_id}: {filepath}")
-    
-    def load_networks(self, filepath: str) -> None:
-        """
-        Load all network states from file.
-        
-        Args:
-            filepath: Path to load the networks from
-        """
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        # Load network states
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
-        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
-        
-        # Load optimizer states
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        
-        print(f"[INFO] Networks loaded for agent {self.agent_id}: {filepath}")
-    
-    def set_train_mode(self) -> None:
-        """Set all networks to training mode."""
-        self.actor.train()
-        self.critic.train()
-        self.actor_target.train()
-        self.critic_target.train()
-    
-    def set_eval_mode(self) -> None:
-        """Set all networks to evaluation mode."""
-        self.actor.eval()
-        self.critic.eval()
-        self.actor_target.eval()
-        self.critic_target.eval()
-    
-    def __repr__(self) -> str:
-        """String representation of the agent."""
-        return f"DDPGAgent(id='{self.agent_id}', device='{self.device}')"

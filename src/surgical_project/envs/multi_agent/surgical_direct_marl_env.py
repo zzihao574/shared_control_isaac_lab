@@ -1,6 +1,7 @@
 # surgical_direct_marl_env.py - Simplified Zone System with Binary Progress Penalty
 # MODIFIED: Simplified progress penalty: -2 if no improvement over historical best, otherwise proportional reward
 # REMOVED: All stall/back accumulation logic, p_tm1 calculations, stylus_pos_t0 tracking
+# MODIFIED: Unified completion threshold and key names for RewardLogger consistency
 
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     Human-robot collaborative surgical MARL environment.
     MODIFIED: Simplified four-zone reward system with binary progress penalty
     MODIFIED: Removed all stall/back accumulation logic for cleaner implementation
+    MODIFIED: Unified completion threshold and consistent key names for data pipeline
     
     Features:
     - Multi-agent force control for surgical tasks
@@ -35,6 +37,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Performance evaluation and milestone tracking
     - Console logging via utils (configured by YAML)
     - Actor network debug information display
+    - Unified completion threshold and key names for RewardLogger
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -760,21 +763,37 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
         rewards = {'robot': _agent_total('robot'), 'human': _agent_total('human')}
 
-        # Public indicators for RewardLogger
+        # UNIFIED KEYS: Public indicators for RewardLogger with consistent naming
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         distance_to_final = torch.norm(
             self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), dim=-1
         )
-        self.reward_components['deviation'] = deviations
-        self.reward_components['progress_ratio'] = progress_ratio
-        self.reward_components['distance_to_final'] = distance_to_final
+        completion_reward = self._calculate_completion_reward()  # For completion detection
+        
+        # Add unified keys for RewardLogger consistency
+        self.reward_components.update({
+            'deviation': deviations,                    # UNIFIED: trajectory deviation
+            'progress_ratio': progress_ratio,           # UNIFIED: progress along trajectory
+            'distance_to_final': distance_to_final,     # Additional: distance to end
+            'completion_reward': completion_reward,      # UNIFIED: completion detection key
+            'min_safety_distance': self.safety_distances_t1,  # UNIFIED: safety distance key
+        })
+        
+        # Ensure all required keys exist with default values if missing
+        default_keys = ['deviation', 'progress_ratio', 'min_safety_distance', 'completion_reward']
+        for key in default_keys:
+            if key not in self.reward_components:
+                self.reward_components[key] = torch.zeros(self.num_envs, device=self.device)
 
         # Call utils with new signature (no robot_weights/human_weights parameters)
         current_step = getattr(self, 'step_counter', getattr(self, '_sim_step_counter', 0))
         active_envs = getattr(self, 'active_env_ids', None)
         self.reward_logger.log_console_if_enabled(self, rewards, current_step, active_envs)
         self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
+        
+        # Store for debug consistency check (ensure MADDPG can read last rewards)
+        self.debug_last_rewards = rewards
         
         return rewards
 
@@ -798,7 +817,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
 
     def _calculate_completion_reward(self) -> torch.Tensor:
-        """Calculate task completion reward - shared across all phases."""
+        """Calculate task completion reward using unified threshold - shared across all phases."""
         is_final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         return torch.where(
             is_final_reached,
@@ -839,7 +858,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if self.enable_edge_termination:
             edge_collision = self.safety_distances_t1 <= self.safety_distance_threshold
         
-        # Task completion
+        # Task completion using unified threshold
         final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         
         # Combine termination conditions

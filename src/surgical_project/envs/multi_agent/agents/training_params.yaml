@@ -11,7 +11,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: false  # Enable detailed console logging for milestone episodes
+  enable_console_logging: true  # Enable detailed console logging for milestone episodes
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -19,7 +19,7 @@ logging:
 trajectory:
   start_point: [0.14, -0.2, 0.03]     # Starting position in 3D space (meters)
   end_point: [0.14, 0.2, 0.03]        # Target end position in 3D space (meters)
-  switch_threshold: 0.01              # Distance threshold for completion (1cm)
+  # REMOVED: switch_threshold - now unified as completion_threshold
 
 # ==============================================================================
 # Physics Constraints (Runtime Constraints)
@@ -62,6 +62,9 @@ constraint_geometry:
 # Reward Parameters - SIMPLIFIED FOUR-ZONE SYSTEM (FLAT STRUCTURE)
 # ==============================================================================
 reward_parameters:
+  # UNIFIED COMPLETION THRESHOLD
+  completion_threshold: 0.01          # Distance threshold for task completion (meters)
+  
   weights:
     # ===== ROBOT =====
     zoneA_weight_robot: 1.0
@@ -116,8 +119,6 @@ reward_parameters:
     timeeff_human: 0.0
     forceeff_human: 0.0
     robotaware_human: 0.0
-    
-  completion_threshold: 0.01          # Distance threshold for completion (meters)
 
 # ==============================================================================
 # Termination Conditions - MODIFIED FOR DIRECT TERMINATION

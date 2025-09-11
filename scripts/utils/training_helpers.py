@@ -4,6 +4,7 @@
 Training helper utilities for MADDPG multi-environment parallel training.
 Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
 MODIFIED: Added MetricsHub for unified data pipeline, removed unused WandB methods
+MODIFIED: Unified global step tracking and completion threshold consistency
 """
 
 import argparse
@@ -109,6 +110,9 @@ class UnifiedProgressManager:
         
         # Optional training logger reference for file logging
         self.training_logger = None
+        
+        # NEW: Unified global step tracking
+        self.global_step = 0
         
         # Environment closure callbacks for dual-layer protection
         self.env_closure_callbacks: List[Callable[[int], None]] = []
@@ -303,6 +307,7 @@ class WandBLogger:
     """
     Enhanced WandB logger with layered, frequency-based monitoring system.
     MODIFIED: Removed unused methods, streamlined to use only MetricsHub pipeline
+    MODIFIED: Unified global step usage for consistent x-axis
     """
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
@@ -339,6 +344,7 @@ class WandBLogger:
                 "agent_mode": "robot_only",  # Single agent training mode
                 "reward_components": "trajectory+progress+potential_field",  # Active components
                 "termination_mode": "direct_obstacle_collision",
+                "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
             })
             
             print(f"[WANDB] Successfully initialized: {self.run.name}")
@@ -347,7 +353,7 @@ class WandBLogger:
             self.enabled = False
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
-        """Attach to MetricsHub for unified data pipeline"""
+        """Attach to MetricsHub for unified data pipeline with consistent step usage"""
         if not self.enabled:
             return
 
@@ -360,7 +366,7 @@ class WandBLogger:
             pass
         hub.subscribe("episode", _on_episode)
 
-        # 3) Milestone completion: calculate and upload topk_best / topk_avg
+        # 3) Milestone completion: calculate and upload topk_best / topk_avg with unified step
         def _on_ms(ms):
             scores = ms.get("scores", {})
             if not scores:
@@ -368,18 +374,24 @@ class WandBLogger:
             score_values = list(scores.values())
             best = max(score_values) if score_values else 0.0
             avg = sum(score_values) / len(score_values) if score_values else 0.0
+            
+            # Use unified step from milestone summary
+            step = ms.get("step", 0)
+            
             self.log_algorithm_statistics({
                 "performance/topk_best_score": best,
                 "performance/topk_avg_score": avg,
                 "performance/topk_count": len(score_values),
                 "milestone/latest_completed": ms.get("milestone", 0),
-            }, ms.get("step", 0))
+            }, step)
+            
         hub.subscribe("milestone_summary", _on_ms)
         
         print("[WANDB] Attached to MetricsHub with subscriptions: update, episode, milestone_summary")
+        print("[WANDB] Using unified global step for consistent x-axis")
 
     def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
-        """Log algorithm diagnostics with white-list filtering."""
+        """Log algorithm diagnostics with white-list filtering using unified step."""
         if not self.enabled or not algorithm_stats:
             return
 
@@ -416,6 +428,7 @@ class WandBLogger:
         try:
             log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
             if log_data:
+                # Always use the provided unified step for consistent x-axis
                 wandb.log(log_data, step=step)
         except Exception as e:
             print(f"[WANDB] Failed to log algorithm statistics: {e}")
@@ -485,12 +498,14 @@ class TopKModelManager:
 
 
 class TrainingLogger:
-    """Handles training progress logging and file operations."""
+    """Handles training progress logging and file operations with unified global step."""
     
     def __init__(self, log_directory: str):
         self.log_directory = log_directory
         os.makedirs(log_directory, exist_ok=True)
-        self.global_step = 0  # Track global step for metrics hub
+        
+        # UNIFIED: Global step tracking for metrics hub
+        self.global_step = 0
     
     def log_message(self, message: str) -> None:
         """Log a message to file."""
@@ -503,10 +518,15 @@ class TrainingLogger:
         """Log training start information."""
         print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Dual Protection)")
         print(f"Environments: {args.num_envs}, Target: {args.max_episodes} episodes per env")
-        print(f"Log Directory: {self.log_directory}\n", "="*70)    
+        print(f"Log Directory: {self.log_directory}")
+        
+        # Log unified completion threshold
+        completion_threshold = params.get('reward_parameters', {}).get('completion_threshold', 0.01)
+        print(f"Unified completion threshold: {completion_threshold}m")
+        print(f"\n", "="*70)    
     
     def log_training_progress(self, global_step: int, stats: Dict[str, Any], top_k_manager: TopKModelManager) -> None:
-        """Log periodic training progress."""
+        """Log periodic training progress with unified global step."""
         self.global_step = global_step  # Update global step
         total_envs = stats['active_count'] + stats['completed_count']
         print(f"[Step {global_step}] Completed: {stats['completed_count']}/{total_envs}")

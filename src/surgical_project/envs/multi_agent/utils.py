@@ -5,6 +5,7 @@ Modified to support active environment filtering and dual protection mechanism.
 MODIFIED: Updated EpisodeAccumulator, simplified StepTracer, updated RewardLogger for MetricsHub integration
 MODIFIED: Simplified Zone D console printing (A/B/C/D regions) with unified inward and removed rejoinspeed/gap
 MODIFIED: Enhanced StepTracer with force consistency checks
+MODIFIED: Unified completion threshold (removed switch_threshold)
 """
 
 import torch
@@ -170,7 +171,7 @@ class TrajectoryManager:
     """Trajectory management and progress tracking for linear path following."""
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
-        """Initialize trajectory manager with start/end points."""
+        """Initialize trajectory manager with start/end points and unified completion threshold."""
         self.device = device
         self.num_envs = num_envs
         self.env_base_positions = env_base_positions
@@ -182,7 +183,18 @@ class TrajectoryManager:
         
         # Unit direction vector for straight line trajectory
         self.line_direction = (self.end_pos_local - self.start_pos_local) / self.total_distance
-        self.switch_threshold = traj.get('switch_threshold', 0.01)  # 1cm threshold
+        
+        # UNIFIED COMPLETION THRESHOLD: priority order
+        # 1. reward_parameters.completion_threshold (new unified location)
+        # 2. trajectory.switch_threshold (legacy fallback)
+        # 3. default 0.01
+        reward_params = params.get('reward_parameters', {})
+        traj_params = params.get('trajectory', {})
+        
+        self.completion_threshold = reward_params.get('completion_threshold',
+                                                    traj_params.get('switch_threshold', 0.01))
+        
+        print(f"[INFO] Trajectory completion threshold: {self.completion_threshold}m")
     
     def get_progress(self, current_pos_local: torch.Tensor) -> torch.Tensor:
         """Calculate progress along trajectory (0 to 1)."""
@@ -206,16 +218,17 @@ class TrajectoryManager:
         return deviations, closest_points
     
     def is_final_setpoint_reached(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """Check if final trajectory setpoint is reached."""
+        """Check if final trajectory setpoint is reached using unified threshold."""
         distances_to_final = torch.norm(current_pos_local - self.end_pos_local.unsqueeze(0), dim=-1)
-        return distances_to_final < self.switch_threshold
+        return distances_to_final < self.completion_threshold
     
     def get_trajectory_info(self) -> Dict:
         """Get trajectory configuration information."""
         return {
             'start_point': self.start_pos_local.cpu().numpy(),
             'end_point': self.end_pos_local.cpu().numpy(),
-            'total_distance': self.total_distance
+            'total_distance': self.total_distance,
+            'completion_threshold': self.completion_threshold
         }
 
 
@@ -276,6 +289,7 @@ class EpisodeAccumulator:
         self.basic[env_id]['collision'] = bool(collided)
 
     def summary(self, env_id: int) -> dict:
+        """Generate episode summary with unified keys for milestone evaluation."""
         b = self.basic[env_id]
         steps = max(1, b['steps'])
         avg_dev = b['deviation_sum'] / steps
@@ -283,10 +297,10 @@ class EpisodeAccumulator:
             'episode_len': b['steps'],
             'episode_return': b['total_reward'],
             'final_progress': b['final_progress'],
-            'success': b['completed'],
+            'success': b['completed'],  # KEY: unified completion flag
             'collision': b['collision'],
             'min_safety_distance': (0.0 if b['min_safety_distance'] == float('inf') else b['min_safety_distance']),
-            'avg_deviation': avg_dev,
+            'avg_deviation': avg_dev,  # KEY: average deviation for trajectory scoring
         }
 
     def reset_envs(self, env_ids):
@@ -484,19 +498,22 @@ class MilestoneManager:
         return episode_num in self.milestones
     
     def _compute_score_from_episode(self, ep: dict) -> float:
-        """NEW: Calculate score based on episode summary instead of detailed data"""
-        # completion 40, progress 20, trajectory 20, safety 20
-        score = 0.0
-        score += 40.0 if ep.get('success', False) else 0.0
-        score += 20.0 * max(0.0, min(1.0, float(ep.get('final_progress', 0.0))))
+        """UNIFIED: Calculate score based on episode summary with consistent weighting."""
+        # Completion: 40 points
+        score = 40.0 if ep.get('success', False) else 0.0
         
-        # Use avg_deviation from episode summary
-        dev = float(ep.get('avg_deviation', 0.0))
-        traj_term = max(0.0, min(1.0, (0.05 - dev) / 0.04))  # Same formula as before
+        # Progress: 20 points
+        final_progress = max(0.0, min(1.0, float(ep.get('final_progress', 0.0))))
+        score += 20.0 * final_progress
+        
+        # Trajectory precision: 20 points (based on avg_deviation)
+        avg_deviation = float(ep.get('avg_deviation', 0.0))
+        traj_term = max(0.0, min(1.0, (0.05 - avg_deviation) / 0.04))  # 5cm max, linear scale
         score += 20.0 * traj_term
         
-        msd = float(ep.get('min_safety_distance', 0.0))
-        safety_term = max(0.0, min(1.0, msd / 0.02))
+        # Safety: 20 points
+        min_safety = float(ep.get('min_safety_distance', 0.0))
+        safety_term = max(0.0, min(1.0, min_safety / 0.02))  # 2cm max, linear scale
         score += 20.0 * safety_term
         
         return max(0.0, min(100.0, score))
@@ -557,10 +574,10 @@ class MilestoneManager:
                     if env_id in self.milestone_performances[milestone]:
                         scores[env_id] = self.milestone_performances[milestone][env_id]['score']
                 
-                if self.progress_manager:
+                # Get unified global step
+                step = 0
+                if self.progress_manager and hasattr(self.progress_manager, 'global_step'):
                     step = getattr(self.progress_manager, 'global_step', 0)
-                else:
-                    step = 0
                 
                 self.metrics_hub.push_milestone_summary(milestone, {
                     "scores": scores,
@@ -687,6 +704,7 @@ class RewardLogger:
     """
     MODIFIED: Optimized reward logger using MetricsHub for data pipeline
     MODIFIED: Updated for new flat key structure and simplified console logging
+    MODIFIED: Unified step tracking and key name consistency
     """
 
     def __init__(self, num_envs: int, device: torch.device, metrics_hub=None, 
@@ -768,12 +786,12 @@ class RewardLogger:
             self.milestone_manager.set_topk_update_callback(callback_fn)
     
     def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
-        """MODIFIED: Update metrics and push to hub"""
+        """MODIFIED: Update metrics with unified key names and push to hub"""
         # Update step counts from progress manager
         if self.progress_manager:
             steps_batch = self.progress_manager.step_counts
         
-        # NEW: Update EpisodeAccumulator with batch data
+        # NEW: Update EpisodeAccumulator with batch data using unified keys
         env_ids = list(range(self.num_envs))
         
         # Calculate total rewards for accumulator
@@ -788,37 +806,36 @@ class RewardLogger:
         self.episode_acc.update_batch(
             env_ids, 
             reward_comp_with_total,
-            safety_distances,
+            reward_components.get('min_safety_distance', safety_distances),  # Unified key
             reward_components.get('deviation'),
             reward_components.get('progress_ratio')
         )
         
-        # Check for completion/collision markers
+        # Check for completion/collision markers using unified keys
         if 'completion_reward' in reward_components:
             completion_rewards = reward_components['completion_reward']
             for env_id in range(self.num_envs):
                 if completion_rewards[env_id] > 0:
                     self.episode_acc.mark_completed(env_id, True)
         
-        if safety_distances is not None:
+        # Use unified safety distance key
+        safety_data = reward_components.get('min_safety_distance', safety_distances)
+        if safety_data is not None:
             for env_id in range(self.num_envs):
-                if safety_distances[env_id] < 0.001:
+                if safety_data[env_id] < 0.001:
                     self.episode_acc.mark_collision(env_id, True)
         
-        # Push step data to hub if available
+        # Push step data to hub if available with unified global step
         if self.metrics_hub and self.progress_manager:
-            # Get global step from trainer's progress manager
+            # Get unified global step
             global_step = getattr(self.progress_manager, 'global_step', 0)
-            if hasattr(self.progress_manager, 'training_logger'):
-                # Try to get from trainer
-                global_step = getattr(self.progress_manager.training_logger, 'global_step', global_step)
             
             self.metrics_hub.push_step(
                 step=global_step,
                 env_ids=env_ids,
                 payload={
                     "reward_components": reward_components,
-                    "safety_distance": safety_distances,
+                    "safety_distance": safety_data,
                     "progress_ratio": reward_components.get('progress_ratio'),
                     "deviation": reward_components.get('deviation'),
                 }
@@ -844,13 +861,9 @@ class RewardLogger:
             # Get episode summary from accumulator
             summary = self.episode_acc.summary(env_id)
             
-            # Push to MetricsHub
+            # Push to MetricsHub with unified global step
             if self.metrics_hub and self.progress_manager:
-                # Get global step
-                global_step = 0
-                if hasattr(self.progress_manager, 'training_logger'):
-                    global_step = getattr(self.progress_manager.training_logger, 'global_step', 0)
-                
+                global_step = getattr(self.progress_manager, 'global_step', 0)
                 self.metrics_hub.push_episode(global_step, env_id, summary)
             
             # Get episode number from external counter

@@ -4,6 +4,7 @@
 Surgical Robot MADDPG Multi-Environment Parallel Training
 Unified dimension management with grouped replay buffers and dual protection mechanism
 MODIFIED: Added MetricsHub for unified data pipeline, removed WandB direct logging
+MODIFIED: Unified global step tracking for consistent WandB x-axis
 """
 
 import sys
@@ -42,6 +43,8 @@ class MADDPGTrainer:
         self._setup_environment()
         self._setup_logging_and_wandb()
         self._setup_training_components()
+        
+        # UNIFIED: Global step tracking for consistent WandB x-axis
         self.global_step = 0
 
     def _get_num_envs_from_env(self):
@@ -270,7 +273,7 @@ class MADDPGTrainer:
         print(f"  Group buffer sizes: {status['group_buffer_sizes']}")
 
     def train(self) -> None:
-        """MODIFIED: Main training loop using MetricsHub for data flow."""
+        """MODIFIED: Main training loop using MetricsHub for data flow with unified global step."""
         self.logger.log_training_start(self.args, self.config.params)
         
         print(f"[INFO] Training with max_episodes={self.args.max_episodes}")
@@ -278,6 +281,7 @@ class MADDPGTrainer:
         print("  - Unified data flow through MetricsHub")
         print("  - WandB uploads via subscription only")
         print("  - Buffer sharing: every 4 environments share 1 replay buffer")
+        print("  - UNIFIED global step tracking for consistent WandB x-axis")
         
         try:
             obs_dict, _ = self.env.reset()
@@ -296,8 +300,12 @@ class MADDPGTrainer:
             
             # Use new progress manager
             while not self.progress.is_training_complete():
+                # UNIFIED: Increment global step at the beginning of each loop iteration
                 self.global_step += 1
-                self.logger.global_step = self.global_step  # Update logger's global step
+                
+                # UNIFIED: Synchronize global step across all components
+                self.logger.global_step = self.global_step
+                self.progress.global_step = self.global_step  # NEW: Unified step source
                 
                 # Get active environments list
                 active_envs = self.progress.get_active_environments()
@@ -310,7 +318,7 @@ class MADDPGTrainer:
                 # Only select actions for active environments (no grad; full batch returned)
                 with torch.no_grad():
                     actions = self.maddpg_trainer.select_actions(
-                        obs_dict, active_envs, add_noise=True
+                        obs_dict, active_envs, add_noise=False
                     )
                 
                 next_obs, rewards, terminated, truncated, info = self.env.step(actions)
@@ -393,13 +401,14 @@ class MADDPGTrainer:
             self.top_k_manager.save_checkpoint(final_path, self.maddpg_trainer)
             self.logger.save_final_results(self.global_step, self.progress, self.top_k_manager, self.config.params, self.args)
             
-            # Final statistics through MetricsHub
+            # Final statistics through MetricsHub with unified global step
             if self.top_k_manager.top_models:
                 scores = [model[1] for model in self.top_k_manager.top_models]
                 final_stats = {
                     "performance/topk_best_score": max(scores),
                     "performance/topk_avg_score": np.mean(scores),
                 }
+                # Use unified global step for final WandB upload
                 self.wandb_logger.log_algorithm_statistics(final_stats, self.global_step)
         
         except (KeyboardInterrupt, Exception) as e:
@@ -412,7 +421,7 @@ class MADDPGTrainer:
                 self._get_reward_logger().close_all_files()
             self.env.close()
             self.wandb_logger.finalize_run()
-            print("\nTraining finished with MetricsHub data pipeline")
+            print("\nTraining finished with MetricsHub data pipeline and unified global step tracking")
 
 def main():
     """Main entry point for training script."""

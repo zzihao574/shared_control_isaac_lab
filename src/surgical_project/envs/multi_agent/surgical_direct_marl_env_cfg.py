@@ -69,7 +69,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     # Scene configuration with multiple environments (count can be overridden from command line)
     scene: InteractiveSceneCfg = MySceneCfg(
         num_envs=512,      # Default value, can be overridden by --num_envs in train_maddpg.py
-        env_spacing=4.0,   # Spacing between environments
+        env_spacing=1.0,   # Spacing between environments
         replicate_physics=True
     )
     

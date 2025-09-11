@@ -219,7 +219,7 @@ class MADDPG:
                 obs = observations[agent_id][env_id].cpu().numpy()
                 
                 # Get detailed action info from agent
-                action_info = self.env_agents[env_id][agent_id].select_action_with_debug(obs, add_noise)
+                action_info = self.env_agents[env_id][agent_id].select_action(obs, add_noise)
                 actions[agent_id][env_id] = torch.from_numpy(action_info['action']).to(self.device)
                 debug_info['mean_actions'][agent_id][env_id] = torch.from_numpy(action_info['mean']).to(self.device)
                 debug_info['noise_actions'][agent_id][env_id] = torch.from_numpy(action_info['noise']).to(self.device)
