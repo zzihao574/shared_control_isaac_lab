@@ -2,6 +2,9 @@
 # MODIFIED: Integrated with unified global_step from trainer for console logging
 # MODIFIED: Added trainer global_step injection method for unified logging
 # MODIFIED: Updated reward logging to work with new key structure
+# MODIFIED: Renamed set_debug_actor_info -> set_detail_actor_info
+# MODIFIED: Removed try/except from _w and _initialize_body_indices
+# MODIFIED: Added assert for agent validation in _pre_physics_step
 
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Physics-based constraint checking and collision detection
     - Four-zone reward system: Track/Surface/Danger/Rejoin
     - Unified global_step integration with trainer
-    - Actor network debug information display
+    - Actor network detail information display
     - Console logging via unified global_step
     - Updated metrics integration with new key structure
     """
@@ -279,7 +282,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if not hasattr(self._omni_robot, 'body_names'):
             return
         
-        # Find stylus body
+        # Find stylus body - no fallback, fail fast if not found
         target_name = "stylus"
         
         for i, name in enumerate(self._omni_robot.body_names):
@@ -288,21 +291,20 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 print(f"[ENV] Found stylus body: {name} (index {i})")
                 return
         
-        # Fallback to last body
-        if len(self._omni_robot.body_names) > 0:
-            self.stylus_body_idx = len(self._omni_robot.body_names) - 1
-            print(f"[ENV] Using fallback stylus body index: {self.stylus_body_idx}")
+        # No fallback - raise error if stylus not found
+        raise RuntimeError(f"stylus link not found in robot body names: {self._omni_robot.body_names}")
     
     # =========================================================================
-    # Weight accessor methods (unchanged)
+    # Weight accessor methods - simplified without try/except
     # =========================================================================
     
     def _w(self, key: str, default: float = 0.0) -> float:
         """Get weight from flat YAML structure with fallback."""
-        try:
-            return float(self.params['reward_parameters']['weights'].get(key, default))
-        except Exception:
-            return float(default)
+        return float(
+            self.params.get('reward_parameters', {})
+                       .get('weights', {})
+                       .get(key, default)
+        )
 
     def _zone_w(self, zone_letter: str, agent: str) -> float:
         """Get zone weight."""
@@ -314,22 +316,22 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing."""
-        # Extract actor debug info if available (passed from MADDPG)
-        if hasattr(self, '_debug_actor_info') and self._debug_actor_info is not None:
+        # Extract actor detail info if available (passed from MADDPG)
+        if hasattr(self, '_detail_actor_info') and self._detail_actor_info is not None:
             for agent in self.cfg.possible_agents:
-                if agent in self._debug_actor_info['mean_actions']:
-                    self.actor_mean_forces[agent] = self._debug_actor_info['mean_actions'][agent].clone()
-                if agent in self._debug_actor_info['noise_actions']:
-                    self.actor_noise_forces[agent] = self._debug_actor_info['noise_actions'][agent].clone()
+                if agent in self._detail_actor_info['mean_actions']:
+                    self.actor_mean_forces[agent] = self._detail_actor_info['mean_actions'][agent].clone()
+                if agent in self._detail_actor_info['noise_actions']:
+                    self.actor_noise_forces[agent] = self._detail_actor_info['noise_actions'][agent].clone()
         
-        # Process and validate actions
+        # Process and validate actions with assertions
         for agent, action in actions.items():
-            if agent in self.cfg.possible_agents:
-                assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
-                
-                # Apply force constraints
-                max_force = self.max_robot_force if agent == "robot" else self.max_human_force
-                self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
+            assert agent in self.cfg.possible_agents, f"Unknown agent: {agent}"
+            assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
+            
+            # Apply force constraints
+            max_force = self.max_robot_force if agent == "robot" else self.max_human_force
+            self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
         
         # Cache forces for reward calculation
         self.robot_forces_t = self.agent_actions["robot"]
@@ -341,9 +343,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Enforce joint constraints
         self._enforce_joint_constraints()
     
-    def set_debug_actor_info(self, debug_info: Dict[str, Any]) -> None:
-        """Set debug information from MADDPG actor outputs."""
-        self._debug_actor_info = debug_info
+    def set_detail_actor_info(self, detail_info: Dict[str, Any]) -> None:
+        """Set detail information from MADDPG actor outputs."""
+        self._detail_actor_info = detail_info
         
     def _apply_external_forces(self) -> None:
         """Apply external forces to the robot end-effector."""
@@ -888,7 +890,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.best_progress[env_ids] = 0.0
         self.rejoin_streak[env_ids] = 0
 
-        # Reset actor debug info caches
+        # Reset actor detail info caches
         for agent in self.cfg.possible_agents:
             self.actor_mean_forces[agent][env_ids] = 0.0
             self.actor_noise_forces[agent][env_ids] = 0.0

@@ -2,6 +2,8 @@
 Multi-environment parallel MADDPG algorithm with shared network architecture.
 FINAL VERSION: Complete implementation per document specifications.
 MODIFIED: Updated statistics keys to match new WHITELIST structure
+MODIFIED: Simplified _get_actual_env method
+MODIFIED: Updated interface calls (debug -> detail)
 
 Key Features:
 - Single shared network per agent (not per environment)
@@ -9,7 +11,7 @@ Key Features:
 - CTDE: Centralized training with joint state-action space
 - Decentralized execution with individual agent policies
 - Gradient norm monitoring for training stability
-- Enhanced debug information collection
+- Enhanced detail information collection
 - New statistics key structure aligned with train/, model/ prefixes
 """
 
@@ -33,19 +35,18 @@ class MADDPG:
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
         self.env = env
-        self.actual_env = getattr(env, 'unwrapped', env)
+        self.actual_env = self._get_actual_env(env)
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
         
         # Get environment configuration
-        actual_env = self._get_actual_env(env)
-        self.agent_ids = list(actual_env.cfg.possible_agents)
+        self.agent_ids = list(self.actual_env.cfg.possible_agents)
         self.num_agents = len(self.agent_ids)
         
         # Get dimensions from environment cfg
-        self.obs_dims = [actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
-        self.action_dims = [actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
+        self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
+        self.action_dims = [self.actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
         self.total_obs_dim = sum(self.obs_dims)
         self.total_action_dim = sum(self.action_dims)
 
@@ -77,26 +78,8 @@ class MADDPG:
         print(f"  Min buffer size: {self.min_buffer_size}")
     
     def _get_actual_env(self, env):
-        """Get actual environment object through Gymnasium wrappers."""
-        if hasattr(env, 'cfg'):
-            return env
-        elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'cfg'):
-            return env.unwrapped
-        elif hasattr(env, 'env') and hasattr(env.env, 'cfg'):
-            return env.env
-        else:
-            # Traverse wrapper layers
-            current = env
-            for _ in range(10):  # Prevent infinite loops
-                if hasattr(current, 'cfg'):
-                    return current
-                elif hasattr(current, 'unwrapped'):
-                    current = current.unwrapped
-                elif hasattr(current, 'env'):
-                    current = current.env
-                else:
-                    break
-            raise AttributeError(f"Cannot find cfg attribute in environment: {type(env)}")
+        """Get actual environment object - simplified single line implementation."""
+        return getattr(env, 'unwrapped', env)
         
     def _initialize_agents(self) -> None:
         """Initialize shared DDPG agents (one per agent type, not per environment)."""
@@ -129,7 +112,7 @@ class MADDPG:
     
     def _build_slices(self) -> None:
         """Build slicing indices for concatenated observations and actions."""
-        # Build slices for Î£obs / Î£act (MUST match agent_ids order exactly)
+        # Build slices for Σobs / Σact (MUST match agent_ids order exactly)
         self.obs_slices = []
         self.act_slices = []
         
@@ -155,10 +138,10 @@ class MADDPG:
             
         Returns:
             actions: {agent_id: Tensor[num_envs, action_dim]}
-            debug: Debug information for console display
+            detail: Detail information for console display
         """
         actions = {}
-        debug = {"mean_actions": {}, "noise_actions": {}}
+        detail = {"mean_actions": {}, "noise_actions": {}}
         
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
@@ -169,11 +152,16 @@ class MADDPG:
                 noise = std * torch.randn_like(mean) if add_noise else torch.zeros_like(mean)
                 action = (mean + noise).clamp_(-agent.max_action, agent.max_action)
             
+            if agent_id == "human":
+                mean = torch.zeros_like(mean)
+                noise = torch.zeros_like(noise)
+                action = torch.zeros_like(action)
+
             actions[agent_id] = action
-            debug["mean_actions"][agent_id] = mean
-            debug["noise_actions"][agent_id] = noise
+            detail["mean_actions"][agent_id] = mean
+            detail["noise_actions"][agent_id] = noise
         
-        return actions, debug
+        return actions, detail
 
     def store_joint_transitions(self, obs, actions, rewards, next_obs, dones):
         """
@@ -215,7 +203,7 @@ class MADDPG:
         CTDE update: Centralized Training, Decentralized Execution.
         MODIFIED: Return statistics with new key structure matching WHITELIST
         
-        - Critics see global state-action space (Î£obs, Î£act)
+        - Critics see global state-action space (Σobs, Σact)
         - Actors update with respect to their own actions only
         - Other agents' actions are detached from gradient flow
         """
@@ -233,7 +221,7 @@ class MADDPG:
             return {}
 
         obs_all, act_all, rew_all, nobs_all, done_any = batch
-        # obs_all: [B, Î£obs], act_all: [B, Î£act], rew_all: [B, N], nobs_all: [B, Î£obs], done_any: [B, 1]
+        # obs_all: [B, Σobs], act_all: [B, Σact], rew_all: [B, N], nobs_all: [B, Σobs], done_any: [B, 1]
         
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 

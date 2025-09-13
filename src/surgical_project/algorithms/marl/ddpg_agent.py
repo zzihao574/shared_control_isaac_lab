@@ -77,35 +77,6 @@ class DDPGAgent:
         
         print(f"[DDPG AGENT] {agent_id} initialized successfully")
 
-    def select_action(self, observation, add_noise: bool = True) -> Dict[str, np.ndarray]:
-        """
-        Unified action selection interface supporting both single and batch inputs.
-        
-        Args:
-            observation: [obs_dim] or [batch, obs_dim] tensor/array
-            add_noise: Whether to add exploration noise
-            
-        Returns:
-            Dictionary containing:
-            - "action": Final action (mean + noise)
-            - "mean": Actor mean output  
-            - "noise": Exploration noise (zero if add_noise=False)
-        """
-        obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
-        if obs_tensor.ndim == 1:
-            obs_tensor = obs_tensor.unsqueeze(0)
-
-        with torch.no_grad():
-            mean, std = self.actor(obs_tensor)  # [B, act_dim]
-            noise = std * torch.randn_like(mean) if add_noise else torch.zeros_like(mean)
-            action = (mean + noise).clamp_(-self.max_action, self.max_action)
-
-        return {
-            "action": action.detach().cpu().numpy(),
-            "mean":   mean.detach().cpu().numpy(),
-            "noise":  noise.detach().cpu().numpy(),
-        }
-    
     def update_actor(self, loss: torch.Tensor) -> Dict[str, float]:
         """
         Update actor network using provided loss.

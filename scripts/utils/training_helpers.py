@@ -9,6 +9,9 @@ MODIFIED: Removed UnifiedProgressManager and all active_env related functionalit
 MODIFIED: Updated WHITELIST and simplified WandB logging to match new key structure
 MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
 MODIFIED: Added TrainingRunner and MilestoneEvaluator classes for code organization
+MODIFIED: Removed HARDWARE_MONITORING_AVAILABLE and all try/except from normal paths
+MODIFIED: Simplified TrainingRunner.run_step to use direct interface calls
+MODIFIED: Removed try/except from WandBLogger.initialize_run and MetricsHub._emit
 """
 
 import argparse
@@ -30,9 +33,6 @@ except ImportError:
     wandb = None
     print("[WARNING] WandB not available. Install with: pip install wandb")
 
-# Hardware monitoring - DISABLED for minimal logging
-HARDWARE_MONITORING_AVAILABLE = False
-
 
 # === NEW CLASS: TrainingRunner ===
 class TrainingRunner:
@@ -52,31 +52,14 @@ class TrainingRunner:
 
     def run_step(self):
         """执行一个训练步骤"""
-        # 获取当前观察 - 优先使用存储的观察
-        if hasattr(self, '_current_obs') and self._current_obs is not None:
-            current_obs = self._current_obs
-        else:
-            # 备用观察获取方法
-            if hasattr(self.env, '_get_observations'):
-                current_obs = self.env._get_observations()
-            elif hasattr(self.env.unwrapped, '_get_observations'):
-                current_obs = self.env.unwrapped._get_observations()
-            else:
-                print("[WARNING] No _get_observations method found, using fallback")
-                actual_env = getattr(self.env, 'unwrapped', self.env)
-                if hasattr(actual_env, 'observation_manager'):
-                    current_obs = actual_env.observation_manager.compute()
-                else:
-                    current_obs = {}
+        # 直接使用当前观测，不再有复杂的获取逻辑
+        current_obs = self._current_obs
         
         # 1) 选动作（带噪声，训练态）
-        actions, debug = self.maddpg.select_actions(current_obs, add_noise=True)
+        actions, detail = self.maddpg.select_actions(current_obs, add_noise=True)
 
-        # 2) 让环境可记录 actor debug
-        if hasattr(self.env, "set_debug_actor_info"):
-            self.env.set_debug_actor_info(debug)
-        elif hasattr(self.env.unwrapped, "set_debug_actor_info"):
-            self.env.unwrapped.set_debug_actor_info(debug)
+        # 2) 让环境可记录 actor detail info - 直接调用统一接口
+        self.env.unwrapped.set_detail_actor_info(detail)
 
         # 3) 与环境交互
         next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
@@ -125,15 +108,14 @@ class TrainingRunner:
             payload = {k: v for k, v in payload.items() if v is not None}
             self.metrics.push_update(self.global_step, payload)
 
-        # 8) 控制台（可选）
-        if self.reward_logger and hasattr(self.reward_logger, "log_console_if_enabled"):
-            self.reward_logger.log_console_if_enabled(self.env, rewards, self.global_step)
-
-        # 9) 步计数 + env侧同步
+        # 8) 步计数 + env侧同步
         self.global_step += 1
         actual_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(actual_env, "set_trainer_global_step"):
             actual_env.set_trainer_global_step(self.global_step)
+
+        # 9) 更新当前观测为下一轮输入
+        self._current_obs = next_obs
 
         return next_obs
 
@@ -144,11 +126,10 @@ class TrainingRunner:
     def run_until(self, max_global_steps: int):
         """运行直到达到最大步数"""
         obs, _ = self.env.reset()
-        # 存储初始观察，供 run_step 使用
+        # 保存初始观测作为第一轮输入
         self._current_obs = obs
         while self.global_step < max_global_steps:
-            next_obs = self.run_step()
-            self._current_obs = next_obs
+            self.run_step()  # next_obs通过_current_obs更新传递
 
 
 # === NEW CLASS: MilestoneEvaluator ===
@@ -287,12 +268,9 @@ class MetricsHub:
         self.subs[event].append(handler)
 
     def _emit(self, event: str, payload: dict) -> None:
-        """Emit an event to all subscribers."""
+        """Emit an event to all subscribers - no try/except, let errors bubble up."""
         for h in self.subs.get(event, []):
-            try:
-                h(payload)
-            except Exception as e:
-                print(f"[MetricsHub] handler error on '{event}': {e}")
+            h(payload)
 
     # ---- Pushers ----
     def push_step(self, step: int, env_ids: list[int], payload: dict) -> None:
@@ -349,21 +327,17 @@ class CheckpointManager:
             print(f"[CHECKPOINT] Checkpoint file not found: {self.checkpoint_path}")
             return False
         
-        try:
-            self.checkpoint_data = torch.load(self.checkpoint_path, map_location='cpu')
-            print(f"[CHECKPOINT] Successfully loaded: {self.checkpoint_path}")
-            
-            if 'top_k_envs' in self.checkpoint_data:
-                top_k_envs = self.checkpoint_data['top_k_envs']
-                print(f"[CHECKPOINT] Contains {len(top_k_envs)} Top-K models")
-                if top_k_envs:
-                    scores = [env['performance'] for env in top_k_envs]
-                    print(f"[CHECKPOINT] Score range: {min(scores):.2f} ~ {max(scores):.2f}/100")
-            
-            return True
-        except Exception as e:
-            print(f"[ERROR] Checkpoint loading failed: {e}")
-            return False
+        self.checkpoint_data = torch.load(self.checkpoint_path, map_location='cpu')
+        print(f"[CHECKPOINT] Successfully loaded: {self.checkpoint_path}")
+        
+        if 'top_k_envs' in self.checkpoint_data:
+            top_k_envs = self.checkpoint_data['top_k_envs']
+            print(f"[CHECKPOINT] Contains {len(top_k_envs)} Top-K models")
+            if top_k_envs:
+                scores = [env['performance'] for env in top_k_envs]
+                print(f"[CHECKPOINT] Score range: {min(scores):.2f} ~ {max(scores):.2f}/100")
+        
+        return True
     
     def initialize_agents_from_checkpoint(self, maddpg_trainer) -> None:
         """Initialize agents from checkpoint data using specified strategy."""
@@ -390,25 +364,23 @@ class CheckpointManager:
         
         success_count = 0
         for target_env_id, source_env_id in source_mapping.items():
-            try:
-                for agent_id in maddpg_trainer.agent_ids:
-                    target_agent = maddpg_trainer.env_agents[target_env_id][agent_id]
-                    network_keys = {
-                        'actor': f'env_{source_env_id}_{agent_id}_actor',
-                        'critic': f'env_{source_env_id}_{agent_id}_critic',
-                        'actor_target': f'env_{source_env_id}_{agent_id}_actor_target',
-                        'critic_target': f'env_{source_env_id}_{agent_id}_critic_target'
-                    }
-                    if any(key not in self.checkpoint_data for key in network_keys.values()):
-                        raise KeyError(f"Missing keys for agent {agent_id} from source env {source_env_id}")
+            for agent_id in maddpg_trainer.agent_ids:
+                target_agent = maddpg_trainer.env_agents[target_env_id][agent_id]
+                network_keys = {
+                    'actor': f'env_{source_env_id}_{agent_id}_actor',
+                    'critic': f'env_{source_env_id}_{agent_id}_critic',
+                    'actor_target': f'env_{source_env_id}_{agent_id}_actor_target',
+                    'critic_target': f'env_{source_env_id}_{agent_id}_critic_target'
+                }
+                
+                assert all(key in self.checkpoint_data for key in network_keys.values()), \
+                    f"Missing keys for agent {agent_id} from source env {source_env_id}"
 
-                    target_agent.actor.load_state_dict(self.checkpoint_data[network_keys['actor']])
-                    target_agent.critic.load_state_dict(self.checkpoint_data[network_keys['critic']])
-                    target_agent.actor_target.load_state_dict(self.checkpoint_data[network_keys['actor_target']])
-                    target_agent.critic_target.load_state_dict(self.checkpoint_data[network_keys['critic_target']])
-                success_count += 1
-            except Exception as e:
-                print(f"[WARNING] Env {target_env_id} loading failed, using random: {e}")
+                target_agent.actor.load_state_dict(self.checkpoint_data[network_keys['actor']])
+                target_agent.critic.load_state_dict(self.checkpoint_data[network_keys['critic']])
+                target_agent.actor_target.load_state_dict(self.checkpoint_data[network_keys['actor_target']])
+                target_agent.critic_target.load_state_dict(self.checkpoint_data[network_keys['critic_target']])
+            success_count += 1
         
         print(f"[CHECKPOINT] Successfully initialized {success_count}/{maddpg_trainer.num_envs} environments")
 
@@ -417,6 +389,7 @@ class WandBLogger:
     """
     Enhanced WandB logger with simplified key structure.
     MODIFIED: Updated to use new WHITELIST and simplified logging pipeline
+    MODIFIED: Removed try/except from initialize_run for fail-fast behavior
     """
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
@@ -427,33 +400,31 @@ class WandBLogger:
             print("[WANDB] Disabled")
 
     def initialize_run(self, config: Dict[str, Any], run_name: Optional[str] = None) -> None:
-        """Initialize WandB run with enhanced configuration tracking."""
+        """Initialize WandB run with enhanced configuration tracking - no try/except."""
         if not self.enabled:
             return
-        try:
-            self.run = wandb.init(
-                project=self.project_name,
-                name=run_name,
-                config=config,
-                tags=["maddpg", "multi-agent", "surgical-robot", "single-agent-training"],
-                notes="Multi-environment parallel MADDPG training (Dual Protection + Single Agent)",
-                settings=wandb.Settings(start_method="thread")
-            )
-            
-            # Log key configuration for dashboard
-            wandb.config.update({
-                "update_interval": config.get("maddpg_config", {}).get("update_interval", 100),
-                "reward_scale": 0.01,  # Our reward scaling factor
-                "agent_mode": "robot_only",  # Single agent training mode
-                "reward_components": "trajectory+progress+potential_field",  # Active components
-                "termination_mode": "direct_obstacle_collision",
-                "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
-            })
-            
-            print(f"[WANDB] Successfully initialized: {self.run.name}")
-        except Exception as e:
-            print(f"[WANDB] Initialization failed: {e}")
-            self.enabled = False
+        
+        # Direct initialization - fail fast if there's a problem
+        self.run = wandb.init(
+            project=self.project_name,
+            name=run_name,
+            config=config,
+            tags=["maddpg", "multi-agent", "surgical-robot", "single-agent-training"],
+            notes="Multi-environment parallel MADDPG training (Dual Protection + Single Agent)",
+            settings=wandb.Settings(start_method="thread")
+        )
+        
+        # Log key configuration for dashboard
+        wandb.config.update({
+            "update_interval": config.get("maddpg_config", {}).get("update_interval", 100),
+            "reward_scale": 0.01,  # Our reward scaling factor
+            "agent_mode": "robot_only",  # Single agent training mode
+            "reward_components": "trajectory+progress+potential_field",  # Active components
+            "termination_mode": "direct_obstacle_collision",
+            "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
+        })
+        
+        print(f"[WANDB] Successfully initialized: {self.run.name}")
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
         """Attach to MetricsHub for unified data pipeline with new key structure"""
@@ -546,22 +517,16 @@ class WandBLogger:
         if not has_milestone_data and not has_training_data:
             return
 
-        try:
-            log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
-            if log_data:
-                # Always use the provided unified step for consistent x-axis
-                wandb.log(log_data, step=step)
-        except Exception as e:
-            print(f"[WANDB] Failed to log algorithm statistics: {e}")
+        log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
+        if log_data:
+            # Always use the provided unified step for consistent x-axis
+            wandb.log(log_data, step=step)
 
     def finalize_run(self) -> None:
         """Finalize WandB run."""
         if self.enabled and self.run:
-            try:
-                wandb.finish()
-                print("[WANDB] Run finished")
-            except Exception as e:
-                print(f"[WANDB] Failed to finish: {e}")
+            wandb.finish()
+            print("[WANDB] Run finished")
 
 
 class TrainingConfiguration:

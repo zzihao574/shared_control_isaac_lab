@@ -11,7 +11,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: false  # Enable detailed console logging for debugging
+  enable_console_logging: true  # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)

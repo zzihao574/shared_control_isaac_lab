@@ -1,7 +1,7 @@
 """
 Environment utilities for shared network MADDPG training.
 FINAL VERSION: Essential components only, minimal complexity.
-MODIFIED: Updated MilestoneManager for compatibility with new architecture
+MODIFIED: Removed all try/except from CompleteConstraintChecker, force import at top
 MODIFIED: Simplified RewardLogger for TrainingRunner/MilestoneEvaluator integration
 """
 
@@ -9,19 +9,22 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
+# 强制导入依赖 - 若没装则直接抛ImportError
+from omni.physx.bindings._physx import (
+    acquire_physx_attachment_interface, acquire_physx_scene_query_interface
+)
+from carb._carb import Float3
+
+
 class CompleteConstraintChecker:
     """Physics-based constraint analysis."""
     
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
         self.device = device
         self.collision_threshold = collision_threshold        
-        try:
-            from omni.physx.bindings._physx import acquire_physx_attachment_interface, acquire_physx_scene_query_interface
-            self.physics_attachment_interface = acquire_physx_attachment_interface()
-            self.physics_scene_query_interface = acquire_physx_scene_query_interface()
-        except ImportError:
-            self.physics_attachment_interface = None
-            self.physics_scene_query_interface = None
+        # 直接初始化，失败就让异常抛出
+        self.physics_attachment_interface = acquire_physx_attachment_interface()
+        self.physics_scene_query_interface = acquire_physx_scene_query_interface()
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """Analyze constraint states for batch of environments."""
@@ -35,96 +38,86 @@ class CompleteConstraintChecker:
             'is_inside': torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         }
         
-        if self.physics_attachment_interface is None:
-            return batch_results
-        
         for env_id in range(num_envs):
             stylus_world_pos = stylus_positions[env_id] + env_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
-            try:
-                result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
-                if result is not None:
-                    batch_results['distances_constraint'][env_id] = result['distance']
-                    batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
-                    batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
-                    batch_results['is_overlapping'][env_id] = result['is_overlapping']
-                    batch_results['is_inside'][env_id] = result['is_inside']
-            except Exception:
-                pass
+            # 删除try/except，让真实异常暴露
+            result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
+            if result is not None:
+                batch_results['distances_constraint'][env_id] = result['distance']
+                batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
+                batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
+                batch_results['is_overlapping'][env_id] = result['is_overlapping']
+                batch_results['is_inside'][env_id] = result['is_inside']
         
         return batch_results
     
     def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str):
         """Analyze constraint state for single environment."""
-        try:
-            from carb._carb import Float3
-            
-            pos = stylus_position.cpu().numpy()
-            current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
-            
-            result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
-            
-            if not (result and 'closest_points' in result and result['closest_points']):
-                return None
-            
-            closest_pt = result['closest_points'][0]
-            closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
-            distance = float(np.linalg.norm(pos - closest_pos))
-            
-            direction_vec = closest_pos - pos
-            direction_length = np.linalg.norm(direction_vec)
-            
-            if direction_length < 1e-8:
-                return {
-                    'distance': 0.0, 'closest_point': closest_pos,
-                    'normal_vector': np.array([1.0, 0.0, 0.0]),
-                    'is_overlapping': True, 'is_inside': False
-                }
-            
-            direction_normalized = direction_vec / direction_length
-            direction_to_closest = Float3(
-                float(direction_normalized[0]),
-                float(direction_normalized[1]),
-                float(direction_normalized[2])
-            )
-            
-            raycast_result = self.physics_scene_query_interface.raycast_closest(
-                current_point, direction_to_closest, direction_length + 0.01
-            )
-            
-            filtered_result = None
-            if raycast_result and 'collision' in raycast_result:
-                if constraint_path in raycast_result['collision']:
-                    filtered_result = raycast_result
-            
-            # Determine state
-            if distance > 1.2 or distance < 1e-8:
-                is_overlapping, is_inside = True, False
-                distance = 0.0
-            elif distance < 0.002:
-                is_overlapping, is_inside = True, False
-                distance = 0.0
-            elif not filtered_result or 'faceIndex' not in filtered_result:
-                is_overlapping, is_inside = False, True
-            else:
-                is_overlapping, is_inside = False, False
-            
-            normal_vector = np.array([1.0, 0.0, 0.0])
-            if filtered_result and 'normal' in filtered_result:
-                normal_carb = filtered_result['normal']
-                normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-                if not is_inside:
-                    normal_vector = -normal_vector
-            
-            return {
-                'distance': distance, 'closest_point': closest_pos,
-                'normal_vector': normal_vector,
-                'is_overlapping': is_overlapping, 'is_inside': is_inside
-            }
-            
-        except Exception:
+        # 删除try/except，直接执行必达路径
+        pos = stylus_position.cpu().numpy()
+        current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
+        
+        result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
+        
+        if not (result and 'closest_points' in result and result['closest_points']):
             return None
+        
+        closest_pt = result['closest_points'][0]
+        closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
+        distance = float(np.linalg.norm(pos - closest_pos))
+        
+        direction_vec = closest_pos - pos
+        direction_length = np.linalg.norm(direction_vec)
+        
+        if direction_length < 1e-8:
+            return {
+                'distance': 0.0, 'closest_point': closest_pos,
+                'normal_vector': np.array([1.0, 0.0, 0.0]),
+                'is_overlapping': True, 'is_inside': False
+            }
+        
+        direction_normalized = direction_vec / direction_length
+        direction_to_closest = Float3(
+            float(direction_normalized[0]),
+            float(direction_normalized[1]),
+            float(direction_normalized[2])
+        )
+        
+        raycast_result = self.physics_scene_query_interface.raycast_closest(
+            current_point, direction_to_closest, direction_length + 0.01
+        )
+        
+        filtered_result = None
+        if raycast_result and 'collision' in raycast_result:
+            if constraint_path in raycast_result['collision']:
+                filtered_result = raycast_result
+        
+        # Determine state
+        if distance > 1.2 or distance < 1e-8:
+            is_overlapping, is_inside = True, False
+            distance = 0.0
+        elif distance < 0.002:
+            is_overlapping, is_inside = True, False
+            distance = 0.0
+        elif not filtered_result or 'faceIndex' not in filtered_result:
+            is_overlapping, is_inside = False, True
+        else:
+            is_overlapping, is_inside = False, False
+        
+        normal_vector = np.array([1.0, 0.0, 0.0])
+        if filtered_result and 'normal' in filtered_result:
+            normal_carb = filtered_result['normal']
+            normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
+            if not is_inside:
+                normal_vector = -normal_vector
+        
+        return {
+            'distance': distance, 'closest_point': closest_pos,
+            'normal_vector': normal_vector,
+            'is_overlapping': is_overlapping, 'is_inside': is_inside
+        }
 
 
 class TrajectoryManager:
@@ -219,35 +212,52 @@ class StepTracer:
 
     def _print_env_snapshot(self, env, env_id: int):
         """Print complete four-zone reward breakdown for a single environment."""
-        stylus = env.stylus_pos_t1[env_id]
-        safety = float(env.safety_distances_t1[env_id].item())
-        normal = env.normal_t1[env_id]
-        dev = float(env.reward_components['deviation'][env_id].item())
-        prog = float(env.reward_components['progress_ratio'][env_id].item())
-        dist = float(env.reward_components['distance_to_final'][env_id].item())
+        # 添加安全检查
+        if not hasattr(env, 'reward_components') or not env.reward_components:
+            print(f"[DEBUG] Environment {env_id}: Reward components not yet calculated")
+            return
+            
+        if not hasattr(env, 'stylus_pos_t1') or env.stylus_pos_t1 is None:
+            print(f"[DEBUG] Environment {env_id}: Stylus position not available")
+            return
+            
+        try:
+            stylus = env.stylus_pos_t1[env_id]
+            safety = float(env.safety_distances_t1[env_id].item())
+            normal = env.normal_t1[env_id]
+            
+            # 安全地获取奖励组件
+            dev = float(env.reward_components.get('deviation', torch.zeros(self.num_envs, device=self.device))[env_id].item())
+            prog = float(env.reward_components.get('progress_ratio', torch.zeros(self.num_envs, device=self.device))[env_id].item())
+            dist = float(env.reward_components.get('distance_to_final', torch.zeros(self.num_envs, device=self.device))[env_id].item())
 
-        print(f"\n--- Environment {env_id} ---")
-        print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
-        print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
+            print(f"\n--- Environment {env_id} ---")
+            print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
+            print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
 
-        self._print_actor_debug_info(env, env_id)
+            self._print_actor_detail_info(env, env_id)
 
-        print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
+            print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
-        D, O = 0.0075, 0.015
-        if safety >= O:      active_zone = "A (Track)"
-        elif safety <= D:    active_zone = "C (Danger)"
-        else:
-            if hasattr(env, 'rejoin_streak') and env.rejoin_streak[env_id] >= 10:
-                active_zone = "D (Rejoin)"
+            D, O = 0.0075, 0.015
+            if safety >= O:      active_zone = "A (Track)"
+            elif safety <= D:    active_zone = "C (Danger)"
             else:
-                active_zone = "B (Surface)"
-        print(f"Active Zone: {active_zone}")
+                if hasattr(env, 'rejoin_streak') and env.rejoin_streak[env_id] >= 10:
+                    active_zone = "D (Rejoin)"
+                else:
+                    active_zone = "B (Surface)"
+            print(f"Active Zone: {active_zone}")
 
-        self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
-        self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+            self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
+            self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+            
+        except Exception as e:
+            print(f"[DEBUG] Error printing environment {env_id} snapshot: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def _print_actor_debug_info(self, env, env_id: int):
+    def _print_actor_detail_info(self, env, env_id: int):
         """Print actor network outputs and noise information with force consistency check."""
         if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
             return
@@ -414,19 +424,15 @@ class RewardLogger:
     def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
         """更新步骤指标到MetricsHub"""
         if self.metrics_hub:
-            try:
-                robot_avg = rewards.get("robot", torch.zeros(1, device=self.device)).mean().item()
-                human_avg = rewards.get("human", torch.zeros(1, device=self.device)).mean().item()
-                safety_avg = safety_distances.mean().item()
-                
-                self.metrics_hub.push_update(0, {
-                    "reward/robot_avg": robot_avg,
-                    "reward/human_avg": human_avg, 
-                    "safety/distance_avg": safety_avg,
-                })
-            except Exception as e:
-                # 静默处理指标推送错误，避免影响训练
-                pass
+            robot_avg = rewards.get("robot", torch.zeros(1, device=self.device)).mean().item()
+            human_avg = rewards.get("human", torch.zeros(1, device=self.device)).mean().item()
+            safety_avg = safety_distances.mean().item()
+            
+            self.metrics_hub.push_update(0, {
+                "reward/robot_avg": robot_avg,
+                "reward/human_avg": human_avg, 
+                "safety/distance_avg": safety_avg,
+            })
     
     def log_console_if_enabled(self, env, rewards: Dict, global_step: int):
         """
@@ -437,12 +443,7 @@ class RewardLogger:
             rewards: Reward dictionary  
             global_step: Unified global step from trainer (hand-maintained)
         """
-        try:
-            self.step_tracer.maybe_print_step(env, rewards, global_step)
-        except Exception as e:
-            # 静默处理控制台日志错误，避免影响训练
-            if global_step % 1000 == 0:  # 偶尔报告错误
-                print(f"[RewardLogger] Console logging error at step {global_step}: {e}")
+        self.step_tracer.maybe_print_step(env, rewards, global_step)
     
     def check_milestone(self, global_episodes: int):
         """检查里程碑（遗留兼容性 - 现在由MADDPGTrainer处理）"""

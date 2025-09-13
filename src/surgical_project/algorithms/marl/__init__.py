@@ -5,7 +5,7 @@
 from .networks import Actor, Critic
 from .ddpg_agent import DDPGAgent  
 from .maddpg import MADDPG
-from .replay_buffer import MultiAgentReplayBuffer
+from .replay_buffer import JointReplayBuffer
 
 # 删除这行：from .networks import Actor, Critic, OrnsteinUhlenbeckNoise
 # 因为我们已经删除了OrnsteinUhlenbeckNoise类
@@ -15,5 +15,5 @@ __all__ = [
     "Critic", 
     "DDPGAgent",
     "MADDPG",
-    "MultiAgentReplayBuffer"
+    "JointReplayBuffer"
 ]

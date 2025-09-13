@@ -3,11 +3,14 @@
 """
 Surgical Robot MADDPG Shared Network Training
 FINAL VERSION: Refactored with TrainingRunner and MilestoneEvaluator for better maintainability.
+MODIFIED: Removed all try/except from training loop except KeyboardInterrupt
+MODIFIED: Simplified environment count detection logic
+MODIFIED: Removed try/except from cleanup operations
 
 Features:
 - TrainingRunner: 统一训练循环管理
 - MilestoneEvaluator: 统一里程碑评估管理  
-- 主脚本仅负责装配与启停
+- 主脚本仅负责装配与启动
 - 保持所有原有功能不变
 """
 
@@ -64,16 +67,12 @@ def create_maddpg_trainer(env, config, args):
     
     device = config.get_compute_device()
     
-    # 获取环境数量 - 支持多种环境接口
+    # 获取环境数量 - 简化逻辑，优先unwrapped.num_envs，否则env.num_envs
     num_envs = args.num_envs
-    if hasattr(env, 'num_envs'):
-        num_envs = env.num_envs
-    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'num_envs'):
+    if hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'num_envs'):
         num_envs = env.unwrapped.num_envs
-    elif hasattr(env, '_num_envs'):
-        num_envs = env._num_envs
-    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, '_num_envs'):
-        num_envs = env.unwrapped._num_envs
+    elif hasattr(env, 'num_envs'):
+        num_envs = env.num_envs
 
     maddpg = MADDPG(
         num_envs=num_envs,
@@ -139,20 +138,15 @@ def create_milestone_callback(evaluator, runner):
     def _on_milestone(milestone):
         """里程碑回调：评估→TopK→跳过episode计数"""
         print(f"[MILESTONE CALLBACK] Processing milestone {milestone}")
-        try:
-            result = evaluator.handle(milestone, runner.global_step)
-            if result.get("skip_episode_once", False):
-                runner.mark_skip_episode_once()
-                print(f"[MILESTONE CALLBACK] Marked skip_episode_once for milestone {milestone}")
-        except Exception as e:
-            print(f"[ERROR] Milestone callback failed for milestone {milestone}: {e}")
-            import traceback
-            traceback.print_exc()
+        result = evaluator.handle(milestone, runner.global_step)
+        if result.get("skip_episode_once", False):
+            runner.mark_skip_episode_once()
+            print(f"[MILESTONE CALLBACK] Marked skip_episode_once for milestone {milestone}")
     return _on_milestone
 
 
 class MADDPGTrainer:
-    """精简的MADDPG训练器 - 仅负责装配与启停"""
+    """精简的MADDPG训练器 - 仅负责装配与启动"""
     
     def __init__(self, args):
         self.args = args
@@ -208,7 +202,7 @@ class MADDPGTrainer:
         
         print(f"[SETUP] Log directory created: {log_dir}")
         
-        # 初始化WandB
+        # 初始化WandB - 不再用try/except包裹
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
@@ -315,18 +309,13 @@ class MADDPGTrainer:
             print(f"[MILESTONE] Crossed threshold: episodes {self.runner.global_episodes} >= milestone {candidate}")
             print(f"[MILESTONE] Triggering evaluation (previous max: {self.max_milestone_triggered})")
             
-            try:
-                # 直接调用evaluator处理
-                result = self.evaluator.handle(candidate, self.runner.global_step)
-                if result.get("skip_episode_once", False):
-                    self.runner.mark_skip_episode_once()
-                
-                self.max_milestone_triggered = candidate
-                print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
-            except Exception as e:
-                print(f"[ERROR] Milestone evaluation failed for milestone {candidate}: {e}")
-                import traceback
-                traceback.print_exc()
+            # 直接调用evaluator处理 - 不再用try/except包裹
+            result = self.evaluator.handle(candidate, self.runner.global_step)
+            if result.get("skip_episode_once", False):
+                self.runner.mark_skip_episode_once()
+            
+            self.max_milestone_triggered = candidate
+            print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
 
     def train(self) -> None:
         """主训练循环"""
@@ -353,37 +342,21 @@ class MADDPGTrainer:
             obs_dict, _ = self.env.reset()
             print(f"[TRAIN] Environment reset complete, starting training loop")
             
-            # 主训练循环 - 使用TrainingRunner
-            step_count = 0
+            # 主训练循环 - 使用TrainingRunner，删除所有try/except
             while self.runner.global_step < self.max_global_steps:
-                # 执行一个训练步骤
-                try:
-                    obs_dict = self.runner.run_step()
-                    step_count += 1
-                except Exception as e:
-                    print(f"[ERROR] Training step failed at step {self.runner.global_step}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    break
+                # 执行一个训练步骤 - 直接调用，失败就抛异常
+                obs_dict = self.runner.run_step()
                 
-                # 里程碑检查
-                try:
-                    self.check_and_trigger_milestone()
-                except Exception as e:
-                    print(f"[ERROR] Milestone check failed at step {self.runner.global_step}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                # 里程碑检查 - 直接调用，失败就抛异常
+                self.check_and_trigger_milestone()
                 
-                # 进度报告
+                # 进度报告 - 直接调用，失败就抛异常
                 if self.runner.global_step % 2000 == 0:
-                    try:
-                        self.logger.log_training_progress(
-                            self.runner.global_step, 
-                            self.runner.global_episodes, 
-                            self.top_k_manager
-                        )
-                    except Exception as e:
-                        print(f"[ERROR] Progress logging failed: {e}")
+                    self.logger.log_training_progress(
+                        self.runner.global_step, 
+                        self.runner.global_episodes, 
+                        self.top_k_manager
+                    )
                 
                 # 检查终止条件
                 if self.runner.global_step >= self.max_global_steps:
@@ -395,47 +368,37 @@ class MADDPGTrainer:
             print(f"  Total steps: {self.runner.global_step}")
             print(f"  Total episodes: {self.runner.global_episodes}")
             print(f"  Max milestone triggered: {self.max_milestone_triggered}")
-            print(f"  Steps processed: {step_count}")
             
             self.logger.log_training_complete(self.top_k_manager)
             
-            # 保存最终模型
-            try:
-                save_final_shared_networks(
-                    log_directory=self.logger.log_directory,
-                    maddpg=self.maddpg,
-                    global_step=self.runner.global_step,
-                    global_episodes=self.runner.global_episodes,
-                    max_milestone_triggered=self.max_milestone_triggered
-                )
-                
-                # 保存训练结果
-                self.logger.save_final_results(
-                    self.runner.global_step,
-                    self.runner.global_episodes,
-                    self.top_k_manager,
-                    self.config.params,
-                    self.args
-                )
-                print(f"[TRAIN] Final results saved successfully")
-            except Exception as e:
-                print(f"[ERROR] Failed to save final results: {e}")
+            # 保存最终模型 - 直接调用，失败就抛异常
+            save_final_shared_networks(
+                log_directory=self.logger.log_directory,
+                maddpg=self.maddpg,
+                global_step=self.runner.global_step,
+                global_episodes=self.runner.global_episodes,
+                max_milestone_triggered=self.max_milestone_triggered
+            )
+            
+            # 保存训练结果 - 直接调用，失败就抛异常
+            self.logger.save_final_results(
+                self.runner.global_step,
+                self.runner.global_episodes,
+                self.top_k_manager,
+                self.config.params,
+                self.args
+            )
+            print(f"[TRAIN] Final results saved successfully")
         
-        except (KeyboardInterrupt, Exception) as e:
-            print(f"\nTraining interrupted or failed: {e}")
-            if isinstance(e, Exception):
-                import traceback
-                traceback.print_exc()
+        except KeyboardInterrupt:
+            print(f"\nTraining interrupted by user")
         finally:
-            # 清理资源
-            try:
-                if self.reward_logger and hasattr(self.reward_logger, 'close_all_files'):
-                    self.reward_logger.close_all_files()
-                self.env.close()
-                self.wandb_logger.finalize_run()
-                print("[TRAIN] Cleanup completed")
-            except Exception as e:
-                print(f"[ERROR] Cleanup failed: {e}")
+            # 清理资源 - 直接调用，失败就抛异常
+            if self.reward_logger and hasattr(self.reward_logger, 'close_all_files'):
+                self.reward_logger.close_all_files()
+            self.env.close()
+            self.wandb_logger.finalize_run()
+            print("[TRAIN] Cleanup completed")
             print("\nShared network training completed")
 
 
@@ -445,46 +408,36 @@ def main():
     print("MADDPG Shared Network Training - Refactored Architecture")
     print("="*80)
     
+    # 解析参数 - 直接调用，失败就抛异常
+    parser = create_argument_parser()
+    AppLauncher.add_app_launcher_args(parser)
+    args_cli = parser.parse_args()
+    
+    print(f"[MAIN] Arguments parsed:")
+    print(f"  Task: {args_cli.task}")
+    print(f"  Environments: {args_cli.num_envs}")
+    print(f"  Max steps: {args_cli.max_global_steps}")
+    print(f"  WandB: {args_cli.wandb}")
+    print(f"  Config: {args_cli.config}")
+    
+    # 启动Isaac Sim - 直接调用，失败就抛异常
+    print(f"[MAIN] Launching Isaac Sim...")
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+    
     try:
-        # 解析参数
-        parser = create_argument_parser()
-        AppLauncher.add_app_launcher_args(parser)
-        args_cli = parser.parse_args()
+        # 创建并启动训练器 - 直接调用，失败就抛异常
+        print(f"[MAIN] Creating MADDPGTrainer...")
+        trainer = MADDPGTrainer(args_cli)
         
-        print(f"[MAIN] Arguments parsed:")
-        print(f"  Task: {args_cli.task}")
-        print(f"  Environments: {args_cli.num_envs}")
-        print(f"  Max steps: {args_cli.max_global_steps}")
-        print(f"  WandB: {args_cli.wandb}")
-        print(f"  Config: {args_cli.config}")
+        print(f"[MAIN] Starting training...")
+        trainer.train()
         
-        # 启动Isaac Sim
-        print(f"[MAIN] Launching Isaac Sim...")
-        app_launcher = AppLauncher(args_cli)
-        simulation_app = app_launcher.app
+        print(f"[MAIN] Training completed successfully")
         
-        try:
-            # 创建并启动训练器
-            print(f"[MAIN] Creating MADDPGTrainer...")
-            trainer = MADDPGTrainer(args_cli)
-            
-            print(f"[MAIN] Starting training...")
-            trainer.train()
-            
-            print(f"[MAIN] Training completed successfully")
-            
-        except Exception as e:
-            print(f"[MAIN] Training failed: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            print(f"[MAIN] Closing Isaac Sim...")
-            simulation_app.close()
-            
-    except Exception as e:
-        print(f"[MAIN] Main execution failed: {e}")
-        import traceback
-        traceback.print_exc()
+    finally:
+        print(f"[MAIN] Closing Isaac Sim...")
+        simulation_app.close()
 
 
 if __name__ == "__main__":
