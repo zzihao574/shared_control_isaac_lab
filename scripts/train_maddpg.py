@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 
 """
-Surgical Robot MADDPG Multi-Environment Parallel Training
-Unified dimension management with grouped replay buffers and dual protection mechanism
-MODIFIED: Added MetricsHub for unified data pipeline, removed WandB direct logging
-MODIFIED: Unified global step tracking for consistent WandB x-axis
+Surgical Robot MADDPG Shared Network Training
+FINAL VERSION: Complete implementation with shared networks, joint buffer, and in-place evaluation.
+MODIFIED: Updated all logging keys to match new WHITELIST structure
+MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
+
+Features:
+- Single shared network per agent across all environments
+- Joint replay buffer with concatenated observations/actions
+- Global step counting (hand-maintained, training only)
+- Global episode counting (sum of all environment completions)
+- YAML-driven milestone evaluation (in-place, no separate environment)
+- Unified step tracking for console logging and WandB
+- New logging key structure: train/, model/, replay/, eval/, milestone/
+- Primary termination condition: max_global_steps
 """
 
 import sys
@@ -23,29 +33,42 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
 from utils.training_helpers import (
-    CheckpointManager, WandBLogger, TrainingConfiguration,
-    TopKModelManager, UnifiedProgressManager, TrainingLogger,
-    create_argument_parser, MetricsHub  # NEW: Import MetricsHub
+    WandBLogger, TrainingConfiguration, TrainingLogger, create_argument_parser, MetricsHub, TopKModelManager
 )
 
 class MADDPGTrainer:
-    """Main trainer class for MADDPG algorithm with grouped replay buffers and dual protection."""
+    """Main trainer class for shared network MADDPG algorithm."""
     
     def __init__(self, args):
         self.args = args
         self.config = TrainingConfiguration(args.config)
-        self.checkpoint_manager = CheckpointManager(args.checkpoint, args.load_strategy)
         self.wandb_logger = WandBLogger(enabled=args.wandb)
         
-        # NEW: Initialize MetricsHub
+        # Initialize MetricsHub
         self.metrics = MetricsHub()
         
         self._setup_environment()
         self._setup_logging_and_wandb()
         self._setup_training_components()
         
-        # UNIFIED: Global step tracking for consistent WandB x-axis
+        # Global step and episode tracking (hand-maintained)
         self.global_step = 0
+        self.global_episodes = 0
+        
+        # Milestone tracking for "cross-threshold" triggering
+        self.max_milestone_triggered = 0
+        
+        # MODIFIED: Setup max_global_steps as primary termination condition
+        maddpg_cfg = self.config.params.get('maddpg_config', {})
+        cfg_steps = maddpg_cfg.get('max_global_steps', 0) or 0
+        cli_steps = getattr(self.args, "max_global_steps", 0) or 0
+        self.max_global_steps = int(cli_steps if cli_steps > 0 else cfg_steps)
+        if self.max_global_steps <= 0:
+            self.max_global_steps = float('inf')
+        
+        print(f"[INFO] Training limits configured:")
+        print(f"  Max global steps: {self.max_global_steps}")
+        print(f"  Milestone episodes: {self.config.params.get('training_monitor', {}).get('milestone_episodes', [])}")
 
     def _get_num_envs_from_env(self):
         """Extract num_envs from environment through wrappers."""
@@ -76,23 +99,23 @@ class MADDPGTrainer:
     def _setup_logging_and_wandb(self):
         """Configure logging directories and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = f"logs/maddpg_parallel/{timestamp}"
+        log_dir = f"logs/maddpg_shared/{timestamp}"
         self.logger = TrainingLogger(log_dir)
         self.checkpoint_path = os.path.join(log_dir, f"checkpoint_top{self.args.top_k_models}.pth")
+        
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_grouped_buffers_{self.args.num_envs}envs_{timestamp}"
+            run_name = f"maddpg_shared_{self.args.num_envs}envs_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
             
-            # NEW: Attach WandB to MetricsHub
+            # Attach WandB to MetricsHub
             self.wandb_logger.attach_metrics_hub(self.metrics)
 
     def _setup_training_components(self):
-        """Initialize MADDPG trainer and related training components with grouped buffers."""
+        """Initialize MADDPG trainer and related training components."""
         from surgical_project.algorithms.marl.maddpg import MADDPG
         device = self.config.get_compute_device()
         
-        # Use unified num_envs extraction
         num_envs = self._get_num_envs_from_env()
 
         self.maddpg_trainer = MADDPG(
@@ -101,51 +124,41 @@ class MADDPGTrainer:
             params=self.config.params,
             device=device
         )
-
-        if self.checkpoint_manager.load_checkpoint():
-            self.checkpoint_manager.initialize_agents_from_checkpoint(self.maddpg_trainer)
         
-        # Use unified progress manager
-        self.progress = UnifiedProgressManager(
-            num_envs,
-            self.args.max_episodes,
-            device=device
-        )
-        
-        # Set progress manager in reward logger (single call)
+        # Configure reward logger with simplified architecture
         reward_logger = self._get_reward_logger()
         if reward_logger:
-            reward_logger.set_progress_manager(self.progress)
-            reward_logger.set_episode_counter(self.progress.episode_counts)
+            from surgical_project.envs.multi_agent.utils import RewardLogger
+            milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
+            new_logger = RewardLogger(
+                num_envs=num_envs,
+                device=self.config.get_compute_device(),
+                metrics_hub=self.metrics,
+                enable_console_logging=self.config.params['logging']['enable_console_logging'],
+                milestones=milestones
+            )
             
-            # Also update milestone manager if it exists
-            if reward_logger.milestone_manager:
-                reward_logger.milestone_manager.progress_manager = self.progress
-        
-        # Inject dependencies to MADDPG trainer
-        self.maddpg_trainer.progress = self.progress
-        self.maddpg_trainer.max_episodes = self.args.max_episodes
-        
-        # Set up training logger reference for progress manager (single call)
-        self.progress.training_logger = self.logger
-        
-        # DUAL PROTECTION SETUP: Register buffer clearing callback
-        self.progress.register_closure_callback(self.maddpg_trainer.disable_environment)
-        print("[PROTECTION] Grouped buffer dual protection mechanism activated:")
-        print("  - First layer: Immediate environment disabling on closure")
-        print("  - Second layer: Training filtering by active environments only")
-        print("  - Group buffer management: Shared buffers cleared only when group completes")
-        
-        # Pass to env (single call)
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        if hasattr(actual_env, 'set_progress_manager'):
-            actual_env.set_progress_manager(self.progress)
-        else:
-            print("[WARNING] Environment does not support progress manager injection")
+            actual_env = getattr(self.env, 'unwrapped', self.env)
+            if hasattr(self.env, 'reward_logger'):
+                self.env.reward_logger = new_logger
+            elif hasattr(actual_env, 'reward_logger'):
+                actual_env.reward_logger = new_logger
+            
+            reward_logger = self._get_reward_logger()
+            if reward_logger:
+                reward_logger.configure_logging(self.config.params)
+                # NOTE: Milestone callback now handled directly by MADDPGTrainer
+                # reward_logger.set_topk_update_callback(self.update_topk_at_milestone)
         
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models)
         self.training_started = False
         self.min_buffer_size = self.maddpg_trainer.min_buffer_size
+
+        print(f"[INFO] Training components initialized:")
+        print(f"  MADDPG trainer: {len(self.maddpg_trainer.agent_ids)} agents")
+        print(f"  Buffer min size: {self.min_buffer_size}")
+        print(f"  Top-K models: {self.args.top_k_models}")
+        print(f"  Milestone management: Direct (no RewardLogger callback)")
 
     def _create_environment(self) -> Tuple[Any, Any]:
         """Create and configure the surgical environment."""
@@ -154,7 +167,6 @@ class MADDPGTrainer:
         import surgical_project.envs.multi_agent
         
         env_cfg = SurgicalDirectMARLEnvCfg()
-        # Override environment count from command line arguments
         env_cfg.scene.num_envs = self.args.num_envs
         env_cfg.seed = self.args.seed
         
@@ -178,34 +190,22 @@ class MADDPGTrainer:
         return getattr(self.env, 'reward_logger', None) or getattr(getattr(self.env, 'unwrapped', None), 'reward_logger', None)
 
     def _configure_reward_logger(self):
-        """MODIFIED: Configure reward logger with MetricsHub injection."""
+        """Configure reward logger with MetricsHub injection."""
         reward_logger = self._get_reward_logger()
         if reward_logger:
-            # Pass max_episodes to reward logger configuration
-            self.config.params['training_monitor']['max_episodes'] = self.args.max_episodes
-            
-            # Filter milestones to only include those within max_episodes
-            original_milestones = self.config.params['training_monitor'].get('milestone_episodes', [])
-            filtered_milestones = [m for m in original_milestones if m <= self.args.max_episodes]
-            self.config.params['training_monitor']['milestone_episodes'] = filtered_milestones
-            
-            print(f"[INFO] Filtered milestones for max_episodes={self.args.max_episodes}: {filtered_milestones}")
-            
-            # Use unified num_envs extraction
             num_envs = self._get_num_envs_from_env()
-            
-            # NEW: Pass MetricsHub to RewardLogger
             from surgical_project.envs.multi_agent.utils import RewardLogger
             
-            # Create new logger with extracted num_envs
+            # MODIFIED: Use milestone list directly from YAML without filtering
+            milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
+            
             new_logger = RewardLogger(
                 num_envs=num_envs,
                 device=self.config.get_compute_device(),
-                metrics_hub=self.metrics,  # NEW: Pass hub
+                metrics_hub=self.metrics,
                 enable_console_logging=self.config.params['logging']['enable_console_logging'],
-                milestones=filtered_milestones
+                milestones=milestones
             )
-            # NOTE: Don't set progress manager here, it will be set later in _setup_training_components
             
             # Set the new logger in the appropriate place
             actual_env = getattr(self.env, 'unwrapped', self.env)
@@ -218,19 +218,13 @@ class MADDPGTrainer:
             reward_logger = self._get_reward_logger()
             if reward_logger:
                 reward_logger.configure_logging(self.config.params)
-                reward_logger.set_topk_update_callback(self.update_topk_at_milestone)
-                # NOTE: Don't set episode counter here either, it will be set later
-                
-                # NEW: Ensure milestone manager has hub reference
-                if reward_logger.milestone_manager:
-                    reward_logger.milestone_manager.metrics_hub = self.metrics
-                    # NOTE: progress_manager will be set later
+                # NOTE: Milestone management now handled directly by MADDPGTrainer
 
-    def _extract_model_state(self, env_id: int) -> Dict[str, Any]:
-        """Extract model state dictionaries for all agents in an environment."""
+    def _extract_model_state(self) -> Dict[str, Any]:
+        """Extract model state dictionaries from shared networks."""
         model_state = {}
         for agent_id in self.maddpg_trainer.agent_ids:
-            agent = self.maddpg_trainer.env_agents[env_id][agent_id]
+            agent = self.maddpg_trainer.agents[agent_id]
             prefix = f'{agent_id}'
             model_state.update({
                 f'{prefix}_actor': agent.actor.state_dict(), 
@@ -240,176 +234,316 @@ class MADDPGTrainer:
             })
         return model_state
 
-    def update_topk_at_milestone(self, milestone: int) -> None:
-        """Update Top-K models when milestone episodes are reached."""
-        print(f"[TopK Update] Evaluating all environments at Milestone {milestone}...")
-        reward_logger = self._get_reward_logger()
-        if not reward_logger or milestone not in reward_logger.milestone_performances:
-            print(f"[WARNING] Milestone {milestone} data incomplete, skipping TopK update")
-            return
+    def evaluate_policy_no_update(self, seed=None):
+        """
+        In-place policy evaluation (no exploration, no updates, no global_step modification).
+        MODIFIED: Single environment (env0) single episode evaluation for efficiency.
         
-        performances = reward_logger.milestone_performances[milestone]
-        for env_id, perf_data in performances.items():
-            try:
-                model_state = self._extract_model_state(env_id)
-                self.top_k_manager.update_model(env_id, perf_data['score'], model_state)
-            except Exception as e:
-                print(f"[WARNING] Env {env_id} model state extraction failed: {e}")
+        Args:
+            target_episodes: Number of complete episodes to collect (ignored, forced to 1)
+            seed: Optional seed for evaluation reproducibility
+            
+        Returns:
+            Dict with return_avg, num_episodes
+        """
+        # Force single environment, single episode evaluation
+        active_env = 0           # Only evaluate env0
+        target_episodes = 1      # Only collect 1 episode
         
-        milestone_path = os.path.join(self.logger.log_directory, f"topk_milestone_{milestone}.pth")
-        self.top_k_manager.save_checkpoint(milestone_path, self.maddpg_trainer)
+        print(f"[EVAL] Starting in-place evaluation (env0 only, 1 episode)...")
         
-        # TopK statistics will be uploaded through MetricsHub subscription
+        # Get actual environment (unwrap if needed)
+        env = getattr(self.env, 'unwrapped', self.env)
+        
+        # Set seed if provided and supported
+        if seed is not None and hasattr(env, 'seed'):
+            env.seed(seed)
+            print(f"[EVAL] Set evaluation seed: {seed}")
+        
+        # Reset environment for clean evaluation window (handle tuple return)
+        obs, _ = env.reset()
+        print(f"[EVAL] Environment reset for independent evaluation")
+        
+        num_envs = self.args.num_envs
+        ep_returns = torch.zeros(num_envs, device='cuda' if torch.cuda.is_available() else 'cpu')
+        completed_returns = []
+        
+        # Deterministic evaluation loop (no training modifications)
+        with torch.no_grad():
+            while len(completed_returns) < target_episodes:
+                # Select actions without noise (deterministic policy)
+                actions, _ = self.maddpg_trainer.select_actions(obs, add_noise=False)
+                
+                # MODIFIED: Mask actions - only active_env (env0) gets real actions, others get zeros
+                for aid, act in actions.items():
+                    # act: [num_envs, act_dim]
+                    if act.ndim == 2:
+                        masked = torch.zeros_like(act)
+                        masked[active_env] = act[active_env]  # Only keep env0's actions
+                        actions[aid] = masked
+                
+                # Environment step (NO store_joint_transitions, NO update, NO global_step increment)
+                obs, rewards, terminated, truncated, infos = env.step(actions)
+                
+                # MODIFIED: Only accumulate rewards from active_env (env0)
+                step_rewards = torch.stack([rewards[aid] for aid in self.maddpg_trainer.agent_ids])  # [num_agents, num_envs]
+                avg_step_rewards = step_rewards.mean(dim=0)  # [num_envs] - average across agents
+                ep_returns[active_env] += avg_step_rewards[active_env]  # Only update env0
+                
+                # MODIFIED: Only check completion for active_env (env0)
+                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+                done_any = None
+                for aid in self.maddpg_trainer.agent_ids:
+                    d = done_any_dict[aid].to(torch.bool)
+                    done_any = d if done_any is None else (done_any | d)
+                
+                # Check if active_env (env0) completed
+                if done_any[active_env]:
+                    # Collect env0's episode return
+                    ret0 = float(ep_returns[active_env].item())
+                    completed_returns.append(ret0)
+                    ep_returns[active_env] = 0.0  # Reset for next episode
+                    
+                    # Stop when we have enough episodes (which is 1)
+                    if len(completed_returns) >= target_episodes:
+                        break
+        
+        # Use only the first target_episodes (even if we collected more)
+        final_returns = completed_returns[:target_episodes]
+        avg_return = sum(final_returns) / max(1, len(final_returns))
+        
+        print(f"[EVAL] Completed: {len(final_returns)} episodes, Average return: {avg_return:.3f}")
+        
+        # Reset environment back to training state (handle tuple return)
+        _, _ = env.reset()
+        print(f"[EVAL] Environment reset back to training mode")
+        self._skip_episode_count_once = True
+        
+        return {
+            "return_avg": avg_return,
+            "num_episodes": len(final_returns)
+        }
 
-    def _print_buffer_status_debug(self):
-        """Print buffer status for debugging grouped buffer mechanism."""
-        status = self.maddpg_trainer.get_buffer_status()
+    def check_and_trigger_milestone(self):
+        """
+        Check if we crossed any milestone threshold and trigger evaluation once.
         
-        print(f"[DEBUG] Grouped Buffer Status:")
-        print(f"  Total environments: {status['total_envs']} (groups: {status['total_groups']})")
-        print(f"  Disabled environments: {status['disabled_envs']} {status['disabled_envs_list']}")
-        print(f"  Finished groups: {status['finished_groups']} {status['finished_groups_list']}")
-        print(f"  Cleared groups: {status['cleared_groups']} {status['cleared_groups_list']}")
-        print(f"  Group buffer sizes: {status['group_buffer_sizes']}")
+        Implements "cross 100 to 101 triggers 100 once" logic:
+        - Find the highest milestone <= current global_episodes  
+        - If it's higher than max_milestone_triggered, trigger evaluation once
+        - Update max_milestone_triggered to prevent duplicate triggers
+        """
+        milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
+        if not milestones:
+            return
+            
+        # Find the highest milestone we've crossed
+        candidate = 0
+        for milestone in sorted(milestones):
+            if self.global_episodes >= milestone:
+                candidate = milestone
+            else:
+                break
+                
+        # Trigger evaluation if we crossed a new threshold
+        if candidate > self.max_milestone_triggered:
+            print(f"[MILESTONE] Crossed threshold: episodes {self.global_episodes} >= milestone {candidate}")
+            print(f"[MILESTONE] Triggering evaluation (previous max: {self.max_milestone_triggered})")
+            
+            self.update_topk_at_milestone(candidate)
+            self.max_milestone_triggered = candidate
+            
+            print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
+
+    def update_topk_at_milestone(self, milestone: int) -> None:
+        """In-place milestone evaluation using current environment."""
+        print(f"[MILESTONE {milestone}] Starting in-place policy evaluation...")
+        
+        # Use current global_step as timestamp (read-only, no modification)
+        eval_timestamp = self.global_step
+        
+        # Perform in-place evaluation (no environment creation)
+        eval_result = self.evaluate_policy_no_update(
+            seed=4242 + milestone
+        )
+            
+        avg_return = eval_result['return_avg']
+        num_episodes = eval_result['num_episodes']
+        
+        print(f"[MILESTONE {milestone}] Evaluation complete:")
+        print(f"  Average return: {avg_return:.3f}")
+        print(f"  Episodes evaluated: {num_episodes}")
+        print(f"  Timestamp (global_step): {eval_timestamp}")
+        
+        # Update TopK manager
+        model_state = self._extract_model_state()
+        self.top_k_manager.update(avg_return, model_state, milestone)
+        
+        # Save milestone checkpoint
+        milestone_path = os.path.join(self.logger.log_directory, f"topk_milestone_{milestone}.pth")
+        self.top_k_manager.save_checkpoint(milestone_path, self.maddpg_trainer.agent_ids)
+        
+        # Push to MetricsHub and WandB using new eval/ and milestone/ keys
+        milestone_data = {
+            "eval/return_mean": avg_return,
+            "eval/num_episodes": num_episodes,
+            "milestone/topk_best_score": avg_return,  # For single model evaluation
+            "milestone/topk_avg_score": avg_return,   # Same as best for single evaluation
+            "milestone/topk_count": 1,                # Single evaluation
+            "milestone/latest_completed": milestone,
+        }
+        
+        self.metrics.push_milestone(eval_timestamp, milestone, milestone_data)
+        
+        print(f"[MILESTONE {milestone}] Results logged and saved, resuming training...")
 
     def train(self) -> None:
-        """MODIFIED: Main training loop using MetricsHub for data flow with unified global step."""
+        """Main training loop with shared networks and unified step tracking."""
         self.logger.log_training_start(self.args, self.config.params)
         
-        print(f"[INFO] Training with max_episodes={self.args.max_episodes}")
-        print("[INFO] MetricsHub data pipeline enabled:")
-        print("  - Unified data flow through MetricsHub")
-        print("  - WandB uploads via subscription only")
-        print("  - Buffer sharing: every 4 environments share 1 replay buffer")
-        print("  - UNIFIED global step tracking for consistent WandB x-axis")
+        print(f"[INFO] Shared network training with in-place evaluation:")
+        print(f"  - Single network per agent shared across all {self.args.num_envs} environments")
+        print(f"  - Joint replay buffer with concatenated observations/actions") 
+        print(f"  - Global step counting (hand-maintained, training only)")
+        print(f"  - Global episode counting (sum of all environment completions)")
+        print(f"  - YAML-driven milestone evaluation (in-place, no separate environment)")
+        print(f"  - Max steps: {self.max_global_steps}")
+        print(f"  - New logging structure: train/, model/, replay/, eval/, milestone/")
         
         try:
             obs_dict, _ = self.env.reset()
             
-            # Initial WandB data point
+            # Initial WandB data point using new keys
             if self.wandb_logger.enabled:
                 initial_stats = {
-                    "milestone/latest_completed": 0,
-                    "performance/topk_count": 0,
+                    "train/episodes_done": 0,
+                    "replay/buffer_size": 0,
                 }
-                self.wandb_logger.log_algorithm_statistics(initial_stats, self.global_step)
-                print("[WANDB] Uploaded initial milestone/performance baseline")
+                self.metrics.push_update(self.global_step, initial_stats)
             
-            # NEW: Subscribe trainer to episode events for group management
-            self.metrics.subscribe("episode", lambda ep: self.maddpg_trainer.on_episode_end(ep["env_id"]))
-            
-            # Use new progress manager
-            while not self.progress.is_training_complete():
-                # UNIFIED: Increment global step at the beginning of each loop iteration
-                self.global_step += 1
+            # MODIFIED: Main training loop with step-based termination only
+            while self.global_step < self.max_global_steps:
                 
-                # UNIFIED: Synchronize global step across all components
-                self.logger.global_step = self.global_step
-                self.progress.global_step = self.global_step  # NEW: Unified step source
-                
-                # Get active environments list
-                active_envs = self.progress.get_active_environments()
-                if not active_envs:
-                    break
+                # === TRAINING STEP ===
+                # Select actions (shared networks process all environments)
+                actions, debug = self.maddpg_trainer.select_actions(obs_dict, add_noise=True)
 
-                # Single step entry point: only count steps for active environments
-                self.progress.on_step(active_envs)
+                # Set debug info for environment before step
+                actual_env = getattr(self.env, 'unwrapped', self.env)
+                if hasattr(actual_env, 'set_debug_actor_info'):
+                    actual_env.set_debug_actor_info(debug)
 
-                # Only select actions for active environments (no grad; full batch returned)
-                with torch.no_grad():
-                    actions = self.maddpg_trainer.select_actions(
-                        obs_dict, active_envs, add_noise=False
-                    )
-                
+                # Environment step
                 next_obs, rewards, terminated, truncated, info = self.env.step(actions)
                 
-                # Combine terminated and truncated signals for proper TD target calculation
-                done_any = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+                # Combine terminated and truncated for proper TD target calculation
+                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
                 
-                # Only store transitions for active environments
-                self.maddpg_trainer.store_transitions_selective(obs_dict, actions, rewards, next_obs, done_any, active_envs)
-                
-                can_train = any(
-                    len(self.maddpg_trainer.env_replay_buffers[i]) >= self.min_buffer_size 
-                    for i in active_envs if i in self.maddpg_trainer.env_replay_buffers
+                # Store joint transitions (training only)
+                self.maddpg_trainer.store_joint_transitions(
+                    obs_dict, actions, rewards, next_obs, done_any_dict
                 )
+                
+                # Training update
+                stats = self.maddpg_trainer.update()
+                
+                # === STEP AND EPISODE COUNTING ===
+                # Hand-maintained global_step increment (training only)
+                self.global_step += 1
+                
+                # Update environment with current global_step for unified console logging
+                actual_env = getattr(self.env, 'unwrapped', self.env)
+                if hasattr(actual_env, 'set_trainer_global_step'):
+                    actual_env.set_trainer_global_step(self.global_step)
+                
+                # Global episode counting (OR over agents, then sum)
+                done_any = None
+                for aid in self.maddpg_trainer.agent_ids:
+                    d = done_any_dict[aid].to(torch.bool)
+                    done_any = d if done_any is None else (done_any | d)
+                
+                # Skip episode counting once after evaluation to avoid counting eval episodes
+                episode_increment = int(done_any.sum().item())
+                if getattr(self, "_skip_episode_count_once", False):
+                    episode_increment = 0
+                    self._skip_episode_count_once = False
+                self.global_episodes += episode_increment
+                
+                # === MILESTONE CHECKING ===
+                # YAML-driven milestone triggering (no hardcoded intervals)
+                self.check_and_trigger_milestone()
+                
+                # === LOGGING ===
+                # WandB logging (training level) - using new key structure
+                if stats and stats.get("training/updates", 0) > 0:
+                    # Convert MADDPG stats to new key structure
+                    log_data = {
+                        "train/actor_loss": stats.get("loss/actor/avg", 0),
+                        "train/critic_loss": stats.get("loss/critic/avg", 0),
+                        "model/q_mean": stats.get("q_mean/avg", 0),
+                        "model/q_std": stats.get("q_std/avg", 0),
+                        "model/grad_norm/actor": stats.get("grad_norm/actor/avg", 0),
+                        "model/grad_norm/critic": stats.get("grad_norm/critic/avg", 0),
+                        "replay/buffer_size": len(self.maddpg_trainer.replay),
+                        "train/episodes_done": self.global_episodes,
+                        "train/updates": stats.get("training/updates", 0),
+                    }
 
-                if can_train:
-                    if not self.training_started:
-                        self.training_started = True
-                        print(f"[Step {self.global_step}] Training Started with MetricsHub pipeline\n")
+                    # Per-agent action std if available
+                    if "action_std/avg" in stats:
+                        log_data["train/action_std"] = stats["action_std/avg"]
                     
-                    # DUAL PROTECTION: Pass active_envs to update method
-                    algorithm_stats = self.maddpg_trainer.update(active_envs)
+                    # Individual agent action std if available
+                    for aid in self.maddpg_trainer.agent_ids:
+                        if aid in stats.get("action_std", {}):
+                            log_data[f"train/action_std/{aid}"] = stats["action_std"][aid]
                     
-                    # NEW: Push update stats to hub instead of direct WandB logging
-                    if algorithm_stats.get("training/updates", 0) > 0:
-                        self.metrics.push_update(self.global_step, algorithm_stats)
-
-                # Episode settlement is completely handled by env._reset_idx()
+                    # Push to metrics hub with unified global_step
+                    self.metrics.push_update(self.global_step, log_data)
+                
+                # Progress reporting (unified global_step usage)
+                if self.global_step % 2000 == 0:
+                    self.logger.log_training_progress(self.global_step, self.global_episodes, self.top_k_manager)
+                
+                # MODIFIED: Only check step-based termination
+                if self.global_step >= self.max_global_steps:
+                    print(f"\n[TRAINING LIMIT] Reached max_global_steps={self.max_global_steps}")
+                    break
+                
                 obs_dict = next_obs
-
-                # Progress reporting (reduced frequency to avoid log spam)
-                if self.global_step > 0 and self.global_step % 2000 == 0:
-                    stats = self.progress.get_progress_statistics()
-                    self.logger.log_training_progress(self.global_step, stats, self.top_k_manager)
-                    # REMOVED: Direct WandB logging call, now handled by MetricsHub
-                
-                # NEW: Push buffer status to hub for console monitoring
-                if self.global_step > 0 and self.global_step % 10000 == 0:
-                    buffer_status = self.maddpg_trainer.get_buffer_status()
-                    self.metrics.push_buffer_status(self.global_step, buffer_status)
-                    self._print_buffer_status_debug()
-                
-                # Milestone progress reporting every 3000 steps (reduced frequency)
-                if self.global_step > 0 and self.global_step % 3000 == 0:
-                    reward_logger = self._get_reward_logger()
-                    if reward_logger:
-                        next_milestone, reached, remaining = reward_logger.get_next_milestone_progress()
-                        if next_milestone is not None:
-                            print(f"[Step {self.global_step}] Next Milestone {next_milestone}: "
-                                f"{reached}/{self.maddpg_trainer.num_envs} environments reached "
-                                f"({remaining} remaining)")
-                        else:
-                            print(f"[Step {self.global_step}] All environments completed all milestones!")
             
-            # Final evaluation of all environments
-            print("[TopK Update] Starting final evaluation...")
-            reward_logger = self._get_reward_logger()
-            if reward_logger:
-                for env_id in range(self.maddpg_trainer.num_envs):
-                    try:
-                        final_episode_count = self.progress.env_episode_counts[env_id]
-                        performance = reward_logger.get_final_evaluation(env_id, final_episode_count)
-                        model_state = self._extract_model_state(env_id)
-                        self.top_k_manager.update_model(env_id, performance, model_state)
-
-                    except Exception as e:
-                        print(f"[WARNING] Env {env_id} final evaluation failed: {e}")
-
-            # Final buffer status report
-            print("\n[FINAL STATUS] Grouped buffer monitoring summary:")
-            status = self.maddpg_trainer.get_buffer_status()
-            print(f"  Total environments: {status['total_envs']} (groups: {status['total_groups']})")
-            print(f"  Disabled environments: {status['disabled_envs']}")
-            print(f"  Finished groups: {status['finished_groups']}")
-            print(f"  Cleared groups: {status['cleared_groups']}")
-            print(f"  Final group buffer sizes: {status['group_buffer_sizes']}")
-
+            # Training completion
+            print(f"\n[TRAINING COMPLETE]")
+            print(f"  Total steps: {self.global_step}")
+            print(f"  Total episodes: {self.global_episodes}")
+            print(f"  Max milestone triggered: {self.max_milestone_triggered}")
+            print(f"[INFO] Shared networks successfully trained across {self.args.num_envs} environments")
+            
             self.logger.log_training_complete(self.top_k_manager)
-            final_path = os.path.join(self.logger.log_directory, "final_top_k_models.pth")
-            self.top_k_manager.save_checkpoint(final_path, self.maddpg_trainer)
-            self.logger.save_final_results(self.global_step, self.progress, self.top_k_manager, self.config.params, self.args)
+            final_path = os.path.join(self.logger.log_directory, "final_shared_networks.pth")
             
-            # Final statistics through MetricsHub with unified global step
-            if self.top_k_manager.top_models:
-                scores = [model[1] for model in self.top_k_manager.top_models]
-                final_stats = {
-                    "performance/topk_best_score": max(scores),
-                    "performance/topk_avg_score": np.mean(scores),
-                }
-                # Use unified global step for final WandB upload
-                self.wandb_logger.log_algorithm_statistics(final_stats, self.global_step)
+            # Save final shared networks
+            final_checkpoint = {
+                'params': self.maddpg_trainer.params,
+                'agent_ids': self.maddpg_trainer.agent_ids,
+                'global_steps_total': self.global_step,
+                'episodes_done_total': self.global_episodes,
+                'max_milestone_triggered': self.max_milestone_triggered,
+                'shared_networks': True,
+            }
+            for agent_id in self.maddpg_trainer.agent_ids:
+                agent = self.maddpg_trainer.agents[agent_id]
+                final_checkpoint.update({
+                    f'{agent_id}_actor': agent.actor.state_dict(),
+                    f'{agent_id}_critic': agent.critic.state_dict(),
+                    f'{agent_id}_actor_target': agent.actor_target.state_dict(),
+                    f'{agent_id}_critic_target': agent.critic_target.state_dict()
+                })
+            
+            torch.save(final_checkpoint, final_path)
+            print(f"[CHECKPOINT] Final shared networks saved: {final_path}")
+            
+            self.logger.save_final_results(self.global_step, self.global_episodes, self.top_k_manager, self.config.params, self.args)
         
         except (KeyboardInterrupt, Exception) as e:
             print(f"\nTraining interrupted or failed: {e}")
@@ -421,10 +555,10 @@ class MADDPGTrainer:
                 self._get_reward_logger().close_all_files()
             self.env.close()
             self.wandb_logger.finalize_run()
-            print("\nTraining finished with MetricsHub data pipeline and unified global step tracking")
+            print("\nShared network training completed")
 
 def main():
-    """Main entry point for training script."""
+    """Main entry point for shared network training script."""
     parser = create_argument_parser()
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()

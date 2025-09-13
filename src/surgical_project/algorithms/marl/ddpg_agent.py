@@ -8,21 +8,22 @@ from .networks import Actor, Critic
 
 class DDPGAgent:
     """
-    Deep Deterministic Policy Gradient agent for multi-agent environments.
+    Deep Deterministic Policy Gradient agent for shared network MADDPG.
     
+    FINAL VERSION: Unified action selection interface supporting batch processing.
     Features:
     - Stochastic actor with mean and variance outputs
-    - Centralized critic for multi-agent coordination
+    - Centralized critic for multi-agent coordination  
     - Soft target network updates
     - Force constraint compliance
-    - Huber loss for improved critic stability
-    - Actor debug information collection for console display
+    - Batch processing support for shared network architecture
+    - Gradient norm statistics for training diagnostics
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
                  total_state_dim: int, total_action_dim: int, params: Dict[str, Any], device: torch.device):
         """
-        Initialize DDPG agent.
+        Initialize DDPG agent for shared network architecture.
         
         Args:
             agent_id: Unique identifier for this agent
@@ -38,23 +39,26 @@ class DDPGAgent:
         
         # Load hyperparameters
         maddpg_cfg = params.get('maddpg_config', {})
-        self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.01))
-        self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.01))
-        self.tau = float(maddpg_cfg.get('tau', 0.01))
-        hidden_dim = int(maddpg_cfg.get('hidden_units', 64))
+        self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.001))
+        self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.001))
+        self.tau = float(maddpg_cfg.get('tau', 0.002))
+        hidden_dim = int(maddpg_cfg.get('hidden_units', 512))
         
         # Get agent-specific force constraints
         constraints = params.get('constraints', {})
         if 'robot' in agent_id.lower():
-            max_action = constraints.get('max_robot_force', 0.02)
+            max_action = constraints.get('max_robot_force', 0.04)
         else:
-            max_action = constraints.get('max_human_force', 0.02)
+            max_action = constraints.get('max_human_force', 0.04)
+            
+        self.max_action = max_action
         
-        print(f"[INFO] Initializing DDPG Agent: {agent_id}")
+        print(f"[DDPG AGENT] {agent_id}:")
         print(f"  State dim: {state_dim}, Action dim: {action_dim}")
-        print(f"  Max action magnitude: {max_action}")
+        print(f"  Total state dim: {total_state_dim}, Total action dim: {total_action_dim}")
+        print(f"  Max action: {max_action}")
         print(f"  Hidden units: {hidden_dim}")
-        print(f"  Learning rates - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
+        print(f"  LR - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
         print(f"  Target update rate (tau): {self.tau}")
         
         # Initialize actor networks
@@ -71,33 +75,36 @@ class DDPGAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
         
-        print(f"[INFO] DDPG Agent {agent_id} initialized successfully")
+        print(f"[DDPG AGENT] {agent_id} initialized successfully")
 
-    def select_action(self, observation: np.ndarray, add_noise: bool = True) -> Dict[str, np.ndarray]:
+    def select_action(self, observation, add_noise: bool = True) -> Dict[str, np.ndarray]:
         """
-        统一接口：选择动作并返回调试信息（mean / noise）。
-        返回:
-            {
-              "action": np.ndarray,  # 最终动作 (mean + noise)
-              "mean":   np.ndarray,  # actor 均值输出
-              "noise":  np.ndarray,  # 探索噪声（若 add_noise=False 则为 0）
-            }
+        Unified action selection interface supporting both single and batch inputs.
+        
+        Args:
+            observation: [obs_dim] or [batch, obs_dim] tensor/array
+            add_noise: Whether to add exploration noise
+            
+        Returns:
+            Dictionary containing:
+            - "action": Final action (mean + noise)
+            - "mean": Actor mean output  
+            - "noise": Exploration noise (zero if add_noise=False)
         """
-        obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+        obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+        if obs_tensor.ndim == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+
         with torch.no_grad():
-            mean, std = self.actor(obs_tensor)        # 形状 [1, act_dim]
-            if add_noise:
-                noise = std * torch.randn_like(mean)
-            else:
-                noise = torch.zeros_like(mean)
-            action = mean + noise
+            mean, std = self.actor(obs_tensor)  # [B, act_dim]
+            noise = std * torch.randn_like(mean) if add_noise else torch.zeros_like(mean)
+            action = (mean + noise).clamp_(-self.max_action, self.max_action)
 
         return {
-            "action": action.squeeze(0).cpu().numpy(),
-            "mean":   mean.squeeze(0).cpu().numpy(),
-            "noise":  noise.squeeze(0).cpu().numpy(),
+            "action": action.detach().cpu().numpy(),
+            "mean":   mean.detach().cpu().numpy(),
+            "noise":  noise.detach().cpu().numpy(),
         }
-
     
     def update_actor(self, loss: torch.Tensor) -> Dict[str, float]:
         """
@@ -116,7 +123,7 @@ class DDPGAgent:
         loss.backward()
         
         # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=3.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         
         # Update parameters
         self.actor_optimizer.step()
@@ -150,7 +157,7 @@ class DDPGAgent:
         critic_loss.backward()
         
         # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         
         # Update parameters
         self.critic_optimizer.step()
@@ -181,4 +188,3 @@ class DDPGAgent:
             target_param.data.copy_(
                 self.tau * param.data + (1.0 - self.tau) * target_param.data
             )
-    

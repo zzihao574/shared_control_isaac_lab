@@ -1,6 +1,6 @@
 # Training parameters configuration
-# Clean version - only training algorithm and task logic parameters
-# Environment structure definitions moved to cfg files
+# SIMPLIFIED: Removed per-environment complexity, optimized for shared network architecture
+# MODIFIED: Added max_global_steps as primary termination condition
 
 # ==============================================================================
 # Global Settings
@@ -11,7 +11,7 @@ seed: 42
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true  # Enable detailed console logging for milestone episodes
+  enable_console_logging: false  # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -19,7 +19,6 @@ logging:
 trajectory:
   start_point: [0.14, -0.2, 0.03]     # Starting position in 3D space (meters)
   end_point: [0.14, 0.2, 0.03]        # Target end position in 3D space (meters)
-  # REMOVED: switch_threshold - now unified as completion_threshold
 
 # ==============================================================================
 # Physics Constraints (Runtime Constraints)
@@ -85,7 +84,6 @@ reward_parameters:
     zoneD_progress_robot: 1.0
     zoneD_deviation_robot: 1.0
     zoneD_inward_robot: 1.0
-    # REMOVED: zoneD_rejoinspeed_robot, zoneD_gap_robot
 
     zpenalty_robot: 0.0
     completion_robot: 0.0
@@ -112,7 +110,6 @@ reward_parameters:
     zoneD_progress_human: 0.0
     zoneD_deviation_human: 0.0
     zoneD_inward_human: 0.0
-    # REMOVED: zoneD_rejoinspeed_human, zoneD_gap_human
 
     zpenalty_human: 0.0
     completion_human: 0.0
@@ -121,15 +118,15 @@ reward_parameters:
     robotaware_human: 0.0
 
 # ==============================================================================
-# Termination Conditions - MODIFIED FOR DIRECT TERMINATION
+# Termination Conditions - SIMPLIFIED
 # ==============================================================================
 termination_conditions:
   z_below_zero: false                 # Disable Z termination for now
-  edge_collision: true                # Enable direct termination on obstacle entry
+  edge_collision: false                # Enable direct termination on obstacle entry
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
   
 # ==============================================================================
-# MADDPG Algorithm Configuration - OPTIMIZED FOR STABILITY + GROUPED BUFFERS
+# MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS
 # ==============================================================================
 maddpg_config:
   lr_actor: 0.001                      # Actor learning rate
@@ -137,16 +134,17 @@ maddpg_config:
   gamma: 0.95                          # Discount factor
   batch_size: 512                     # Training batch size (increased for stability)
   hidden_units: 512                   # Hidden layer units
-  num_episodes: 600                   # Target episodes per environment
+  num_episodes: 600                   # Legacy parameter (kept for compatibility, not used for termination)
+  max_global_steps: 200000            # PRIMARY TERMINATION CONDITION: Stop after this many training steps
   update_interval: 100                # Updates every N steps
-  min_buffer_size: 6000               # Minimum buffer size to start training
+  min_buffer_size: 4096               # Minimum buffer size to start training (renamed from warmup)
   tau: 0.002                           # Target network update rate (slower for stability)
   max_replay_buffer_len: 100000        # Maximum replay buffer size
-  buffer_group_size: 4                # NEW: Number of environments sharing one buffer
 
 # ==============================================================================
-# Training Monitoring
+# Training Monitoring - SIMPLIFIED
 # ==============================================================================
 training_monitor:
-  # Milestone episodes for performance evaluation and TopK model selection
-  milestone_episodes: [1, 2, 5, 10, 20, 30, 50, 75, 90, 100, 125, 150, 175, 200, 300, 500]
+  # Milestone episodes for policy evaluation and TopK model selection
+  # Episodes are counted as sum of all environment completions
+  milestone_episodes: [10, 20, 30, 40, 50, 100, 200, 300, 500]

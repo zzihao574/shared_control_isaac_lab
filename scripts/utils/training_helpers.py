@@ -5,6 +5,9 @@ Training helper utilities for MADDPG multi-environment parallel training.
 Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
 MODIFIED: Added MetricsHub for unified data pipeline, removed unused WandB methods
 MODIFIED: Unified global step tracking and completion threshold consistency
+MODIFIED: Removed UnifiedProgressManager and all active_env related functionality
+MODIFIED: Updated WHITELIST and simplified WandB logging to match new key structure
+MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
 """
 
 import argparse
@@ -69,12 +72,12 @@ class MetricsHub:
         self.update_ring.append(data)
         self._emit("update", data)
 
-    def push_milestone_summary(self, milestone: int, summary: dict) -> None:
+    def push_milestone(self, step: int, milestone: int, summary: dict) -> None:
         """Push milestone completion summary."""
         scores = summary.get("scores", {})
         for eid, sc in scores.items():
             self.milestone_scores[milestone][eid] = sc
-        self._emit("milestone_summary", {"milestone": milestone, **summary})
+        self._emit("milestone_summary", {"step": step, "milestone": milestone, **summary})
 
     def push_buffer_status(self, step: int, status: dict) -> None:
         """Push buffer status information."""
@@ -88,144 +91,6 @@ class MetricsHub:
     def get_milestone_scores(self) -> dict:
         """Get all milestone scores."""
         return self.milestone_scores
-
-
-class UnifiedProgressManager:
-    """Unified progress manager - single source of truth for all progress tracking."""
-    
-    def __init__(self, num_envs: int, max_episodes: int, device="cpu"):
-        self.num_envs = num_envs
-        self.max_episodes = max_episodes
-        self.device = torch.device(device)
-        
-        # Core state tensors
-        self.env_episode_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        self.env_step_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        self.env_active_mask = torch.ones(num_envs, dtype=torch.bool, device=self.device)
-        self.hard_disabled_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-        self._episode_started = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-        
-        # Completion tracking
-        self.num_completed_envs = 0
-        
-        # Optional training logger reference for file logging
-        self.training_logger = None
-        
-        # NEW: Unified global step tracking
-        self.global_step = 0
-        
-        # Environment closure callbacks for dual-layer protection
-        self.env_closure_callbacks: List[Callable[[int], None]] = []
-
-    def register_closure_callback(self, callback: Callable[[int], None]):
-        """Register callback function to be called when environments are closed."""
-        self.env_closure_callbacks.append(callback)
-        print(f"[PROGRESS] Registered environment closure callback")
-
-    def on_step(self, env_ids):
-        """Single step entry point: only count steps for specified environment IDs."""
-        ids = self._normalize_ids(env_ids)
-        if not ids: 
-            return
-            
-        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
-        live = self.env_active_mask[idx] & (~self.hard_disabled_mask[idx])
-        
-        if torch.any(live):
-            live_idx = idx[live]
-            self.env_step_counts[live_idx] += 1
-            self._episode_started[live_idx] = True
-
-    def on_episode_end(self, env_ids, reason: str = "env_reset"):
-        """Single episode settlement entry point: handle episode completion."""
-        ids = self._normalize_ids(env_ids)
-        if not ids: 
-            return
-            
-        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
-        
-        # Update episode count and reset step count
-        self.env_episode_counts[idx] += 1
-        self.env_step_counts[idx] = 0
-        self._episode_started[idx] = False
-        
-        # Check if any environments reached max episodes
-        newly_done = (self.env_episode_counts[idx] >= self.max_episodes) & self.env_active_mask[idx]
-        done_idx = torch.nonzero(newly_done, as_tuple=False).squeeze(-1)
-        
-        if done_idx.numel() > 0:
-            self.env_active_mask[idx[done_idx]] = False
-            self.num_completed_envs += int(done_idx.numel())
-            
-            # Console logging for environment closures
-            closed = [int(i) for i in idx[done_idx].tolist()]
-            print(f"[PROGRESS] Newly closed this step: {closed}")
-            print(f"[PROGRESS] Total closed: {self.num_completed_envs}/{self.num_envs}")
-            
-            # Optional: also stream to TrainingLogger if available
-            if getattr(self, "training_logger", None) is not None:
-                try:
-                    self.training_logger.log_message(
-                        f"Environments closed: {closed} at episodes "
-                        f"{[int(self.env_episode_counts[i].item()) for i in idx[done_idx]]}"
-                    )
-                except Exception:
-                    pass
-            
-            # First layer protection: immediately clear buffers via callbacks
-            for callback in self.env_closure_callbacks:
-                for env_id in closed:
-                    try:
-                        callback(env_id)
-                    except Exception as e:
-                        print(f"[WARNING] Environment {env_id} closure callback failed: {e}")
-
-    def filter_valid_for_episode_end(self, env_ids=None, min_steps: int = 1) -> list[int]:
-        """Unified filtering: only episodes that actually ran can be settled."""
-        ids = self._normalize_ids(env_ids)
-        if not ids: 
-            return []
-            
-        idx = torch.tensor(ids, device=self.device, dtype=torch.long)
-        started = self._episode_started[idx]
-        enough = self.env_step_counts[idx] >= min_steps
-        
-        return [i for i, ok in zip(ids, (started & enough).tolist()) if ok]
-
-    def get_active_environments(self) -> list[int]:
-        """Get list of environments still in training."""
-        mask = self.env_active_mask & (~self.hard_disabled_mask)
-        return torch.nonzero(mask, as_tuple=False).squeeze(-1).tolist()
-
-    def is_training_complete(self) -> bool:
-        """Check if training is complete."""
-        return (self.env_active_mask & (~self.hard_disabled_mask)).sum().item() == 0
-
-    def get_progress_statistics(self) -> Dict[str, Union[int, float]]:
-        """Get training progress statistics."""
-        active_count = len(self.get_active_environments())
-        return {
-            'active_count': active_count, 
-            'completed_count': self.num_completed_envs
-        }
-
-    @property
-    def episode_counts(self): 
-        return self.env_episode_counts
-    
-    @property
-    def step_counts(self):    
-        return self.env_step_counts
-
-    def _normalize_ids(self, env_ids):
-        """Normalize environment ID input."""
-        if env_ids is None: 
-            return list(range(self.num_envs))
-        if torch.is_tensor(env_ids): 
-            return env_ids.detach().cpu().tolist()
-        if isinstance(env_ids, int): 
-            return [env_ids]
-        return list(env_ids)
 
 
 class CheckpointManager:
@@ -262,6 +127,11 @@ class CheckpointManager:
     
     def initialize_agents_from_checkpoint(self, maddpg_trainer) -> None:
         """Initialize agents from checkpoint data using specified strategy."""
+        # æ·»åŠ å…±äº«ç½'ç»œæž¶æž„æ£€æŸ¥
+        if hasattr(maddpg_trainer, 'agents') and not hasattr(maddpg_trainer, 'env_agents'):
+            print("[CHECKPOINT] Shared network architecture detected, skipping per-env initialization")
+            return
+            
         if not (self.checkpoint_data and 'top_k_envs' in self.checkpoint_data and self.checkpoint_data['top_k_envs']):
             print("[CHECKPOINT] No valid data, using random initialization")
             return
@@ -305,20 +175,13 @@ class CheckpointManager:
 
 class WandBLogger:
     """
-    Enhanced WandB logger with layered, frequency-based monitoring system.
-    MODIFIED: Removed unused methods, streamlined to use only MetricsHub pipeline
-    MODIFIED: Unified global step usage for consistent x-axis
+    Enhanced WandB logger with simplified key structure.
+    MODIFIED: Updated to use new WHITELIST and simplified logging pipeline
     """
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
         self.project_name = project_name
         self.run = None
-        
-        # Performance tracking for WandB dashboard
-        self.topk = 20  # Top-K model tracking
-        self._leaderboard = []  # Store (score, step, env_id) tuples
-        self._latest_completed = 0
-        self._completed_percent = 0.0
         
         if not self.enabled:
             print("[WANDB] Disabled")
@@ -353,77 +216,95 @@ class WandBLogger:
             self.enabled = False
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
-        """Attach to MetricsHub for unified data pipeline with consistent step usage"""
+        """Attach to MetricsHub for unified data pipeline with new key structure"""
         if not self.enabled:
             return
 
-        # 1) Training update level: use existing 19 whitelist items
+        # Training update level: direct logging with new keys
         hub.subscribe("update", lambda data: self.log_algorithm_statistics(data, data["step"]))
 
-        # 2) Episode level: currently not used but available for future
+        # Episode level: currently not used but available for future
         def _on_episode(ep):
             # Could aggregate episode-level metrics here if needed
             pass
         hub.subscribe("episode", _on_episode)
 
-        # 3) Milestone completion: calculate and upload topk_best / topk_avg with unified step
+        # Milestone completion: calculate and upload with new milestone/ keys
         def _on_ms(ms):
             scores = ms.get("scores", {})
-            if not scores:
-                return
-            score_values = list(scores.values())
-            best = max(score_values) if score_values else 0.0
-            avg = sum(score_values) / len(score_values) if score_values else 0.0
-            
-            # Use unified step from milestone summary
             step = ms.get("step", 0)
             
-            self.log_algorithm_statistics({
-                "performance/topk_best_score": best,
-                "performance/topk_avg_score": avg,
-                "performance/topk_count": len(score_values),
-                "milestone/latest_completed": ms.get("milestone", 0),
-            }, step)
+            # Calculate milestone metrics from scores if available, otherwise use direct values
+            if scores:
+                score_values = list(scores.values())
+                best = max(score_values) if score_values else 0.0
+                avg = sum(score_values) / len(score_values) if score_values else 0.0
+                count = len(score_values)
+            else:
+                # Fallback to direct values from milestone data
+                best = ms.get("milestone/topk_best_score", ms.get("eval/return_mean", 0.0))
+                avg = ms.get("milestone/topk_avg_score", ms.get("eval/return_mean", 0.0))
+                count = ms.get("milestone/topk_count", 1)
+            
+            # Construct log data with milestone metrics
+            log_data = {
+                "milestone/topk_best_score": best,
+                "milestone/topk_avg_score": avg,
+                "milestone/topk_count": count,
+                "milestone/latest_completed": ms.get("milestone", ms.get("milestone/latest_completed", 0)),
+            }
+            
+            # Forward eval/ data if present
+            if "eval/return_mean" in ms:
+                log_data["eval/return_mean"] = ms["eval/return_mean"]
+            if "eval/num_episodes" in ms:
+                log_data["eval/num_episodes"] = ms["eval/num_episodes"]
+            
+            # Use new milestone/ prefix
+            self.log_algorithm_statistics(log_data, step)
             
         hub.subscribe("milestone_summary", _on_ms)
         
-        print("[WANDB] Attached to MetricsHub with subscriptions: update, episode, milestone_summary")
+        print("[WANDB] Attached to MetricsHub with new key structure")
         print("[WANDB] Using unified global step for consistent x-axis")
 
     def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
-        """Log algorithm diagnostics with white-list filtering using unified step."""
+        """Log algorithm diagnostics with new WHITELIST filtering."""
         if not self.enabled or not algorithm_stats:
             return
 
-        # Allow milestone/performance data to bypass training/updates check
-        has_milestone_data = any(key.startswith(("milestone/", "performance/")) 
+        # New simplified WHITELIST
+        WHITELIST = {
+            # --- train ---
+            "train/actor_loss", "train/critic_loss",
+            "train/action_std/robot", "train/action_std/human",
+            "train/episodes_done", "train/updates",
+            
+            # --- model (q/td/gradç­‰ç»Ÿä¸€åœ¨è¿™) ---
+            "model/q_mean", "model/q_std",
+            "model/q_target_mean", "model/q_target_std",
+            "model/td_error_mean", "model/td_rmse", "model/q_qt_corr",
+            "model/grad_norm/actor", "model/grad_norm/critic",
+            
+            # --- replay ---
+            "replay/buffer_size",
+            
+            # --- eval ---
+            "eval/return_mean", "eval/num_episodes",
+            
+            # --- milestone ---
+            "milestone/topk_best_score", "milestone/topk_avg_score",
+            "milestone/topk_count", "milestone/latest_completed",
+        }
+
+        # Allow milestone/eval data to bypass training check
+        has_milestone_data = any(key.startswith(("milestone/", "eval/")) 
                                for key in algorithm_stats.keys())
         
-        # Only log when actual update occurred, except for milestone/performance data
-        if not has_milestone_data and algorithm_stats.get("training/updates", 0) <= 0:
+        # Only log when actual update occurred, except for milestone/eval data
+        has_training_data = algorithm_stats.get("train/updates", 0) > 0 or algorithm_stats.get("train/episodes_done", 0) > 0
+        if not has_milestone_data and not has_training_data:
             return
-
-        WHITELIST = {
-            # training (6)
-            "training/actor_loss_mean", "training/actor_loss_std",
-            "training/critic_loss_mean", "training/critic_loss_std",
-            "training/avg_buffer_size", "training/updates",
-            # algo global (5)
-            "algo/q_mean", "algo/q_std",
-            "algo/q_target_mean", "algo/q_target_std",
-            "algo/td_error_mean",
-            # env0 / env1 (8)
-            "env0/algo/q_mean", "env0/algo/q_std",
-            "env0/algo/q_target_mean", "env0/algo/q_target_std",
-            "env0/algo/td_error_mean", "env0/algo/q_qt_corr", "env0/algo/td_rmse",
-            "env1/algo/q_mean", "env1/algo/q_std",
-            "env1/algo/q_target_mean", "env1/algo/q_target_std",
-            "env1/algo/td_error_mean", "env1/algo/q_qt_corr", "env1/algo/td_rmse",
-            # performance & milestone (4)
-            "performance/topk_best_score", "performance/topk_avg_score",
-            "performance/topk_count",
-            "milestone/latest_completed",
-        }
 
         try:
             log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
@@ -462,39 +343,50 @@ class TopKModelManager:
     
     def __init__(self, k: int = 10):
         self.k = k
-        self.top_models: List[Tuple[int, float, Dict]] = []
+        self.top_models: List[Tuple[float, Dict, int]] = []
     
-    def update_model(self, env_id: int, performance: float, model_state: Dict[str, Any]) -> None:
+    def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
         """Update top-K models with new performance data."""
-        performance = np.clip(performance, 0, 100)
-        existing_index = next((i for i, (e_id, _, _) in enumerate(self.top_models) if e_id == env_id), None)
-        if existing_index is not None:
-            self.top_models[existing_index] = (env_id, performance, model_state)
-        elif len(self.top_models) < self.k:
-            self.top_models.append((env_id, performance, model_state))
-        elif performance > self.top_models[-1][1]:
-            self.top_models[-1] = (env_id, performance, model_state)
-        self.top_models.sort(key=lambda x: x[1], reverse=True)
+        # Use raw performance value without clipping
+        
+        # Add new model
+        if len(self.top_models) < self.k:
+            self.top_models.append((performance, model_state, milestone))
+        elif performance > self.top_models[-1][0]:
+            self.top_models[-1] = (performance, model_state, milestone)
+        
+        # Sort by performance (descending)
+        self.top_models.sort(key=lambda x: x[0], reverse=True)
     
-    def get_top_models(self) -> List[Tuple[int, float, Dict]]:
+    def get_top_models(self) -> List[Tuple[float, Dict, int]]:
         """Get list of top-K models."""
         return self.top_models
     
-    def save_checkpoint(self, filepath: str, maddpg_trainer) -> None:
+    def save_checkpoint(self, filepath: str, agent_ids: List[str]) -> None:
         """Save checkpoint with top-K models."""
         checkpoint = {
-            'params': maddpg_trainer.params,
-            'agent_ids': maddpg_trainer.agent_ids,
+            'agent_ids': agent_ids,
             'top_k_count': len(self.top_models),
-            'top_k_envs': [{'env_id': eid, 'performance': p} for eid, p, _ in self.top_models]
+            'top_k_models': []
         }
-        for env_id, _, model_state in self.top_models:
+        
+        for i, (performance, model_state, milestone) in enumerate(self.top_models):
+            model_info = {
+                'rank': i + 1,
+                'performance': performance,
+                'milestone': milestone
+            }
+            checkpoint['top_k_models'].append(model_info)
+            
+            # Save model state with rank prefix
             for key, value in model_state.items():
-                checkpoint[f'env_{env_id}_{key}'] = value
+                checkpoint[f'rank_{i+1}_{key}'] = value
+        
         torch.save(checkpoint, filepath)
         if self.top_models:
+            scores = [m[0] for m in self.top_models]
             print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: "
-                  f"{self.top_models[0][1]:.2f} ~ {self.top_models[-1][1]:.2f}/100")
+                  f"{scores[0]:.2f} ~ {scores[-1]:.2f}")
 
 
 class TrainingLogger:
@@ -515,9 +407,16 @@ class TrainingLogger:
             f.write(f"[{timestamp}] {message}\n")
     
     def log_training_start(self, args: argparse.Namespace, params: Dict[str, Any]) -> None:
-        """Log training start information."""
-        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Dual Protection)")
-        print(f"Environments: {args.num_envs}, Target: {args.max_episodes} episodes per env")
+        """Log training start information with step-based limits."""
+        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Shared Networks)")
+        
+        # Read CLI or YAML max_global_steps for display
+        cfg_steps = params.get('maddpg_config', {}).get('max_global_steps', 0) or 0
+        cli_steps = getattr(args, "max_global_steps", 0) or 0
+        max_steps = int(cli_steps if cli_steps > 0 else cfg_steps) or float('inf')
+        target_str = f"{max_steps} steps" if max_steps != float('inf') else "∞ steps"
+        
+        print(f"Environments: {args.num_envs}, Target: {target_str}")
         print(f"Log Directory: {self.log_directory}")
         
         # Log unified completion threshold
@@ -525,27 +424,30 @@ class TrainingLogger:
         print(f"Unified completion threshold: {completion_threshold}m")
         print(f"\n", "="*70)    
     
-    def log_training_progress(self, global_step: int, stats: Dict[str, Any], top_k_manager: TopKModelManager) -> None:
+    def log_training_progress(self, global_step: int, global_episodes: int, top_k_manager: TopKModelManager) -> None:
         """Log periodic training progress with unified global step."""
         self.global_step = global_step  # Update global step
-        total_envs = stats['active_count'] + stats['completed_count']
-        print(f"[Step {global_step}] Completed: {stats['completed_count']}/{total_envs}")
+        print(f"[Step {global_step}] Episodes so far: {global_episodes}")
         if top_k_manager.top_models:
-            scores = [m[1] for m in top_k_manager.top_models]
-            print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}/100")
+            scores = [m[0] for m in top_k_manager.top_models]
+            print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}")
     
     def log_training_complete(self, top_k_manager: TopKModelManager) -> None:
         """Log training completion summary."""
         print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
         print("\nFinal Top-K Models:")
-        for i, (env_id, performance, _) in enumerate(top_k_manager.get_top_models()):
-            print(f"  #{i+1} Environment {env_id}: {performance:.2f}/100")
+        for i, (performance, _, milestone) in enumerate(top_k_manager.get_top_models()):
+            print(f"  #{i+1} Milestone {milestone}: {performance:.2f}")
         print(f"\nResults saved in: {self.log_directory}")
     
-    def save_final_results(self, global_step: int, progress_manager: UnifiedProgressManager, 
+    def save_final_results(self, global_step: int, global_episodes: int, 
                           top_k_manager: TopKModelManager, params: Dict[str, Any], args: argparse.Namespace) -> None:
         """Save final training results to disk."""
-        stats = {'total_steps': global_step, 'top_k_scores': [(e, p) for e, p, _ in top_k_manager.get_top_models()]}
+        stats = {
+            'total_steps': global_step, 
+            'total_episodes': global_episodes,
+            'top_k_scores': [(p, m) for p, _, m in top_k_manager.get_top_models()]
+        }
         with open(os.path.join(self.log_directory, "training_stats.pkl"), 'wb') as f:
             pickle.dump(stats, f)
         params['command_line_args'] = vars(args)
@@ -554,20 +456,28 @@ class TrainingLogger:
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
-    """Create command line argument parser with default configuration."""
+    """Create command line argument parser with step-based configuration."""
     if config_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
     config = TrainingConfiguration(config_path)
-    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with dual protection")
+    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with shared networks")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment count from command line overrides cfg default
     parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
     parser.add_argument("--seed", type=int, default=config.params.get('seed', 42))
-    parser.add_argument("--max_episodes", type=int, default=config.maddpg_cfg.get('num_episodes', 600))
+    
+    # MODIFIED: Removed --max_episodes, added --max_global_steps
+    parser.add_argument(
+        "--max_global_steps", 
+        type=int, 
+        default=config.maddpg_cfg.get('max_global_steps', 0),
+        help="Stop after this many global training steps; if >0, it becomes the sole stop condition."
+    )
+    
     parser.add_argument("--top_k_models", type=int, default=10)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--load_strategy", type=str, default="distribute_topk", 
