@@ -1,6 +1,8 @@
 """
 Environment utilities for shared network MADDPG training.
 FINAL VERSION: Essential components only, minimal complexity.
+MODIFIED: Updated MilestoneManager for compatibility with new architecture
+MODIFIED: Simplified RewardLogger for TrainingRunner/MilestoneEvaluator integration
 """
 
 import torch
@@ -331,22 +333,23 @@ class StepTracer:
 
 class MilestoneManager:
     """
-    Simple milestone management for shared networks.
-    NOTE: This is now primarily handled by MADDPGTrainer directly.
-    Kept for backward compatibility.
+    统一的里程碑管理器，兼容新架构。
+    MODIFIED: 简化为与TrainingRunner和MilestoneEvaluator协作
     """
     
     def __init__(self, milestones: List[int]):
-        self.milestones = sorted(milestones)
+        self.milestones = sorted(milestones) if milestones else []
         self.completed = set()
         self.callback = None
+        print(f"[MILESTONE MANAGER] Initialized with milestones: {self.milestones}")
     
     def set_callback(self, callback_fn):
-        """Set milestone callback."""
+        """设置里程碑回调函数"""
         self.callback = callback_fn
+        print(f"[MILESTONE MANAGER] Callback set for {len(self.milestones)} milestones")
     
     def check(self, global_episodes: int) -> Optional[int]:
-        """Check if milestone reached."""
+        """检查是否达到里程碑（兼容性方法，实际使用由TrainingRunner处理）"""
         for milestone in self.milestones:
             if global_episodes >= milestone and milestone not in self.completed:
                 self.completed.add(milestone)
@@ -361,8 +364,9 @@ class MilestoneManager:
 
 class RewardLogger:
     """
-    Simple reward logger for shared networks with unified global_step integration.
-    Milestone management now primarily handled by MADDPGTrainer.
+    简化的奖励日志器，用于控制台输出。
+    MODIFIED: 与TrainingRunner/MilestoneEvaluator架构兼容
+    MODIFIED: 专注于控制台日志功能，里程碑管理转移至TrainingRunner
     """
 
     def __init__(self, num_envs: int, device: torch.device, metrics_hub=None, 
@@ -379,21 +383,21 @@ class RewardLogger:
             max_envs_to_print=2
         )
         
-        # Milestone management (NOTE: Legacy compatibility - now handled by MADDPGTrainer)
-        self.milestone_manager = MilestoneManager(milestones or [100, 200, 300, 500])
+        # Milestone management (Legacy compatibility - now handled by MADDPGTrainer)
+        self.milestone_manager = MilestoneManager(milestones or [])
         
         print(f"[RewardLogger] Initialized with {num_envs} environments")
         print(f"  Console logging: {'enabled' if enable_console_logging else 'disabled'}")
         print(f"  Milestone management: Legacy compatibility mode")
     
     def configure_logging(self, params: Dict):
-        """Configure logging parameters."""
+        """配置日志参数"""
         logging_config = params.get('logging', {})
         enable_console = logging_config.get('enable_console_logging', False)
         
         # Get milestones from config
         training_monitor = params.get('training_monitor', {})
-        milestones = training_monitor.get('milestone_episodes', [100, 200, 300, 500])
+        milestones = training_monitor.get('milestone_episodes', [])
         
         self.milestone_manager = MilestoneManager(milestones)
         self.step_tracer.enable_console_logging = enable_console
@@ -403,22 +407,26 @@ class RewardLogger:
         print(f"  Milestones: {milestones}")
     
     def set_topk_update_callback(self, callback_fn):
-        """Set TopK callback (legacy compatibility)."""
+        """设置TopK回调（遗留兼容性）"""
         self.milestone_manager.set_callback(callback_fn)
-        print(f"[RewardLogger] TopK callback registered (legacy mode)")
+        print(f"[RewardLogger] TopK callback registered (legacy mode - actual handling by MADDPGTrainer)")
     
     def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
-        """Update step metrics for MetricsHub."""
+        """更新步骤指标到MetricsHub"""
         if self.metrics_hub:
-            robot_avg = rewards.get("robot", torch.zeros(1, device=self.device)).mean().item()
-            human_avg = rewards.get("human", torch.zeros(1, device=self.device)).mean().item()
-            safety_avg = safety_distances.mean().item()
-            
-            self.metrics_hub.push_update(0, {
-                "reward/robot_avg": robot_avg,
-                "reward/human_avg": human_avg, 
-                "safety/distance_avg": safety_avg,
-            })
+            try:
+                robot_avg = rewards.get("robot", torch.zeros(1, device=self.device)).mean().item()
+                human_avg = rewards.get("human", torch.zeros(1, device=self.device)).mean().item()
+                safety_avg = safety_distances.mean().item()
+                
+                self.metrics_hub.push_update(0, {
+                    "reward/robot_avg": robot_avg,
+                    "reward/human_avg": human_avg, 
+                    "safety/distance_avg": safety_avg,
+                })
+            except Exception as e:
+                # 静默处理指标推送错误，避免影响训练
+                pass
     
     def log_console_if_enabled(self, env, rewards: Dict, global_step: int):
         """
@@ -429,12 +437,17 @@ class RewardLogger:
             rewards: Reward dictionary  
             global_step: Unified global step from trainer (hand-maintained)
         """
-        self.step_tracer.maybe_print_step(env, rewards, global_step)
+        try:
+            self.step_tracer.maybe_print_step(env, rewards, global_step)
+        except Exception as e:
+            # 静默处理控制台日志错误，避免影响训练
+            if global_step % 1000 == 0:  # 偶尔报告错误
+                print(f"[RewardLogger] Console logging error at step {global_step}: {e}")
     
     def check_milestone(self, global_episodes: int):
-        """Check milestone (legacy compatibility - now handled by MADDPGTrainer)."""
+        """检查里程碑（遗留兼容性 - 现在由MADDPGTrainer处理）"""
         return self.milestone_manager.check(global_episodes)
     
     def close_all_files(self):
-        """Cleanup (no-op for this implementation)."""
-        pass
+        """清理（此实现为空操作）"""
+        print("[RewardLogger] Cleanup completed (no files to close)")

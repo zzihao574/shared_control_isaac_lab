@@ -8,6 +8,7 @@ MODIFIED: Unified global step tracking and completion threshold consistency
 MODIFIED: Removed UnifiedProgressManager and all active_env related functionality
 MODIFIED: Updated WHITELIST and simplified WandB logging to match new key structure
 MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
+MODIFIED: Added TrainingRunner and MilestoneEvaluator classes for code organization
 """
 
 import argparse
@@ -31,6 +32,245 @@ except ImportError:
 
 # Hardware monitoring - DISABLED for minimal logging
 HARDWARE_MONITORING_AVAILABLE = False
+
+
+# === NEW CLASS: TrainingRunner ===
+class TrainingRunner:
+    """统一训练循环执行器：rollout→replay→update→日志→计数"""
+    
+    def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids):
+        self.env = env
+        self.maddpg = maddpg
+        self.replay = replay
+        self.metrics = metrics_hub
+        self.reward_logger = reward_logger
+        self.agent_ids = agent_ids
+        self.global_step = 0
+        self.global_episodes = 0
+        self._skip_episode_once = False
+        self._current_obs = None
+
+    def run_step(self):
+        """执行一个训练步骤"""
+        # 获取当前观察 - 优先使用存储的观察
+        if hasattr(self, '_current_obs') and self._current_obs is not None:
+            current_obs = self._current_obs
+        else:
+            # 备用观察获取方法
+            if hasattr(self.env, '_get_observations'):
+                current_obs = self.env._get_observations()
+            elif hasattr(self.env.unwrapped, '_get_observations'):
+                current_obs = self.env.unwrapped._get_observations()
+            else:
+                print("[WARNING] No _get_observations method found, using fallback")
+                actual_env = getattr(self.env, 'unwrapped', self.env)
+                if hasattr(actual_env, 'observation_manager'):
+                    current_obs = actual_env.observation_manager.compute()
+                else:
+                    current_obs = {}
+        
+        # 1) 选动作（带噪声，训练态）
+        actions, debug = self.maddpg.select_actions(current_obs, add_noise=True)
+
+        # 2) 让环境可记录 actor debug
+        if hasattr(self.env, "set_debug_actor_info"):
+            self.env.set_debug_actor_info(debug)
+        elif hasattr(self.env.unwrapped, "set_debug_actor_info"):
+            self.env.unwrapped.set_debug_actor_info(debug)
+
+        # 3) 与环境交互
+        next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
+
+        # 4) 写 joint transition
+        # 合并 terminated 和 truncated 为 done_any_dict
+        done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+        
+        self.maddpg.store_joint_transitions(
+            obs=current_obs,
+            actions=actions,
+            rewards=rewards,
+            next_obs=next_obs,
+            dones=done_any_dict
+        )
+
+        # 5) 更新网络
+        stats = self.maddpg.update()
+
+        # 6) 统计 episode（OR 聚合）
+        done_any = None
+        for aid in self.agent_ids:
+            d = done_any_dict[aid].to(torch.bool)
+            done_any = d if done_any is None else (done_any | d)
+        
+        episode_increment = int(done_any.sum().item())
+        if self._skip_episode_once:
+            episode_increment = 0
+            self._skip_episode_once = False
+        self.global_episodes += episode_increment
+
+        # 7) 统一日志（映射到 WHITELIST 的键）
+        if stats and stats.get("training/updates", 0) > 0:
+            payload = {
+                "train/actor_loss": stats.get("loss/actor/avg"),
+                "train/critic_loss": stats.get("loss/critic/avg"),
+                "model/q_mean": stats.get("q_mean/avg"),
+                "model/q_std": stats.get("q_std/avg"),
+                "model/td_error_mean": stats.get("model/td_error_mean"),
+                "model/td_rmse": stats.get("model/td_rmse"),
+                "replay/buffer_size": len(self.maddpg.replay) if hasattr(self.maddpg, "replay") else None,
+                "train/episodes_done": self.global_episodes,
+                "train/updates": stats.get("training/updates"),
+            }
+            # 清理 None
+            payload = {k: v for k, v in payload.items() if v is not None}
+            self.metrics.push_update(self.global_step, payload)
+
+        # 8) 控制台（可选）
+        if self.reward_logger and hasattr(self.reward_logger, "log_console_if_enabled"):
+            self.reward_logger.log_console_if_enabled(self.env, rewards, self.global_step)
+
+        # 9) 步计数 + env侧同步
+        self.global_step += 1
+        actual_env = getattr(self.env, "unwrapped", self.env)
+        if hasattr(actual_env, "set_trainer_global_step"):
+            actual_env.set_trainer_global_step(self.global_step)
+
+        return next_obs
+
+    def mark_skip_episode_once(self):
+        """标记下次跳过一次episode计数"""
+        self._skip_episode_once = True
+
+    def run_until(self, max_global_steps: int):
+        """运行直到达到最大步数"""
+        obs, _ = self.env.reset()
+        # 存储初始观察，供 run_step 使用
+        self._current_obs = obs
+        while self.global_step < max_global_steps:
+            next_obs = self.run_step()
+            self._current_obs = next_obs
+
+
+# === NEW CLASS: MilestoneEvaluator ===
+class MilestoneEvaluator:
+    """里程碑评估器：触发时执行评估→TopK→日志→返回跳过标志"""
+    
+    def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
+        self.env = env
+        self.maddpg = maddpg
+        self.topk = topk_mgr
+        self.metrics = metrics_hub
+        self.log_dir = log_dir
+        self.agent_ids = agent_ids
+
+    def handle(self, milestone: int, global_step: int) -> dict:
+        """处理里程碑触发"""
+        # 1) 就地评估
+        avg_return, num_eps = self._evaluate_env0_once()
+
+        # 2) 提取模型权重
+        model_state = self._extract_model_state()
+
+        # 3) 更新 TopK 并保存
+        self.topk.update(avg_return, model_state, milestone)
+        ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
+        self.topk.save_checkpoint(ckpt_path, self.agent_ids)
+
+        # 4) 推送 milestone 日志
+        payload = {
+            "eval/return_mean": float(avg_return),
+            "eval/num_episodes": int(num_eps),
+            "milestone/topk_best_score": float(avg_return),
+            "milestone/topk_avg_score": float(avg_return),
+            "milestone/topk_count": 1,
+            "milestone/latest_completed": int(milestone),
+        }
+        self.metrics.push_milestone(global_step, milestone, payload)
+
+        # 5) 通知训练循环：下一步跳过一次 episode 计数
+        return {"skip_episode_once": True}
+
+    def _evaluate_env0_once(self):
+        """就地评估（env0单次episode）"""
+        active_env = 0
+        target_episodes = 1
+        
+        print(f"[EVAL] Starting in-place evaluation (env0 only, 1 episode)...")
+        
+        env = getattr(self.env, "unwrapped", self.env)
+        obs, _ = env.reset()
+        print(f"[EVAL] Environment reset for independent evaluation")
+        
+        num_envs = len(obs[self.agent_ids[0]])  # 获取环境数量
+        ep_returns = torch.zeros(num_envs, device='cuda' if torch.cuda.is_available() else 'cpu')
+        completed_returns = []
+        
+        with torch.no_grad():
+            while len(completed_returns) < target_episodes:
+                # 获取当前观察
+                if hasattr(env, '_get_observations'):
+                    current_obs = env._get_observations()
+                elif hasattr(env, 'observation_manager'):
+                    current_obs = env.observation_manager.compute()
+                else:
+                    current_obs = obs  # 使用最近的obs作为备选
+                
+                # 选择动作（确定性）
+                actions, _ = self.maddpg.select_actions(current_obs, add_noise=False)
+                
+                # 只有 env0 执行真实动作，其他环境动作置零
+                for aid, act in actions.items():
+                    if act.ndim == 2:
+                        masked = torch.zeros_like(act)
+                        masked[active_env] = act[active_env]
+                        actions[aid] = masked
+                
+                obs, rewards, terminated, truncated, infos = env.step(actions)
+                
+                # 只累积 env0 的奖励
+                step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
+                avg_step_rewards = step_rewards.mean(dim=0)
+                ep_returns[active_env] += avg_step_rewards[active_env]
+                
+                # 检查 env0 是否完成
+                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+                done_any = None
+                for aid in self.agent_ids:
+                    d = done_any_dict[aid].to(torch.bool)
+                    done_any = d if done_any is None else (done_any | d)
+                
+                if done_any[active_env]:
+                    ret0 = float(ep_returns[active_env].item())
+                    completed_returns.append(ret0)
+                    ep_returns[active_env] = 0.0
+                    
+                    if len(completed_returns) >= target_episodes:
+                        break
+        
+        final_returns = completed_returns[:target_episodes]
+        avg_return = sum(final_returns) / max(1, len(final_returns))
+        
+        print(f"[EVAL] Completed: {len(final_returns)} episodes, Average return: {avg_return:.3f}")
+        
+        # 重置环境回训练状态
+        _, _ = env.reset()
+        print(f"[EVAL] Environment reset back to training mode")
+        
+        return avg_return, len(final_returns)
+
+    def _extract_model_state(self):
+        """提取模型状态"""
+        model_state = {}
+        for agent_id in self.agent_ids:
+            agent = self.maddpg.agents[agent_id]
+            prefix = f'{agent_id}'
+            model_state.update({
+                f'{prefix}_actor': agent.actor.state_dict(),
+                f'{prefix}_critic': agent.critic.state_dict(),
+                f'{prefix}_actor_target': agent.actor_target.state_dict(),
+                f'{prefix}_critic_target': agent.critic_target.state_dict()
+            })
+        return model_state
 
 
 # === NEW CLASS: MetricsHub ===
@@ -127,7 +367,7 @@ class CheckpointManager:
     
     def initialize_agents_from_checkpoint(self, maddpg_trainer) -> None:
         """Initialize agents from checkpoint data using specified strategy."""
-        # æ·»åŠ å…±äº«ç½'ç»œæž¶æž„æ£€æŸ¥
+        # 检查共享网络架构
         if hasattr(maddpg_trainer, 'agents') and not hasattr(maddpg_trainer, 'env_agents'):
             print("[CHECKPOINT] Shared network architecture detected, skipping per-env initialization")
             return
@@ -280,7 +520,7 @@ class WandBLogger:
             "train/action_std/robot", "train/action_std/human",
             "train/episodes_done", "train/updates",
             
-            # --- model (q/td/gradç­‰ç»Ÿä¸€åœ¨è¿™) ---
+            # --- model (q/td/grad等统计) ---
             "model/q_mean", "model/q_std",
             "model/q_target_mean", "model/q_target_std",
             "model/td_error_mean", "model/td_rmse", "model/q_qt_corr",
@@ -333,6 +573,11 @@ class TrainingConfiguration:
             self.params = yaml.safe_load(f)
         self.maddpg_cfg = self.params.get('maddpg_config', {})
     
+    @classmethod
+    def from_yaml(cls, config_path: str):
+        """Create configuration from YAML file."""
+        return cls(config_path)
+    
     def get_compute_device(self) -> str:
         """Get compute device (CUDA if available)."""
         return 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -341,8 +586,9 @@ class TrainingConfiguration:
 class TopKModelManager:
     """Manages top-K model collection and checkpoint saving."""
     
-    def __init__(self, k: int = 10):
+    def __init__(self, k: int = 10, mode: str = "max"):
         self.k = k
+        self.mode = mode
         self.top_models: List[Tuple[float, Dict, int]] = []
     
     def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
@@ -455,9 +701,36 @@ class TrainingLogger:
             yaml.dump(params, f, default_flow_style=False)
 
 
+def save_final_shared_networks(log_directory: str, maddpg, global_step: int, global_episodes: int, max_milestone_triggered: Optional[int]) -> None:
+    """Save final shared networks to checkpoint file."""
+    final_path = os.path.join(log_directory, "final_shared_networks.pth")
+    
+    final_checkpoint = {
+        'params': maddpg.params,
+        'agent_ids': maddpg.agent_ids,
+        'global_steps_total': global_step,
+        'episodes_done_total': global_episodes,
+        'max_milestone_triggered': max_milestone_triggered or 0,
+        'shared_networks': True,
+    }
+    
+    for agent_id in maddpg.agent_ids:
+        agent = maddpg.agents[agent_id]
+        final_checkpoint.update({
+            f'{agent_id}_actor': agent.actor.state_dict(),
+            f'{agent_id}_critic': agent.critic.state_dict(),
+            f'{agent_id}_actor_target': agent.actor_target.state_dict(),
+            f'{agent_id}_critic_target': agent.critic_target.state_dict()
+        })
+    
+    torch.save(final_checkpoint, final_path)
+    print(f"[CHECKPOINT] Final shared networks saved: {final_path}")
+
+
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     """Create command line argument parser with step-based configuration."""
     if config_path is None:
+        # 根据实际文件位置调整路径
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 

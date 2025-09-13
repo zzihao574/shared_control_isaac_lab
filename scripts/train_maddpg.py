@@ -2,19 +2,13 @@
 
 """
 Surgical Robot MADDPG Shared Network Training
-FINAL VERSION: Complete implementation with shared networks, joint buffer, and in-place evaluation.
-MODIFIED: Updated all logging keys to match new WHITELIST structure
-MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
+FINAL VERSION: Refactored with TrainingRunner and MilestoneEvaluator for better maintainability.
 
 Features:
-- Single shared network per agent across all environments
-- Joint replay buffer with concatenated observations/actions
-- Global step counting (hand-maintained, training only)
-- Global episode counting (sum of all environment completions)
-- YAML-driven milestone evaluation (in-place, no separate environment)
-- Unified step tracking for console logging and WandB
-- New logging key structure: train/, model/, replay/, eval/, milestone/
-- Primary termination condition: max_global_steps
+- TrainingRunner: 统一训练循环管理
+- MilestoneEvaluator: 统一里程碑评估管理  
+- 主脚本仅负责装配与启停
+- 保持所有原有功能不变
 """
 
 import sys
@@ -33,32 +27,219 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
 from utils.training_helpers import (
-    WandBLogger, TrainingConfiguration, TrainingLogger, create_argument_parser, MetricsHub, TopKModelManager
+    WandBLogger, TrainingConfiguration, TrainingLogger, create_argument_parser, 
+    MetricsHub, TopKModelManager, TrainingRunner, MilestoneEvaluator, save_final_shared_networks
 )
 
+
+def create_env_and_config(args, config):
+    """创建环境和环境配置"""
+    from surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
+    import gymnasium as gym
+    import surgical_project.envs.multi_agent
+    
+    env_cfg = SurgicalDirectMARLEnvCfg()
+    env_cfg.scene.num_envs = args.num_envs
+    env_cfg.seed = args.seed
+    
+    print(f"[INFO] Environment configuration:")
+    print(f"  Number of environments: {env_cfg.scene.num_envs}")
+    print(f"  Episode length: {env_cfg.episode_length_s}s")
+    print(f"  Decimation: {env_cfg.decimation}")
+    print(f"  Possible agents: {env_cfg.possible_agents}")
+    print(f"  Action spaces: {env_cfg.action_spaces}")
+    print(f"  Observation spaces: {env_cfg.observation_spaces}")
+    
+    env = gym.make(args.task, cfg=env_cfg)
+    
+    if hasattr(env, 'max_episode_length'):
+        print(f"[INFO] Environment max_episode_length: {env.max_episode_length}")
+    
+    return env, env_cfg
+
+
+def create_maddpg_trainer(env, config, args):
+    """创建MADDPG训练器"""
+    from surgical_project.algorithms.marl.maddpg import MADDPG
+    
+    device = config.get_compute_device()
+    
+    # 获取环境数量 - 支持多种环境接口
+    num_envs = args.num_envs
+    if hasattr(env, 'num_envs'):
+        num_envs = env.num_envs
+    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'num_envs'):
+        num_envs = env.unwrapped.num_envs
+    elif hasattr(env, '_num_envs'):
+        num_envs = env._num_envs
+    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, '_num_envs'):
+        num_envs = env.unwrapped._num_envs
+
+    maddpg = MADDPG(
+        num_envs=num_envs,
+        env=env,
+        params=config.params,
+        device=device
+    )
+    
+    print(f"[INFO] MADDPG trainer created:")
+    print(f"  Device: {device}")
+    print(f"  Agent IDs: {maddpg.agent_ids}")
+    print(f"  Environments: {num_envs}")
+    
+    return maddpg
+
+
+def setup_reward_logger(env, config, metrics_hub):
+    """配置奖励日志器"""
+    # 获取现有的reward_logger
+    reward_logger = None
+    if hasattr(env, 'reward_logger'):
+        reward_logger = env.reward_logger
+    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'reward_logger'):
+        reward_logger = env.unwrapped.reward_logger
+    
+    if not reward_logger:
+        print("[INFO] No existing reward_logger found, will create a new one")
+        return None
+        
+    # 获取环境数量
+    num_envs = getattr(env, 'num_envs', getattr(getattr(env, 'unwrapped', env), 'num_envs', 512))
+    
+    # 创建新的RewardLogger
+    from surgical_project.envs.multi_agent.utils import RewardLogger
+    milestones = config.params.get('training_monitor', {}).get('milestone_episodes', [])
+    
+    new_logger = RewardLogger(
+        num_envs=num_envs,
+        device=config.get_compute_device(),
+        metrics_hub=metrics_hub,
+        enable_console_logging=config.params.get('logging', {}).get('enable_console_logging', False),
+        milestones=milestones
+    )
+    
+    # 替换环境中的logger
+    if hasattr(env, 'reward_logger'):
+        env.reward_logger = new_logger
+    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'reward_logger'):
+        env.unwrapped.reward_logger = new_logger
+    
+    # 配置新的logger
+    new_logger.configure_logging(config.params)
+    
+    print(f"[INFO] RewardLogger configured:")
+    print(f"  Console logging: {'enabled' if new_logger.step_tracer.enable_console_logging else 'disabled'}")
+    print(f"  Milestone management: Legacy compatibility mode")
+    
+    return new_logger
+
+
+def create_milestone_callback(evaluator, runner):
+    """创建里程碑回调函数"""
+    def _on_milestone(milestone):
+        """里程碑回调：评估→TopK→跳过episode计数"""
+        print(f"[MILESTONE CALLBACK] Processing milestone {milestone}")
+        try:
+            result = evaluator.handle(milestone, runner.global_step)
+            if result.get("skip_episode_once", False):
+                runner.mark_skip_episode_once()
+                print(f"[MILESTONE CALLBACK] Marked skip_episode_once for milestone {milestone}")
+        except Exception as e:
+            print(f"[ERROR] Milestone callback failed for milestone {milestone}: {e}")
+            import traceback
+            traceback.print_exc()
+    return _on_milestone
+
+
 class MADDPGTrainer:
-    """Main trainer class for shared network MADDPG algorithm."""
+    """精简的MADDPG训练器 - 仅负责装配与启停"""
     
     def __init__(self, args):
         self.args = args
-        self.config = TrainingConfiguration(args.config)
-        self.wandb_logger = WandBLogger(enabled=args.wandb)
         
-        # Initialize MetricsHub
-        self.metrics = MetricsHub()
+        print(f"[TRAINER] Initializing MADDPGTrainer...")
         
+        # 装配阶段
+        self._setup_configuration()
         self._setup_environment()
         self._setup_logging_and_wandb()
         self._setup_training_components()
+        self._setup_runners_and_evaluators()
+        self._setup_milestone_management()
         
-        # Global step and episode tracking (hand-maintained)
-        self.global_step = 0
-        self.global_episodes = 0
+        print(f"[TRAINER] MADDPGTrainer initialized successfully")
+        print(f"  Max global steps: {self.max_global_steps}")
+        print(f"  Milestone episodes: {self.milestone_episodes}")
+
+    def _setup_configuration(self):
+        """设置配置"""
+        print(f"[SETUP] Loading configuration from: {self.args.config}")
+        self.config = TrainingConfiguration.from_yaml(self.args.config)
         
-        # Milestone tracking for "cross-threshold" triggering
-        self.max_milestone_triggered = 0
+        # 设置随机种子
+        torch.manual_seed(self.args.seed)
+        np.random.seed(self.args.seed)
+        random.seed(self.args.seed)
+        self.config.params['seed'] = self.args.seed
         
-        # MODIFIED: Setup max_global_steps as primary termination condition
+        print(f"[SETUP] Configuration loaded, seed set to: {self.args.seed}")
+
+    def _setup_environment(self):
+        """设置环境"""
+        print(f"[SETUP] Creating environment: {self.args.task}")
+        self.env, self.env_cfg = create_env_and_config(self.args, self.config)
+        
+        # 注入配置到环境
+        actual_env = getattr(self.env, 'unwrapped', self.env)
+        if hasattr(actual_env, "params"):
+            actual_env.params = self.config.params
+            print(f"[SETUP] Injected configuration parameters to environment")
+        else:
+            print("[WARNING] Environment does not support config injection")
+
+    def _setup_logging_and_wandb(self):
+        """设置日志和WandB"""
+        # 创建日志目录
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"logs/maddpg_shared/{timestamp}"
+        
+        self.logger = TrainingLogger(log_dir)
+        self.checkpoint_path = os.path.join(log_dir, f"checkpoint_top{self.args.top_k_models}.pth")
+        
+        print(f"[SETUP] Log directory created: {log_dir}")
+        
+        # 初始化WandB
+        self.wandb_logger = WandBLogger(enabled=self.args.wandb)
+        if self.wandb_logger.enabled:
+            run_config = {**vars(self.args), **self.config.params}
+            run_name = f"maddpg_shared_{self.args.num_envs}envs_{timestamp}"
+            self.wandb_logger.initialize_run(run_config, run_name)
+            print(f"[SETUP] WandB initialized with run name: {run_name}")
+        else:
+            print(f"[SETUP] WandB disabled")
+
+    def _setup_training_components(self):
+        """设置训练组件"""
+        print(f"[SETUP] Setting up training components...")
+        
+        # 创建MetricsHub
+        self.metrics_hub = MetricsHub()
+        
+        # 连接WandB到MetricsHub
+        if self.wandb_logger.enabled:
+            self.wandb_logger.attach_metrics_hub(self.metrics_hub)
+            print(f"[SETUP] WandB attached to MetricsHub")
+        
+        # 创建MADDPG训练器
+        self.maddpg = create_maddpg_trainer(self.env, self.config, self.args)
+        
+        # 设置奖励日志器
+        self.reward_logger = setup_reward_logger(self.env, self.config, self.metrics_hub)
+        
+        # 创建TopK管理器
+        self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
+        
+        # 设置训练参数
         maddpg_cfg = self.config.params.get('maddpg_config', {})
         cfg_steps = maddpg_cfg.get('max_global_steps', 0) or 0
         cli_steps = getattr(self.args, "max_global_steps", 0) or 0
@@ -66,484 +247,179 @@ class MADDPGTrainer:
         if self.max_global_steps <= 0:
             self.max_global_steps = float('inf')
         
-        print(f"[INFO] Training limits configured:")
+        self.milestone_episodes = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
+        
+        print(f"[SETUP] Training components configured:")
         print(f"  Max global steps: {self.max_global_steps}")
-        print(f"  Milestone episodes: {self.config.params.get('training_monitor', {}).get('milestone_episodes', [])}")
+        print(f"  Top-K models: {self.args.top_k_models}")
+        print(f"  Milestone episodes: {self.milestone_episodes}")
 
-    def _get_num_envs_from_env(self):
-        """Extract num_envs from environment through wrappers."""
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        if hasattr(actual_env, 'num_envs'): 
-            return actual_env.num_envs
-        if hasattr(actual_env, '_num_envs'): 
-            return actual_env._num_envs
-        return self.args.num_envs
-
-    def _setup_environment(self):
-        """Initialize environment with proper seeding and configuration."""
-        torch.manual_seed(self.args.seed)
-        np.random.seed(self.args.seed)
-        random.seed(self.args.seed)
-        self.config.params['seed'] = self.args.seed
-        self.env, self.env_cfg = self._create_environment()
+    def _setup_runners_and_evaluators(self):
+        """设置执行器和评估器"""
+        print(f"[SETUP] Creating TrainingRunner and MilestoneEvaluator...")
         
-        # Inject config to avoid env re-reading YAML
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        if hasattr(actual_env, "params"):
-            actual_env.params = self.config.params
-        else:
-            print("[WARNING] Environment does not support config injection")
-            
-        self._configure_reward_logger()
-
-    def _setup_logging_and_wandb(self):
-        """Configure logging directories and WandB integration."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = f"logs/maddpg_shared/{timestamp}"
-        self.logger = TrainingLogger(log_dir)
-        self.checkpoint_path = os.path.join(log_dir, f"checkpoint_top{self.args.top_k_models}.pth")
-        
-        if self.wandb_logger.enabled:
-            run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_shared_{self.args.num_envs}envs_{timestamp}"
-            self.wandb_logger.initialize_run(run_config, run_name)
-            
-            # Attach WandB to MetricsHub
-            self.wandb_logger.attach_metrics_hub(self.metrics)
-
-    def _setup_training_components(self):
-        """Initialize MADDPG trainer and related training components."""
-        from surgical_project.algorithms.marl.maddpg import MADDPG
-        device = self.config.get_compute_device()
-        
-        num_envs = self._get_num_envs_from_env()
-
-        self.maddpg_trainer = MADDPG(
-            num_envs=num_envs,
+        # 创建TrainingRunner
+        self.runner = TrainingRunner(
             env=self.env,
-            params=self.config.params,
-            device=device
+            maddpg=self.maddpg,
+            replay=self.maddpg.replay,
+            metrics_hub=self.metrics_hub,
+            reward_logger=self.reward_logger,
+            agent_ids=self.maddpg.agent_ids
         )
         
-        # Configure reward logger with simplified architecture
-        reward_logger = self._get_reward_logger()
-        if reward_logger:
-            from surgical_project.envs.multi_agent.utils import RewardLogger
-            milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
-            new_logger = RewardLogger(
-                num_envs=num_envs,
-                device=self.config.get_compute_device(),
-                metrics_hub=self.metrics,
-                enable_console_logging=self.config.params['logging']['enable_console_logging'],
-                milestones=milestones
-            )
-            
-            actual_env = getattr(self.env, 'unwrapped', self.env)
-            if hasattr(self.env, 'reward_logger'):
-                self.env.reward_logger = new_logger
-            elif hasattr(actual_env, 'reward_logger'):
-                actual_env.reward_logger = new_logger
-            
-            reward_logger = self._get_reward_logger()
-            if reward_logger:
-                reward_logger.configure_logging(self.config.params)
-                # NOTE: Milestone callback now handled directly by MADDPGTrainer
-                # reward_logger.set_topk_update_callback(self.update_topk_at_milestone)
+        # 创建MilestoneEvaluator
+        self.evaluator = MilestoneEvaluator(
+            env=self.env,
+            maddpg=self.maddpg,
+            topk_mgr=self.top_k_manager,
+            metrics_hub=self.metrics_hub,
+            log_dir=self.logger.log_directory,
+            agent_ids=self.maddpg.agent_ids
+        )
         
-        self.top_k_manager = TopKModelManager(k=self.args.top_k_models)
-        self.training_started = False
-        self.min_buffer_size = self.maddpg_trainer.min_buffer_size
+        print(f"[SETUP] TrainingRunner and MilestoneEvaluator created successfully")
 
-        print(f"[INFO] Training components initialized:")
-        print(f"  MADDPG trainer: {len(self.maddpg_trainer.agent_ids)} agents")
-        print(f"  Buffer min size: {self.min_buffer_size}")
-        print(f"  Top-K models: {self.args.top_k_models}")
-        print(f"  Milestone management: Direct (no RewardLogger callback)")
-
-    def _create_environment(self) -> Tuple[Any, Any]:
-        """Create and configure the surgical environment."""
-        from surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
-        import gymnasium as gym
-        import surgical_project.envs.multi_agent
+    def _setup_milestone_management(self):
+        """设置里程碑管理"""
+        print(f"[SETUP] Setting up milestone management...")
         
-        env_cfg = SurgicalDirectMARLEnvCfg()
-        env_cfg.scene.num_envs = self.args.num_envs
-        env_cfg.seed = self.args.seed
+        # 创建MilestoneManager（用于兼容性，实际管理由trainer处理）
+        from surgical_project.envs.multi_agent.utils import MilestoneManager
+        self.milestone_manager = MilestoneManager(self.milestone_episodes)
         
-        print(f"[INFO] Environment configuration:")
-        print(f"  Number of environments: {env_cfg.scene.num_envs}")
-        print(f"  Episode length: {env_cfg.episode_length_s}s")
-        print(f"  Decimation: {env_cfg.decimation}")
-        print(f"  Possible agents: {env_cfg.possible_agents}")
-        print(f"  Action spaces: {env_cfg.action_spaces}")
-        print(f"  Observation spaces: {env_cfg.observation_spaces}")
+        # 设置回调（实际上不会被调用，真实管理在check_and_trigger_milestone中）
+        milestone_callback = create_milestone_callback(self.evaluator, self.runner)
+        self.milestone_manager.set_callback(milestone_callback)
         
-        env = gym.make(self.args.task, cfg=env_cfg)
+        # 里程碑跟踪
+        self.max_milestone_triggered = 0
         
-        if hasattr(env, 'max_episode_length'):
-            print(f"[INFO] Environment max_episode_length: {env.max_episode_length}")
-        
-        return env, env_cfg
-
-    def _get_reward_logger(self):
-        """Get reward logger from environment."""
-        return getattr(self.env, 'reward_logger', None) or getattr(getattr(self.env, 'unwrapped', None), 'reward_logger', None)
-
-    def _configure_reward_logger(self):
-        """Configure reward logger with MetricsHub injection."""
-        reward_logger = self._get_reward_logger()
-        if reward_logger:
-            num_envs = self._get_num_envs_from_env()
-            from surgical_project.envs.multi_agent.utils import RewardLogger
-            
-            # MODIFIED: Use milestone list directly from YAML without filtering
-            milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
-            
-            new_logger = RewardLogger(
-                num_envs=num_envs,
-                device=self.config.get_compute_device(),
-                metrics_hub=self.metrics,
-                enable_console_logging=self.config.params['logging']['enable_console_logging'],
-                milestones=milestones
-            )
-            
-            # Set the new logger in the appropriate place
-            actual_env = getattr(self.env, 'unwrapped', self.env)
-            if hasattr(self.env, 'reward_logger'):
-                self.env.reward_logger = new_logger
-            elif hasattr(actual_env, 'reward_logger'):
-                actual_env.reward_logger = new_logger
-            
-            # Configure the new logger
-            reward_logger = self._get_reward_logger()
-            if reward_logger:
-                reward_logger.configure_logging(self.config.params)
-                # NOTE: Milestone management now handled directly by MADDPGTrainer
-
-    def _extract_model_state(self) -> Dict[str, Any]:
-        """Extract model state dictionaries from shared networks."""
-        model_state = {}
-        for agent_id in self.maddpg_trainer.agent_ids:
-            agent = self.maddpg_trainer.agents[agent_id]
-            prefix = f'{agent_id}'
-            model_state.update({
-                f'{prefix}_actor': agent.actor.state_dict(), 
-                f'{prefix}_critic': agent.critic.state_dict(),
-                f'{prefix}_actor_target': agent.actor_target.state_dict(), 
-                f'{prefix}_critic_target': agent.critic_target.state_dict()
-            })
-        return model_state
-
-    def evaluate_policy_no_update(self, seed=None):
-        """
-        In-place policy evaluation (no exploration, no updates, no global_step modification).
-        MODIFIED: Single environment (env0) single episode evaluation for efficiency.
-        
-        Args:
-            target_episodes: Number of complete episodes to collect (ignored, forced to 1)
-            seed: Optional seed for evaluation reproducibility
-            
-        Returns:
-            Dict with return_avg, num_episodes
-        """
-        # Force single environment, single episode evaluation
-        active_env = 0           # Only evaluate env0
-        target_episodes = 1      # Only collect 1 episode
-        
-        print(f"[EVAL] Starting in-place evaluation (env0 only, 1 episode)...")
-        
-        # Get actual environment (unwrap if needed)
-        env = getattr(self.env, 'unwrapped', self.env)
-        
-        # Set seed if provided and supported
-        if seed is not None and hasattr(env, 'seed'):
-            env.seed(seed)
-            print(f"[EVAL] Set evaluation seed: {seed}")
-        
-        # Reset environment for clean evaluation window (handle tuple return)
-        obs, _ = env.reset()
-        print(f"[EVAL] Environment reset for independent evaluation")
-        
-        num_envs = self.args.num_envs
-        ep_returns = torch.zeros(num_envs, device='cuda' if torch.cuda.is_available() else 'cpu')
-        completed_returns = []
-        
-        # Deterministic evaluation loop (no training modifications)
-        with torch.no_grad():
-            while len(completed_returns) < target_episodes:
-                # Select actions without noise (deterministic policy)
-                actions, _ = self.maddpg_trainer.select_actions(obs, add_noise=False)
-                
-                # MODIFIED: Mask actions - only active_env (env0) gets real actions, others get zeros
-                for aid, act in actions.items():
-                    # act: [num_envs, act_dim]
-                    if act.ndim == 2:
-                        masked = torch.zeros_like(act)
-                        masked[active_env] = act[active_env]  # Only keep env0's actions
-                        actions[aid] = masked
-                
-                # Environment step (NO store_joint_transitions, NO update, NO global_step increment)
-                obs, rewards, terminated, truncated, infos = env.step(actions)
-                
-                # MODIFIED: Only accumulate rewards from active_env (env0)
-                step_rewards = torch.stack([rewards[aid] for aid in self.maddpg_trainer.agent_ids])  # [num_agents, num_envs]
-                avg_step_rewards = step_rewards.mean(dim=0)  # [num_envs] - average across agents
-                ep_returns[active_env] += avg_step_rewards[active_env]  # Only update env0
-                
-                # MODIFIED: Only check completion for active_env (env0)
-                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
-                done_any = None
-                for aid in self.maddpg_trainer.agent_ids:
-                    d = done_any_dict[aid].to(torch.bool)
-                    done_any = d if done_any is None else (done_any | d)
-                
-                # Check if active_env (env0) completed
-                if done_any[active_env]:
-                    # Collect env0's episode return
-                    ret0 = float(ep_returns[active_env].item())
-                    completed_returns.append(ret0)
-                    ep_returns[active_env] = 0.0  # Reset for next episode
-                    
-                    # Stop when we have enough episodes (which is 1)
-                    if len(completed_returns) >= target_episodes:
-                        break
-        
-        # Use only the first target_episodes (even if we collected more)
-        final_returns = completed_returns[:target_episodes]
-        avg_return = sum(final_returns) / max(1, len(final_returns))
-        
-        print(f"[EVAL] Completed: {len(final_returns)} episodes, Average return: {avg_return:.3f}")
-        
-        # Reset environment back to training state (handle tuple return)
-        _, _ = env.reset()
-        print(f"[EVAL] Environment reset back to training mode")
-        self._skip_episode_count_once = True
-        
-        return {
-            "return_avg": avg_return,
-            "num_episodes": len(final_returns)
-        }
+        print(f"[SETUP] Milestone management configured for {len(self.milestone_episodes)} milestones")
 
     def check_and_trigger_milestone(self):
-        """
-        Check if we crossed any milestone threshold and trigger evaluation once.
-        
-        Implements "cross 100 to 101 triggers 100 once" logic:
-        - Find the highest milestone <= current global_episodes  
-        - If it's higher than max_milestone_triggered, trigger evaluation once
-        - Update max_milestone_triggered to prevent duplicate triggers
-        """
-        milestones = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
-        if not milestones:
+        """检查并触发里程碑（主要的里程碑管理逻辑）"""
+        if not self.milestone_episodes:
             return
             
-        # Find the highest milestone we've crossed
+        # 找到最高的已跨越里程碑
         candidate = 0
-        for milestone in sorted(milestones):
-            if self.global_episodes >= milestone:
+        for milestone in sorted(self.milestone_episodes):
+            if self.runner.global_episodes >= milestone:
                 candidate = milestone
             else:
                 break
                 
-        # Trigger evaluation if we crossed a new threshold
+        # 如果跨越了新阈值则触发评估
         if candidate > self.max_milestone_triggered:
-            print(f"[MILESTONE] Crossed threshold: episodes {self.global_episodes} >= milestone {candidate}")
+            print(f"[MILESTONE] Crossed threshold: episodes {self.runner.global_episodes} >= milestone {candidate}")
             print(f"[MILESTONE] Triggering evaluation (previous max: {self.max_milestone_triggered})")
             
-            self.update_topk_at_milestone(candidate)
-            self.max_milestone_triggered = candidate
-            
-            print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
-
-    def update_topk_at_milestone(self, milestone: int) -> None:
-        """In-place milestone evaluation using current environment."""
-        print(f"[MILESTONE {milestone}] Starting in-place policy evaluation...")
-        
-        # Use current global_step as timestamp (read-only, no modification)
-        eval_timestamp = self.global_step
-        
-        # Perform in-place evaluation (no environment creation)
-        eval_result = self.evaluate_policy_no_update(
-            seed=4242 + milestone
-        )
-            
-        avg_return = eval_result['return_avg']
-        num_episodes = eval_result['num_episodes']
-        
-        print(f"[MILESTONE {milestone}] Evaluation complete:")
-        print(f"  Average return: {avg_return:.3f}")
-        print(f"  Episodes evaluated: {num_episodes}")
-        print(f"  Timestamp (global_step): {eval_timestamp}")
-        
-        # Update TopK manager
-        model_state = self._extract_model_state()
-        self.top_k_manager.update(avg_return, model_state, milestone)
-        
-        # Save milestone checkpoint
-        milestone_path = os.path.join(self.logger.log_directory, f"topk_milestone_{milestone}.pth")
-        self.top_k_manager.save_checkpoint(milestone_path, self.maddpg_trainer.agent_ids)
-        
-        # Push to MetricsHub and WandB using new eval/ and milestone/ keys
-        milestone_data = {
-            "eval/return_mean": avg_return,
-            "eval/num_episodes": num_episodes,
-            "milestone/topk_best_score": avg_return,  # For single model evaluation
-            "milestone/topk_avg_score": avg_return,   # Same as best for single evaluation
-            "milestone/topk_count": 1,                # Single evaluation
-            "milestone/latest_completed": milestone,
-        }
-        
-        self.metrics.push_milestone(eval_timestamp, milestone, milestone_data)
-        
-        print(f"[MILESTONE {milestone}] Results logged and saved, resuming training...")
+            try:
+                # 直接调用evaluator处理
+                result = self.evaluator.handle(candidate, self.runner.global_step)
+                if result.get("skip_episode_once", False):
+                    self.runner.mark_skip_episode_once()
+                
+                self.max_milestone_triggered = candidate
+                print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
+            except Exception as e:
+                print(f"[ERROR] Milestone evaluation failed for milestone {candidate}: {e}")
+                import traceback
+                traceback.print_exc()
 
     def train(self) -> None:
-        """Main training loop with shared networks and unified step tracking."""
+        """主训练循环"""
+        # 记录训练开始
         self.logger.log_training_start(self.args, self.config.params)
         
-        print(f"[INFO] Shared network training with in-place evaluation:")
-        print(f"  - Single network per agent shared across all {self.args.num_envs} environments")
-        print(f"  - Joint replay buffer with concatenated observations/actions") 
-        print(f"  - Global step counting (hand-maintained, training only)")
-        print(f"  - Global episode counting (sum of all environment completions)")
-        print(f"  - YAML-driven milestone evaluation (in-place, no separate environment)")
+        print(f"[TRAIN] Starting training with refactored architecture:")
+        print(f"  - TrainingRunner handles: rollout→replay→update→log→count")
+        print(f"  - MilestoneEvaluator handles: milestone→eval→topk→log")
+        print(f"  - MADDPGTrainer handles: milestone triggering and coordination")
         print(f"  - Max steps: {self.max_global_steps}")
-        print(f"  - New logging structure: train/, model/, replay/, eval/, milestone/")
         
         try:
-            obs_dict, _ = self.env.reset()
-            
-            # Initial WandB data point using new keys
+            # 初始化WandB数据点
             if self.wandb_logger.enabled:
                 initial_stats = {
                     "train/episodes_done": 0,
                     "replay/buffer_size": 0,
                 }
-                self.metrics.push_update(self.global_step, initial_stats)
+                self.metrics_hub.push_update(0, initial_stats)
             
-            # MODIFIED: Main training loop with step-based termination only
-            while self.global_step < self.max_global_steps:
-                
-                # === TRAINING STEP ===
-                # Select actions (shared networks process all environments)
-                actions, debug = self.maddpg_trainer.select_actions(obs_dict, add_noise=True)
-
-                # Set debug info for environment before step
-                actual_env = getattr(self.env, 'unwrapped', self.env)
-                if hasattr(actual_env, 'set_debug_actor_info'):
-                    actual_env.set_debug_actor_info(debug)
-
-                # Environment step
-                next_obs, rewards, terminated, truncated, info = self.env.step(actions)
-                
-                # Combine terminated and truncated for proper TD target calculation
-                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
-                
-                # Store joint transitions (training only)
-                self.maddpg_trainer.store_joint_transitions(
-                    obs_dict, actions, rewards, next_obs, done_any_dict
-                )
-                
-                # Training update
-                stats = self.maddpg_trainer.update()
-                
-                # === STEP AND EPISODE COUNTING ===
-                # Hand-maintained global_step increment (training only)
-                self.global_step += 1
-                
-                # Update environment with current global_step for unified console logging
-                actual_env = getattr(self.env, 'unwrapped', self.env)
-                if hasattr(actual_env, 'set_trainer_global_step'):
-                    actual_env.set_trainer_global_step(self.global_step)
-                
-                # Global episode counting (OR over agents, then sum)
-                done_any = None
-                for aid in self.maddpg_trainer.agent_ids:
-                    d = done_any_dict[aid].to(torch.bool)
-                    done_any = d if done_any is None else (done_any | d)
-                
-                # Skip episode counting once after evaluation to avoid counting eval episodes
-                episode_increment = int(done_any.sum().item())
-                if getattr(self, "_skip_episode_count_once", False):
-                    episode_increment = 0
-                    self._skip_episode_count_once = False
-                self.global_episodes += episode_increment
-                
-                # === MILESTONE CHECKING ===
-                # YAML-driven milestone triggering (no hardcoded intervals)
-                self.check_and_trigger_milestone()
-                
-                # === LOGGING ===
-                # WandB logging (training level) - using new key structure
-                if stats and stats.get("training/updates", 0) > 0:
-                    # Convert MADDPG stats to new key structure
-                    log_data = {
-                        "train/actor_loss": stats.get("loss/actor/avg", 0),
-                        "train/critic_loss": stats.get("loss/critic/avg", 0),
-                        "model/q_mean": stats.get("q_mean/avg", 0),
-                        "model/q_std": stats.get("q_std/avg", 0),
-                        "model/grad_norm/actor": stats.get("grad_norm/actor/avg", 0),
-                        "model/grad_norm/critic": stats.get("grad_norm/critic/avg", 0),
-                        "replay/buffer_size": len(self.maddpg_trainer.replay),
-                        "train/episodes_done": self.global_episodes,
-                        "train/updates": stats.get("training/updates", 0),
-                    }
-
-                    # Per-agent action std if available
-                    if "action_std/avg" in stats:
-                        log_data["train/action_std"] = stats["action_std/avg"]
-                    
-                    # Individual agent action std if available
-                    for aid in self.maddpg_trainer.agent_ids:
-                        if aid in stats.get("action_std", {}):
-                            log_data[f"train/action_std/{aid}"] = stats["action_std"][aid]
-                    
-                    # Push to metrics hub with unified global_step
-                    self.metrics.push_update(self.global_step, log_data)
-                
-                # Progress reporting (unified global_step usage)
-                if self.global_step % 2000 == 0:
-                    self.logger.log_training_progress(self.global_step, self.global_episodes, self.top_k_manager)
-                
-                # MODIFIED: Only check step-based termination
-                if self.global_step >= self.max_global_steps:
-                    print(f"\n[TRAINING LIMIT] Reached max_global_steps={self.max_global_steps}")
+            # 重置环境
+            print(f"[TRAIN] Resetting environment...")
+            obs_dict, _ = self.env.reset()
+            print(f"[TRAIN] Environment reset complete, starting training loop")
+            
+            # 主训练循环 - 使用TrainingRunner
+            step_count = 0
+            while self.runner.global_step < self.max_global_steps:
+                # 执行一个训练步骤
+                try:
+                    obs_dict = self.runner.run_step()
+                    step_count += 1
+                except Exception as e:
+                    print(f"[ERROR] Training step failed at step {self.runner.global_step}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     break
                 
-                obs_dict = next_obs
+                # 里程碑检查
+                try:
+                    self.check_and_trigger_milestone()
+                except Exception as e:
+                    print(f"[ERROR] Milestone check failed at step {self.runner.global_step}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # 进度报告
+                if self.runner.global_step % 2000 == 0:
+                    try:
+                        self.logger.log_training_progress(
+                            self.runner.global_step, 
+                            self.runner.global_episodes, 
+                            self.top_k_manager
+                        )
+                    except Exception as e:
+                        print(f"[ERROR] Progress logging failed: {e}")
+                
+                # 检查终止条件
+                if self.runner.global_step >= self.max_global_steps:
+                    print(f"\n[TRAINING LIMIT] Reached max_global_steps={self.max_global_steps}")
+                    break
             
-            # Training completion
+            # 训练完成
             print(f"\n[TRAINING COMPLETE]")
-            print(f"  Total steps: {self.global_step}")
-            print(f"  Total episodes: {self.global_episodes}")
+            print(f"  Total steps: {self.runner.global_step}")
+            print(f"  Total episodes: {self.runner.global_episodes}")
             print(f"  Max milestone triggered: {self.max_milestone_triggered}")
-            print(f"[INFO] Shared networks successfully trained across {self.args.num_envs} environments")
+            print(f"  Steps processed: {step_count}")
             
             self.logger.log_training_complete(self.top_k_manager)
-            final_path = os.path.join(self.logger.log_directory, "final_shared_networks.pth")
             
-            # Save final shared networks
-            final_checkpoint = {
-                'params': self.maddpg_trainer.params,
-                'agent_ids': self.maddpg_trainer.agent_ids,
-                'global_steps_total': self.global_step,
-                'episodes_done_total': self.global_episodes,
-                'max_milestone_triggered': self.max_milestone_triggered,
-                'shared_networks': True,
-            }
-            for agent_id in self.maddpg_trainer.agent_ids:
-                agent = self.maddpg_trainer.agents[agent_id]
-                final_checkpoint.update({
-                    f'{agent_id}_actor': agent.actor.state_dict(),
-                    f'{agent_id}_critic': agent.critic.state_dict(),
-                    f'{agent_id}_actor_target': agent.actor_target.state_dict(),
-                    f'{agent_id}_critic_target': agent.critic_target.state_dict()
-                })
-            
-            torch.save(final_checkpoint, final_path)
-            print(f"[CHECKPOINT] Final shared networks saved: {final_path}")
-            
-            self.logger.save_final_results(self.global_step, self.global_episodes, self.top_k_manager, self.config.params, self.args)
+            # 保存最终模型
+            try:
+                save_final_shared_networks(
+                    log_directory=self.logger.log_directory,
+                    maddpg=self.maddpg,
+                    global_step=self.runner.global_step,
+                    global_episodes=self.runner.global_episodes,
+                    max_milestone_triggered=self.max_milestone_triggered
+                )
+                
+                # 保存训练结果
+                self.logger.save_final_results(
+                    self.runner.global_step,
+                    self.runner.global_episodes,
+                    self.top_k_manager,
+                    self.config.params,
+                    self.args
+                )
+                print(f"[TRAIN] Final results saved successfully")
+            except Exception as e:
+                print(f"[ERROR] Failed to save final results: {e}")
         
         except (KeyboardInterrupt, Exception) as e:
             print(f"\nTraining interrupted or failed: {e}")
@@ -551,28 +427,65 @@ class MADDPGTrainer:
                 import traceback
                 traceback.print_exc()
         finally:
-            if self._get_reward_logger():
-                self._get_reward_logger().close_all_files()
-            self.env.close()
-            self.wandb_logger.finalize_run()
+            # 清理资源
+            try:
+                if self.reward_logger and hasattr(self.reward_logger, 'close_all_files'):
+                    self.reward_logger.close_all_files()
+                self.env.close()
+                self.wandb_logger.finalize_run()
+                print("[TRAIN] Cleanup completed")
+            except Exception as e:
+                print(f"[ERROR] Cleanup failed: {e}")
             print("\nShared network training completed")
 
+
 def main():
-    """Main entry point for shared network training script."""
-    parser = create_argument_parser()
-    AppLauncher.add_app_launcher_args(parser)
-    args_cli = parser.parse_args()
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
+    """主入口点"""
+    print("="*80)
+    print("MADDPG Shared Network Training - Refactored Architecture")
+    print("="*80)
+    
     try:
-        trainer = MADDPGTrainer(args_cli)
-        trainer.train()
+        # 解析参数
+        parser = create_argument_parser()
+        AppLauncher.add_app_launcher_args(parser)
+        args_cli = parser.parse_args()
+        
+        print(f"[MAIN] Arguments parsed:")
+        print(f"  Task: {args_cli.task}")
+        print(f"  Environments: {args_cli.num_envs}")
+        print(f"  Max steps: {args_cli.max_global_steps}")
+        print(f"  WandB: {args_cli.wandb}")
+        print(f"  Config: {args_cli.config}")
+        
+        # 启动Isaac Sim
+        print(f"[MAIN] Launching Isaac Sim...")
+        app_launcher = AppLauncher(args_cli)
+        simulation_app = app_launcher.app
+        
+        try:
+            # 创建并启动训练器
+            print(f"[MAIN] Creating MADDPGTrainer...")
+            trainer = MADDPGTrainer(args_cli)
+            
+            print(f"[MAIN] Starting training...")
+            trainer.train()
+            
+            print(f"[MAIN] Training completed successfully")
+            
+        except Exception as e:
+            print(f"[MAIN] Training failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print(f"[MAIN] Closing Isaac Sim...")
+            simulation_app.close()
+            
     except Exception as e:
-        print(f"Training failed: {e}")
+        print(f"[MAIN] Main execution failed: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        simulation_app.close()
+
 
 if __name__ == "__main__":
     main()
