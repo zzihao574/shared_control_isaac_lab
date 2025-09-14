@@ -470,15 +470,15 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         best_p_tm1 = self.best_progress.clone()
         
         delta_p = p_t - best_p_tm1
-        reward_forward = torch.clamp(delta_p * T, min=0.0, max=4.0)
-        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -2.0))
+        reward_forward = torch.clamp(delta_p * T, min=0.0, max=0.1)
+        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
         
         # Update historical best progress
         self.best_progress = torch.maximum(best_p_tm1, p_t)
         
         # Linear deviation penalty
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 50.0, min=0.0, max=4.0)
+        dev_raw = -torch.clamp(deviations * 0.5, min=0.0, max=0.1)
         
         # Zone A combination
         wp = self._comp_w('A', 'progress', agent)

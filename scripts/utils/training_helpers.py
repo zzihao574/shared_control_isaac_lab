@@ -2,16 +2,13 @@
 
 """
 Training helper utilities for MADDPG multi-environment parallel training.
-Clean version - removes YAML duplicate dependencies, gets dimensions from environment cfg.
-MODIFIED: Added MetricsHub for unified data pipeline, removed unused WandB methods
-MODIFIED: Unified global step tracking and completion threshold consistency
-MODIFIED: Removed UnifiedProgressManager and all active_env related functionality
-MODIFIED: Updated WHITELIST and simplified WandB logging to match new key structure
-MODIFIED: Changed from max_episodes to max_global_steps as primary termination condition
-MODIFIED: Added TrainingRunner and MilestoneEvaluator classes for code organization
-MODIFIED: Removed HARDWARE_MONITORING_AVAILABLE and all try/except from normal paths
-MODIFIED: Simplified TrainingRunner.run_step to use direct interface calls
-MODIFIED: Removed try/except from WandBLogger.initialize_run and MetricsHub._emit
+Enhanced version with configurable network architecture and exponential noise decay support.
+
+Features:
+- TrainingRunner: Unified training loop execution with noise scheduling
+- MilestoneEvaluator: Milestone evaluation and TopK model management  
+- MetricsHub: Unified data pipeline for logging
+- Configurable network support and intelligent noise scheduling
 """
 
 import argparse
@@ -20,6 +17,7 @@ import yaml
 import torch
 import numpy as np
 import pickle
+import math
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Union, Any, Callable, DefaultDict, Deque
 from collections import defaultdict, deque
@@ -34,9 +32,16 @@ except ImportError:
     print("[WARNING] WandB not available. Install with: pip install wandb")
 
 
-# === NEW CLASS: TrainingRunner ===
 class TrainingRunner:
-    """统一训练循环执行器：rollout→replay→update→日志→计数"""
+    """
+    Unified training loop executor: rollout→replay→update→log→count with noise scheduling.
+    
+    Features:
+    - Exponential noise decay scheduling (fast early, slow later)
+    - Unified global step tracking
+    - Episode counting with skip mechanism for milestone evaluation
+    - Metrics collection and WandB logging
+    """
     
     def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids):
         self.env = env
@@ -49,24 +54,61 @@ class TrainingRunner:
         self.global_episodes = 0
         self._skip_episode_once = False
         self._current_obs = None
+        
+        # Load exploration parameters for noise scheduling
+        expl = self.maddpg.params.get("exploration", {})
+        self.sigma_start = float(expl.get("sigma_start", 0.7))
+        self.sigma_end = float(expl.get("sigma_end", 0.1))
+        self.decay_k = float(expl.get("decay_k", 6.0))
+        
+        # Get max_global_steps for noise scheduling
+        maddpg_cfg = self.maddpg.params.get('maddpg_config', {})
+        self.max_global_steps = int(maddpg_cfg.get('max_global_steps', 200000))
+        
+        print(f"[NOISE SCHEDULE] Configured exponential decay:")
+        print(f"  Start: {self.sigma_start}, End: {self.sigma_end}, k: {self.decay_k}")
+        print(f"  Max steps: {self.max_global_steps}")
+
+    def _calculate_noise_scale(self) -> float:
+        """Calculate current noise scaling factor (exponential decay: fast early, slow later)."""
+        if self.max_global_steps <= 0:
+            return self.sigma_start
+            
+        # ratio ∈ [0,1]
+        ratio = min(1.0, float(self.global_step) / float(max(1, self.max_global_steps)))
+        
+        # Exponential decay: noise_scale = sigma_end + (sigma_start - sigma_end) * exp(-k * ratio)
+        noise_scale = self.sigma_end + (self.sigma_start - self.sigma_end) * math.exp(-self.decay_k * ratio)
+        
+        return noise_scale
 
     def run_step(self):
-        """执行一个训练步骤"""
-        # 直接使用当前观测，不再有复杂的获取逻辑
+        """Execute one training step with noise scheduling."""
+        # Use current observations
         current_obs = self._current_obs
+        if current_obs is None:
+            # 优先用环境的即时观测函数；没有就 reset 一次
+            if hasattr(self.env, "_get_observations"):
+                current_obs = self.env._get_observations()
+            else:
+                current_obs, _ = self.env.reset()
+            self._current_obs = current_obs
+            
+        # 1) Calculate noise scaling factor
+        noise_scale = self._calculate_noise_scale()
         
-        # 1) 选动作（带噪声，训练态）
-        actions, detail = self.maddpg.select_actions(current_obs, add_noise=True)
+        # 2) Select actions (with noise, training mode, using global noise scheduling)
+        actions, detail = self.maddpg.select_actions(current_obs, add_noise=True, noise_scale=noise_scale)
 
-        # 2) 让环境可记录 actor detail info - 直接调用统一接口
+        # 3) Let environment record actor detail info
         self.env.unwrapped.set_detail_actor_info(detail)
 
-        # 3) 与环境交互
+        # 4) Environment interaction
         next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-        # 4) 写 joint transition
-        # 合并 terminated 和 truncated 为 done_any_dict
+        # 5) Store joint transitions
         done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+
         
         self.maddpg.store_joint_transitions(
             obs=current_obs,
@@ -76,10 +118,10 @@ class TrainingRunner:
             dones=done_any_dict
         )
 
-        # 5) 更新网络
+        # 6) Update networks
         stats = self.maddpg.update()
 
-        # 6) 统计 episode（OR 聚合）
+        # 7) Count episodes (OR aggregation)
         done_any = None
         for aid in self.agent_ids:
             d = done_any_dict[aid].to(torch.bool)
@@ -91,7 +133,7 @@ class TrainingRunner:
             self._skip_episode_once = False
         self.global_episodes += episode_increment
 
-        # 7) 统一日志（映射到 WHITELIST 的键）
+        # 8) Unified logging with noise scheduling information
         if stats and stats.get("training/updates", 0) > 0:
             payload = {
                 "train/actor_loss": stats.get("loss/actor/avg"),
@@ -103,38 +145,45 @@ class TrainingRunner:
                 "replay/buffer_size": len(self.maddpg.replay) if hasattr(self.maddpg, "replay") else None,
                 "train/episodes_done": self.global_episodes,
                 "train/updates": stats.get("training/updates"),
+                "exploration/noise_scale": noise_scale,
+                "exploration/sigma_ratio": noise_scale / self.sigma_start if self.sigma_start > 0 else 0,
             }
-            # 清理 None
+            # Clean None values
             payload = {k: v for k, v in payload.items() if v is not None}
             self.metrics.push_update(self.global_step, payload)
 
-        # 8) 步计数 + env侧同步
+        # 9) Step counting + env synchronization
         self.global_step += 1
         actual_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(actual_env, "set_trainer_global_step"):
             actual_env.set_trainer_global_step(self.global_step)
 
-        # 9) 更新当前观测为下一轮输入
+        # 10) Update current observations for next round
         self._current_obs = next_obs
 
         return next_obs
 
     def mark_skip_episode_once(self):
-        """标记下次跳过一次episode计数"""
+        """Mark to skip episode counting once (for milestone evaluation)."""
         self._skip_episode_once = True
 
     def run_until(self, max_global_steps: int):
-        """运行直到达到最大步数"""
+        """Run until reaching maximum steps."""
         obs, _ = self.env.reset()
-        # 保存初始观测作为第一轮输入
         self._current_obs = obs
         while self.global_step < max_global_steps:
-            self.run_step()  # next_obs通过_current_obs更新传递
+            self.run_step()
 
 
-# === NEW CLASS: MilestoneEvaluator ===
 class MilestoneEvaluator:
-    """里程碑评估器：触发时执行评估→TopK→日志→返回跳过标志"""
+    """
+    Milestone evaluator: triggers evaluation→TopK→logging→return skip flag.
+    
+    Features:
+    - Single environment evaluation for efficiency
+    - TopK model management
+    - Milestone logging to MetricsHub
+    """
     
     def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
         self.env = env
@@ -145,19 +194,19 @@ class MilestoneEvaluator:
         self.agent_ids = agent_ids
 
     def handle(self, milestone: int, global_step: int) -> dict:
-        """处理里程碑触发"""
-        # 1) 就地评估
+        """Handle milestone trigger."""
+        # 1) In-place evaluation
         avg_return, num_eps = self._evaluate_env0_once()
 
-        # 2) 提取模型权重
+        # 2) Extract model weights
         model_state = self._extract_model_state()
 
-        # 3) 更新 TopK 并保存
+        # 3) Update TopK and save
         self.topk.update(avg_return, model_state, milestone)
         ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
         self.topk.save_checkpoint(ckpt_path, self.agent_ids)
 
-        # 4) 推送 milestone 日志
+        # 4) Push milestone logs
         payload = {
             "eval/return_mean": float(avg_return),
             "eval/num_episodes": int(num_eps),
@@ -168,11 +217,11 @@ class MilestoneEvaluator:
         }
         self.metrics.push_milestone(global_step, milestone, payload)
 
-        # 5) 通知训练循环：下一步跳过一次 episode 计数
+        # 5) Notify training loop to skip episode counting once
         return {"skip_episode_once": True}
 
     def _evaluate_env0_once(self):
-        """就地评估（env0单次episode）"""
+        """In-place evaluation (env0 single episode)."""
         active_env = 0
         target_episodes = 1
         
@@ -182,24 +231,24 @@ class MilestoneEvaluator:
         obs, _ = env.reset()
         print(f"[EVAL] Environment reset for independent evaluation")
         
-        num_envs = len(obs[self.agent_ids[0]])  # 获取环境数量
+        num_envs = len(obs[self.agent_ids[0]])
         ep_returns = torch.zeros(num_envs, device='cuda' if torch.cuda.is_available() else 'cpu')
         completed_returns = []
         
         with torch.no_grad():
             while len(completed_returns) < target_episodes:
-                # 获取当前观察
+                # Get current observations
                 if hasattr(env, '_get_observations'):
                     current_obs = env._get_observations()
                 elif hasattr(env, 'observation_manager'):
                     current_obs = env.observation_manager.compute()
                 else:
-                    current_obs = obs  # 使用最近的obs作为备选
+                    current_obs = obs
                 
-                # 选择动作（确定性）
-                actions, _ = self.maddpg.select_actions(current_obs, add_noise=False)
+                # Select actions (deterministic, no noise)
+                actions, _ = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
                 
-                # 只有 env0 执行真实动作，其他环境动作置零
+                # Only env0 executes real actions, others are masked to zero
                 for aid, act in actions.items():
                     if act.ndim == 2:
                         masked = torch.zeros_like(act)
@@ -208,12 +257,12 @@ class MilestoneEvaluator:
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 
-                # 只累积 env0 的奖励
+                # Only accumulate env0 rewards
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
                 avg_step_rewards = step_rewards.mean(dim=0)
                 ep_returns[active_env] += avg_step_rewards[active_env]
                 
-                # 检查 env0 是否完成
+                # Check if env0 is complete
                 done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
                 done_any = None
                 for aid in self.agent_ids:
@@ -233,14 +282,14 @@ class MilestoneEvaluator:
         
         print(f"[EVAL] Completed: {len(final_returns)} episodes, Average return: {avg_return:.3f}")
         
-        # 重置环境回训练状态
+        # Reset environment back to training state
         _, _ = env.reset()
         print(f"[EVAL] Environment reset back to training mode")
         
         return avg_return, len(final_returns)
 
     def _extract_model_state(self):
-        """提取模型状态"""
+        """Extract model state for checkpoint saving."""
         model_state = {}
         for agent_id in self.agent_ids:
             agent = self.maddpg.agents[agent_id]
@@ -254,9 +303,16 @@ class MilestoneEvaluator:
         return model_state
 
 
-# === NEW CLASS: MetricsHub ===
 class MetricsHub:
-    """Single-exit metrics bus. Modules push; sinks subscribe. No IO here."""
+    """
+    Single-exit metrics bus for unified data pipeline.
+    
+    Features:
+    - Event-based subscription system
+    - Ring buffer for update history
+    - Support for step, episode, milestone, and buffer status events
+    """
+    
     def __init__(self, ring: int = 100):
         self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)
         self.episode_state: dict[int, dict] = {}
@@ -268,11 +324,10 @@ class MetricsHub:
         self.subs[event].append(handler)
 
     def _emit(self, event: str, payload: dict) -> None:
-        """Emit an event to all subscribers - no try/except, let errors bubble up."""
+        """Emit an event to all subscribers."""
         for h in self.subs.get(event, []):
             h(payload)
 
-    # ---- Pushers ----
     def push_step(self, step: int, env_ids: list[int], payload: dict) -> None:
         """Push step-level data."""
         self._emit("step", {"step": step, "env_ids": env_ids, **payload})
@@ -301,7 +356,6 @@ class MetricsHub:
         """Push buffer status information."""
         self._emit("buffer_status", {"step": step, **status})
 
-    # ---- Getters ----
     def get_episode_state(self, env_id: int) -> dict:
         """Get the latest episode state for an environment."""
         return self.episode_state.get(env_id, {})
@@ -311,86 +365,17 @@ class MetricsHub:
         return self.milestone_scores
 
 
-class CheckpointManager:
-    """
-    Manages checkpoint loading and agent initialization with fallback mechanisms.
-    """
-    
-    def __init__(self, checkpoint_path: Optional[str] = None, load_strategy: str = "distribute_topk"):
-        self.checkpoint_path = checkpoint_path
-        self.checkpoint_data: Optional[Dict] = None
-        self.load_strategy = load_strategy
-        
-    def load_checkpoint(self) -> bool:
-        """Load checkpoint from file if exists."""
-        if not self.checkpoint_path or not os.path.exists(self.checkpoint_path):
-            print(f"[CHECKPOINT] Checkpoint file not found: {self.checkpoint_path}")
-            return False
-        
-        self.checkpoint_data = torch.load(self.checkpoint_path, map_location='cpu')
-        print(f"[CHECKPOINT] Successfully loaded: {self.checkpoint_path}")
-        
-        if 'top_k_envs' in self.checkpoint_data:
-            top_k_envs = self.checkpoint_data['top_k_envs']
-            print(f"[CHECKPOINT] Contains {len(top_k_envs)} Top-K models")
-            if top_k_envs:
-                scores = [env['performance'] for env in top_k_envs]
-                print(f"[CHECKPOINT] Score range: {min(scores):.2f} ~ {max(scores):.2f}/100")
-        
-        return True
-    
-    def initialize_agents_from_checkpoint(self, maddpg_trainer) -> None:
-        """Initialize agents from checkpoint data using specified strategy."""
-        # 检查共享网络架构
-        if hasattr(maddpg_trainer, 'agents') and not hasattr(maddpg_trainer, 'env_agents'):
-            print("[CHECKPOINT] Shared network architecture detected, skipping per-env initialization")
-            return
-            
-        if not (self.checkpoint_data and 'top_k_envs' in self.checkpoint_data and self.checkpoint_data['top_k_envs']):
-            print("[CHECKPOINT] No valid data, using random initialization")
-            return
-        
-        top_k_envs = self.checkpoint_data['top_k_envs']
-        print(f"[CHECKPOINT] Using {self.load_strategy} strategy for {maddpg_trainer.num_envs} environments")
-        
-        loading_strategies = {
-            "distribute_topk": lambda n, t: {i: t[i % len(t)]['env_id'] for i in range(n)},
-            "top1_all": lambda n, t: {i: t[0]['env_id'] for i in range(n)},
-            "random": lambda n, t: {i: np.random.choice([e['env_id'] for e in t]) for i in range(n)}
-        }
-        
-        strategy_func = loading_strategies.get(self.load_strategy, loading_strategies["distribute_topk"])
-        source_mapping = strategy_func(maddpg_trainer.num_envs, top_k_envs)
-        
-        success_count = 0
-        for target_env_id, source_env_id in source_mapping.items():
-            for agent_id in maddpg_trainer.agent_ids:
-                target_agent = maddpg_trainer.env_agents[target_env_id][agent_id]
-                network_keys = {
-                    'actor': f'env_{source_env_id}_{agent_id}_actor',
-                    'critic': f'env_{source_env_id}_{agent_id}_critic',
-                    'actor_target': f'env_{source_env_id}_{agent_id}_actor_target',
-                    'critic_target': f'env_{source_env_id}_{agent_id}_critic_target'
-                }
-                
-                assert all(key in self.checkpoint_data for key in network_keys.values()), \
-                    f"Missing keys for agent {agent_id} from source env {source_env_id}"
-
-                target_agent.actor.load_state_dict(self.checkpoint_data[network_keys['actor']])
-                target_agent.critic.load_state_dict(self.checkpoint_data[network_keys['critic']])
-                target_agent.actor_target.load_state_dict(self.checkpoint_data[network_keys['actor_target']])
-                target_agent.critic_target.load_state_dict(self.checkpoint_data[network_keys['critic_target']])
-            success_count += 1
-        
-        print(f"[CHECKPOINT] Successfully initialized {success_count}/{maddpg_trainer.num_envs} environments")
-
-
 class WandBLogger:
     """
-    Enhanced WandB logger with simplified key structure.
-    MODIFIED: Updated to use new WHITELIST and simplified logging pipeline
-    MODIFIED: Removed try/except from initialize_run for fail-fast behavior
+    Enhanced WandB logger with configurable networks and noise scheduling support.
+    
+    Features:
+    - Network configuration logging
+    - Exploration metrics tracking
+    - Milestone and evaluation logging
+    - Fail-fast initialization
     """
+    
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE
         self.project_name = project_name
@@ -400,7 +385,7 @@ class WandBLogger:
             print("[WANDB] Disabled")
 
     def initialize_run(self, config: Dict[str, Any], run_name: Optional[str] = None) -> None:
-        """Initialize WandB run with enhanced configuration tracking - no try/except."""
+        """Initialize WandB run with enhanced configuration tracking."""
         if not self.enabled:
             return
         
@@ -409,55 +394,65 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["maddpg", "multi-agent", "surgical-robot", "single-agent-training"],
-            notes="Multi-environment parallel MADDPG training (Dual Protection + Single Agent)",
+            tags=["maddpg", "multi-agent", "surgical-robot", "configurable-networks"],
+            notes="Multi-environment parallel MADDPG training with configurable networks and noise scheduling",
             settings=wandb.Settings(start_method="thread")
         )
         
         # Log key configuration for dashboard
+        networks_cfg = config.get("networks", {})
+        exploration_cfg = config.get("exploration", {})
+        
         wandb.config.update({
             "update_interval": config.get("maddpg_config", {}).get("update_interval", 100),
-            "reward_scale": 0.01,  # Our reward scaling factor
-            "agent_mode": "robot_only",  # Single agent training mode
-            "reward_components": "trajectory+progress+potential_field",  # Active components
+            "reward_scale": 0.01,
+            "agent_mode": "robot_only",
+            "reward_components": "trajectory+progress+potential_field",
             "termination_mode": "direct_obstacle_collision",
             "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
+            # Network configuration
+            "actor_layers": networks_cfg.get("actor", {}).get("hidden_layers", []),
+            "critic_layers": networks_cfg.get("critic", {}).get("hidden_layers", []),
+            "actor_dropout": networks_cfg.get("actor", {}).get("dropout_p", 0.0),
+            "critic_dropout": networks_cfg.get("critic", {}).get("dropout_p", 0.0),
+            "orthogonal_init": networks_cfg.get("actor", {}).get("orthogonal_init", False),
+            "std_scale": networks_cfg.get("actor", {}).get("std_scale", 1.0),
+            # Exploration configuration
+            "noise_sigma_start": exploration_cfg.get("sigma_start", 0.7),
+            "noise_sigma_end": exploration_cfg.get("sigma_end", 0.1),
+            "noise_decay_k": exploration_cfg.get("decay_k", 6.0),
         })
         
         print(f"[WANDB] Successfully initialized: {self.run.name}")
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
-        """Attach to MetricsHub for unified data pipeline with new key structure"""
+        """Attach to MetricsHub for unified data pipeline."""
         if not self.enabled:
             return
 
-        # Training update level: direct logging with new keys
+        # Training update level: direct logging with exploration metrics
         hub.subscribe("update", lambda data: self.log_algorithm_statistics(data, data["step"]))
 
-        # Episode level: currently not used but available for future
+        # Episode level: available for future use
         def _on_episode(ep):
-            # Could aggregate episode-level metrics here if needed
             pass
         hub.subscribe("episode", _on_episode)
 
-        # Milestone completion: calculate and upload with new milestone/ keys
+        # Milestone completion: calculate and upload milestone metrics
         def _on_ms(ms):
             scores = ms.get("scores", {})
             step = ms.get("step", 0)
             
-            # Calculate milestone metrics from scores if available, otherwise use direct values
             if scores:
                 score_values = list(scores.values())
                 best = max(score_values) if score_values else 0.0
                 avg = sum(score_values) / len(score_values) if score_values else 0.0
                 count = len(score_values)
             else:
-                # Fallback to direct values from milestone data
                 best = ms.get("milestone/topk_best_score", ms.get("eval/return_mean", 0.0))
                 avg = ms.get("milestone/topk_avg_score", ms.get("eval/return_mean", 0.0))
                 count = ms.get("milestone/topk_count", 1)
             
-            # Construct log data with milestone metrics
             log_data = {
                 "milestone/topk_best_score": best,
                 "milestone/topk_avg_score": avg,
@@ -465,45 +460,45 @@ class WandBLogger:
                 "milestone/latest_completed": ms.get("milestone", ms.get("milestone/latest_completed", 0)),
             }
             
-            # Forward eval/ data if present
             if "eval/return_mean" in ms:
                 log_data["eval/return_mean"] = ms["eval/return_mean"]
             if "eval/num_episodes" in ms:
                 log_data["eval/num_episodes"] = ms["eval/num_episodes"]
             
-            # Use new milestone/ prefix
             self.log_algorithm_statistics(log_data, step)
             
         hub.subscribe("milestone_summary", _on_ms)
         
-        print("[WANDB] Attached to MetricsHub with new key structure")
-        print("[WANDB] Using unified global step for consistent x-axis")
+        print("[WANDB] Attached to MetricsHub with exploration metrics support")
 
     def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
-        """Log algorithm diagnostics with new WHITELIST filtering."""
+        """Log algorithm diagnostics with WHITELIST filtering."""
         if not self.enabled or not algorithm_stats:
             return
 
-        # New simplified WHITELIST
+        # WHITELIST with exploration metrics
         WHITELIST = {
-            # --- train ---
+            # Training
             "train/actor_loss", "train/critic_loss",
             "train/action_std/robot", "train/action_std/human",
             "train/episodes_done", "train/updates",
             
-            # --- model (q/td/grad等统计) ---
+            # Model statistics
             "model/q_mean", "model/q_std",
             "model/q_target_mean", "model/q_target_std",
             "model/td_error_mean", "model/td_rmse", "model/q_qt_corr",
             "model/grad_norm/actor", "model/grad_norm/critic",
             
-            # --- replay ---
+            # Exploration metrics
+            "exploration/noise_scale", "exploration/sigma_ratio",
+            
+            # Replay buffer
             "replay/buffer_size",
             
-            # --- eval ---
+            # Evaluation
             "eval/return_mean", "eval/num_episodes",
             
-            # --- milestone ---
+            # Milestones
             "milestone/topk_best_score", "milestone/topk_avg_score",
             "milestone/topk_count", "milestone/latest_completed",
         }
@@ -519,7 +514,6 @@ class WandBLogger:
 
         log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
         if log_data:
-            # Always use the provided unified step for consistent x-axis
             wandb.log(log_data, step=step)
 
     def finalize_run(self) -> None:
@@ -549,7 +543,14 @@ class TrainingConfiguration:
 
 
 class TopKModelManager:
-    """Manages top-K model collection and checkpoint saving."""
+    """
+    Manages top-K model collection and checkpoint saving.
+    
+    Features:
+    - Raw performance tracking (no clipping)
+    - Automatic sorting by performance
+    - Checkpoint saving with model metadata
+    """
     
     def __init__(self, k: int = 10, mode: str = "max"):
         self.k = k
@@ -558,7 +559,7 @@ class TopKModelManager:
     
     def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
         """Update top-K models with new performance data."""
-        # Use raw performance value without clipping
+        # Use raw performance value - no clipping to preserve true performance
         
         # Add new model
         if len(self.top_models) < self.k:
@@ -601,13 +602,18 @@ class TopKModelManager:
 
 
 class TrainingLogger:
-    """Handles training progress logging and file operations with unified global step."""
+    """
+    Handles training progress logging and file operations.
+    
+    Features:
+    - Progress tracking with unified global step
+    - Configuration logging with network and exploration info
+    - Final results persistence
+    """
     
     def __init__(self, log_directory: str):
         self.log_directory = log_directory
         os.makedirs(log_directory, exist_ok=True)
-        
-        # UNIFIED: Global step tracking for metrics hub
         self.global_step = 0
     
     def log_message(self, message: str) -> None:
@@ -618,8 +624,8 @@ class TrainingLogger:
             f.write(f"[{timestamp}] {message}\n")
     
     def log_training_start(self, args: argparse.Namespace, params: Dict[str, Any]) -> None:
-        """Log training start information with step-based limits."""
-        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Shared Networks)")
+        """Log training start information with configuration details."""
+        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Configurable Networks)")
         
         # Read CLI or YAML max_global_steps for display
         cfg_steps = params.get('maddpg_config', {}).get('max_global_steps', 0) or 0
@@ -630,14 +636,33 @@ class TrainingLogger:
         print(f"Environments: {args.num_envs}, Target: {target_str}")
         print(f"Log Directory: {self.log_directory}")
         
+        # Log network configuration
+        networks_cfg = params.get('networks', {})
+        if networks_cfg:
+            actor_cfg = networks_cfg.get('actor', {})
+            critic_cfg = networks_cfg.get('critic', {})
+            print(f"Network Configuration:")
+            print(f"  Actor layers: {actor_cfg.get('hidden_layers', 'default')}")
+            print(f"  Critic layers: {critic_cfg.get('hidden_layers', 'default')}")
+            print(f"  Dropout: Actor {actor_cfg.get('dropout_p', 0.0)}, Critic {critic_cfg.get('dropout_p', 0.0)}")
+            print(f"  Orthogonal init: {actor_cfg.get('orthogonal_init', False)}")
+            print(f"  Std scale: {actor_cfg.get('std_scale', 1.0)}")
+        
+        # Log exploration configuration
+        exploration_cfg = params.get('exploration', {})
+        if exploration_cfg:
+            print(f"Exploration Configuration:")
+            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
+            print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
+        
         # Log unified completion threshold
         completion_threshold = params.get('reward_parameters', {}).get('completion_threshold', 0.01)
         print(f"Unified completion threshold: {completion_threshold}m")
         print(f"\n", "="*70)    
     
     def log_training_progress(self, global_step: int, global_episodes: int, top_k_manager: TopKModelManager) -> None:
-        """Log periodic training progress with unified global step."""
-        self.global_step = global_step  # Update global step
+        """Log periodic training progress."""
+        self.global_step = global_step
         print(f"[Step {global_step}] Episodes so far: {global_episodes}")
         if top_k_manager.top_models:
             scores = [m[0] for m in top_k_manager.top_models]
@@ -657,7 +682,11 @@ class TrainingLogger:
         stats = {
             'total_steps': global_step, 
             'total_episodes': global_episodes,
-            'top_k_scores': [(p, m) for p, _, m in top_k_manager.get_top_models()]
+            'top_k_scores': [(p, m) for p, _, m in top_k_manager.get_top_models()],
+            'final_config': {
+                'networks': params.get('networks', {}),
+                'exploration': params.get('exploration', {}),
+            }
         }
         with open(os.path.join(self.log_directory, "training_stats.pkl"), 'wb') as f:
             pickle.dump(stats, f)
@@ -677,6 +706,8 @@ def save_final_shared_networks(log_directory: str, maddpg, global_step: int, glo
         'episodes_done_total': global_episodes,
         'max_milestone_triggered': max_milestone_triggered or 0,
         'shared_networks': True,
+        'network_config': maddpg.params.get('networks', {}),
+        'exploration_config': maddpg.params.get('exploration', {}),
     }
     
     for agent_id in maddpg.agent_ids:
@@ -693,22 +724,22 @@ def save_final_shared_networks(log_directory: str, maddpg, global_step: int, glo
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
-    """Create command line argument parser with step-based configuration."""
+    """Create command line argument parser with configurable networks support."""
     if config_path is None:
-        # 根据实际文件位置调整路径
+        # Adjust path based on actual file location
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
     config = TrainingConfiguration(config_path)
-    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with shared networks")
+    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with configurable networks")
     parser.add_argument("--config", type=str, default=config_path)
     
-    # Environment count from command line overrides cfg default
+    # Environment configuration
     parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
     parser.add_argument("--seed", type=int, default=config.params.get('seed', 42))
     
-    # MODIFIED: Removed --max_episodes, added --max_global_steps
+    # Training configuration
     parser.add_argument(
         "--max_global_steps", 
         type=int, 
@@ -716,9 +747,10 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         help="Stop after this many global training steps; if >0, it becomes the sole stop condition."
     )
     
+    # Model management
     parser.add_argument("--top_k_models", type=int, default=10)
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--load_strategy", type=str, default="distribute_topk", 
-                       choices=["distribute_topk", "top1_all", "random"])
+    
+    # Logging
     parser.add_argument("--wandb", action="store_true", default=False)
+    
     return parser

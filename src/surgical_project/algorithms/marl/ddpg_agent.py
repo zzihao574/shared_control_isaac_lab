@@ -18,6 +18,7 @@ class DDPGAgent:
     - Force constraint compliance
     - Batch processing support for shared network architecture
     - Gradient norm statistics for training diagnostics
+    - Configurable network architecture via YAML
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
@@ -53,22 +54,83 @@ class DDPGAgent:
             
         self.max_action = max_action
         
+        # Load network configuration
+        net_cfg = params.get('networks', {})
+        actor_cfg = net_cfg.get('actor', {})
+        critic_cfg = net_cfg.get('critic', {})
+
+        hidden_dim = int(params.get('maddpg_config', {}).get('hidden_units', 512))  # 兼容旧字段
+
+        actor_hidden_layers = actor_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
+        actor_dropout = float(actor_cfg.get('dropout_p', 0.0))
+        actor_ortho = bool(actor_cfg.get('orthogonal_init', False))
+        actor_gain_h = float(actor_cfg.get('ortho_gain_hidden', 1.0))
+        actor_gain_o = float(actor_cfg.get('ortho_gain_output', 0.01))
+        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))  # 新
+
+        critic_hidden_layers = critic_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
+        critic_dropout = float(critic_cfg.get('dropout_p', 0.0))
+        critic_ortho = bool(critic_cfg.get('orthogonal_init', False))
+        critic_gain_h = float(critic_cfg.get('ortho_gain_hidden', 1.0))
+        critic_gain_o = float(critic_cfg.get('ortho_gain_output', 1.0))
+        
         print(f"[DDPG AGENT] {agent_id}:")
         print(f"  State dim: {state_dim}, Action dim: {action_dim}")
         print(f"  Total state dim: {total_state_dim}, Total action dim: {total_action_dim}")
         print(f"  Max action: {max_action}")
-        print(f"  Hidden units: {hidden_dim}")
+        print(f"  Actor layers: {actor_hidden_layers}, dropout: {actor_dropout}")
+        print(f"  Critic layers: {critic_hidden_layers}, dropout: {critic_dropout}")
+        print(f"  Orthogonal init - Actor: {actor_ortho}, Critic: {critic_ortho}")
+        print(f"  Std scale: {actor_std_scale}")
         print(f"  LR - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
         print(f"  Target update rate (tau): {self.tau}")
         
         # Initialize actor networks
-        self.actor = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
-        self.actor_target = Actor(state_dim, action_dim, hidden_dim, max_action_magnitude=max_action).to(device)
+        self.actor = Actor(
+            state_dim, action_dim,
+            hidden_dimension=hidden_dim,
+            max_action_magnitude=max_action,
+            hidden_layers=actor_hidden_layers,
+            dropout_p=actor_dropout,
+            orthogonal_init=actor_ortho,
+            ortho_gain_hidden=actor_gain_h,
+            ortho_gain_output=actor_gain_o,
+            std_scale=actor_std_scale
+        ).to(device)
+
+        self.actor_target = Actor(
+            state_dim, action_dim,
+            hidden_dimension=hidden_dim,
+            max_action_magnitude=max_action,
+            hidden_layers=actor_hidden_layers,
+            dropout_p=actor_dropout,
+            orthogonal_init=actor_ortho,
+            ortho_gain_hidden=actor_gain_h,
+            ortho_gain_output=actor_gain_o,
+            std_scale=actor_std_scale
+        ).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        
+
         # Initialize critic networks (centralized training)
-        self.critic = Critic(total_state_dim, total_action_dim, hidden_dim).to(device)
-        self.critic_target = Critic(total_state_dim, total_action_dim, hidden_dim).to(device)
+        self.critic = Critic(
+            total_state_dim, total_action_dim,
+            hidden_dimension=hidden_dim,
+            hidden_layers=critic_hidden_layers,
+            dropout_p=critic_dropout,
+            orthogonal_init=critic_ortho,
+            ortho_gain_hidden=critic_gain_h,
+            ortho_gain_output=critic_gain_o
+        ).to(device)
+
+        self.critic_target = Critic(
+            total_state_dim, total_action_dim,
+            hidden_dimension=hidden_dim,
+            hidden_layers=critic_hidden_layers,
+            dropout_p=critic_dropout,
+            orthogonal_init=critic_ortho,
+            ortho_gain_hidden=critic_gain_h,
+            ortho_gain_output=critic_gain_o
+        ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
         # Initialize optimizers

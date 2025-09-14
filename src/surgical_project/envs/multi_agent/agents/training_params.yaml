@@ -1,11 +1,38 @@
 # Training parameters configuration
 # SIMPLIFIED: Removed per-environment complexity, optimized for shared network architecture
 # MODIFIED: Added max_global_steps as primary termination condition
+# MODIFIED: Added networks and exploration configuration sections
 
 # ==============================================================================
 # Global Settings
 # ==============================================================================
 seed: 42
+
+# ==============================================================================
+# Network Architecture Configuration
+# ==============================================================================
+networks:
+  actor:
+    hidden_layers: [512, 512, 256, 256]
+    dropout_p: 0.10
+    orthogonal_init: true
+    ortho_gain_hidden: 1.414   # ReLU建议√2
+    ortho_gain_output: 0.001    # Actor输出小一点更稳
+    std_scale: 1.0             # 等价于去掉原来*0.2的限制
+  critic:
+    hidden_layers: [512, 512, 256, 256]
+    dropout_p: 0.10
+    orthogonal_init: true
+    ortho_gain_hidden: 1.414   # 同样的ReLU补偿
+    ortho_gain_output: 1.0     # Critic可以用标准增益
+
+# ==============================================================================
+# Exploration Configuration
+# ==============================================================================
+exploration:
+  sigma_start: 0.6   # 初始噪声 = 0.6 × max_action
+  sigma_end: 0.1     # 收尾噪声 = 0.1 × max_action
+  decay_k: 3.0       # 衰减快慢（可省略，代码里给默认）
 
 # ==============================================================================
 # Logging Configuration
@@ -65,10 +92,10 @@ reward_parameters:
   completion_threshold: 0.01          # Distance threshold for task completion (meters)
   
   weights:
-    # ===== ROBOT =====
+    # ===== ROBOT (Active Agent) =====
     zoneA_weight_robot: 1.0
-    zoneA_progress_robot: 1.0
-    zoneA_deviation_robot: 1.0
+    zoneA_progress_robot: 5.0
+    zoneA_deviation_robot: 15.0
 
     zoneB_weight_robot: 1.0
     zoneB_gap_robot: 1.0
@@ -79,7 +106,6 @@ reward_parameters:
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
 
-    # SIMPLIFIED Zone D: Only Progress + Deviation + Inward
     zoneD_weight_robot: 1.0
     zoneD_progress_robot: 1.0
     zoneD_deviation_robot: 1.0
@@ -91,26 +117,22 @@ reward_parameters:
     forceeff_robot: 0.0
     humanaware_robot: 0.0
 
-    # ===== HUMAN =====
+    # ===== HUMAN (Disabled in Single-Agent Mode) =====  
+    # All human weights set to 0.0 for single-agent training
     zoneA_weight_human: 0.0
     zoneA_progress_human: 0.0
     zoneA_deviation_human: 0.0
-
     zoneB_weight_human: 0.0
     zoneB_gap_human: 0.0
     zoneB_surftangent_human: 0.0
     zoneB_inward_human: 0.0
-
     zoneC_weight_human: 0.0
     zoneC_offpen_human: 0.0
     zoneC_inward_human: 0.0
-
-    # SIMPLIFIED Zone D: Only Progress + Deviation + Inward
     zoneD_weight_human: 0.0
     zoneD_progress_human: 0.0
     zoneD_deviation_human: 0.0
     zoneD_inward_human: 0.0
-
     zpenalty_human: 0.0
     completion_human: 0.0
     timeeff_human: 0.0

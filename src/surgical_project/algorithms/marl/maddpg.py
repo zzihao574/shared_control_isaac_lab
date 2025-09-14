@@ -4,6 +4,7 @@ FINAL VERSION: Complete implementation per document specifications.
 MODIFIED: Updated statistics keys to match new WHITELIST structure
 MODIFIED: Simplified _get_actual_env method
 MODIFIED: Updated interface calls (debug -> detail)
+MODIFIED: Added noise_scale parameter for global noise scheduling
 
 Key Features:
 - Single shared network per agent (not per environment)
@@ -13,6 +14,7 @@ Key Features:
 - Gradient norm monitoring for training stability
 - Enhanced detail information collection
 - New statistics key structure aligned with train/, model/ prefixes
+- Global noise scaling for exploration schedule
 """
 
 import torch
@@ -128,13 +130,14 @@ class MADDPG:
         print(f"[SLICES] Observation slices: {self.obs_slices}")
         print(f"[SLICES] Action slices: {self.act_slices}")
 
-    def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool) -> tuple[Dict[str, torch.Tensor], Dict]:
+    def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """
-        Select actions using shared networks with batch processing.
+        Select actions using shared networks with batch processing and global noise scaling.
         
         Args:
             observations: {agent_id: Tensor[num_envs, obs_dim]}
             add_noise: Whether to add exploration noise
+            noise_scale: Global noise scaling factor for exploration schedule
             
         Returns:
             actions: {agent_id: Tensor[num_envs, action_dim]}
@@ -149,9 +152,10 @@ class MADDPG:
             
             with torch.no_grad():
                 mean, std = agent.actor(obs_i)
-                noise = std * torch.randn_like(mean) if add_noise else torch.zeros_like(mean)
+                noise = (noise_scale * std * torch.randn_like(mean)) if add_noise else torch.zeros_like(mean)
                 action = (mean + noise).clamp_(-agent.max_action, agent.max_action)
             
+            # Single agent training: zero out human actions
             if agent_id == "human":
                 mean = torch.zeros_like(mean)
                 noise = torch.zeros_like(noise)
