@@ -9,8 +9,8 @@ Features:
 - Exponential noise scheduling: fast early decay, slow later convergence
 - Unified global step tracking for consistent logging
 - TopK model management with milestone evaluation
-- WandB integration with exploration metrics
-- Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator (no old RewardLogger chain)
+- WandB integration with per-agent metrics
+- Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator
 """
 
 import sys
@@ -29,13 +29,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
 from utils.training_helpers import (
-    WandBLogger, TrainingConfiguration, TrainingLogger, create_argument_parser, 
+    WandBLogger, TrainingConfiguration, create_argument_parser, 
     MetricsHub, TopKModelManager, TrainingRunner, MilestoneEvaluator, save_final_shared_networks
 )
 
 
-def create_env_and_config(args, config):
-    """Create environment and environment configuration."""
+def setup_environment(args, config):
+    """Create and configure the surgical robot environment."""
     from surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
     import gymnasium as gym
     import surgical_project.envs.multi_agent
@@ -60,13 +60,13 @@ def create_env_and_config(args, config):
     return env, env_cfg
 
 
-def create_maddpg_trainer(env, config, args):
-    """Create MADDPG trainer with configurable networks."""
+def initialize_maddpg_algorithm(env, config, args):
+    """Create and initialize MADDPG algorithm with configurable networks."""
     from surgical_project.algorithms.marl.maddpg import MADDPG
     
     device = config.get_compute_device()
     
-    # Get environment count - simplified logic
+    # Get environment count
     num_envs = args.num_envs
     if hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'num_envs'):
         num_envs = env.unwrapped.num_envs
@@ -80,7 +80,7 @@ def create_maddpg_trainer(env, config, args):
         device=device
     )
     
-    print(f"[INFO] MADDPG trainer created:")
+    print(f"[INFO] MADDPG algorithm initialized:")
     print(f"  Device: {device}")
     print(f"  Agent IDs: {maddpg.agent_ids}")
     print(f"  Environments: {num_envs}")
@@ -89,7 +89,7 @@ def create_maddpg_trainer(env, config, args):
 
 
 def inject_step_tracer(env, config, num_envs):
-    """Inject StepTracer into environment for console logging (post-creation, zero-intrusion)."""
+    """Inject StepTracer into environment for console logging."""
     actual_env = getattr(env, "unwrapped", env)
     
     from surgical_project.envs.multi_agent.utils import StepTracer
@@ -112,7 +112,7 @@ class MADDPGTrainer:
     - Configuration-driven network architecture
     - Exponential noise decay scheduling
     - Milestone evaluation with TopK model selection
-    - Comprehensive WandB logging with exploration metrics
+    - Comprehensive WandB logging with per-agent metrics
     - Single evaluation chain (no old RewardLogger/MilestoneManager)
     """
     
@@ -121,7 +121,7 @@ class MADDPGTrainer:
         
         print(f"[TRAINER] Initializing MADDPGTrainer with configurable networks...")
         
-        # Setup phase
+        # Setup phases
         self._setup_configuration()
         self._setup_environment()
         self._setup_logging_and_wandb()
@@ -133,15 +133,14 @@ class MADDPGTrainer:
         print(f"  Max global steps: {self.max_global_steps}")
         print(f"  Milestone episodes: {self.milestone_episodes}")
         
-        # Print network configuration
         self._print_configuration_summary()
 
     def _setup_configuration(self):
-        """Setup configuration."""
+        """Load and setup training configuration."""
         print(f"[SETUP] Loading configuration from: {self.args.config}")
         self.config = TrainingConfiguration.from_yaml(self.args.config)
         
-        # Set random seeds
+        # Set random seeds for reproducibility
         torch.manual_seed(self.args.seed)
         np.random.seed(self.args.seed)
         random.seed(self.args.seed)
@@ -150,9 +149,9 @@ class MADDPGTrainer:
         print(f"[SETUP] Configuration loaded, seed set to: {self.args.seed}")
 
     def _setup_environment(self):
-        """Setup environment."""
+        """Create and configure the environment."""
         print(f"[SETUP] Creating environment: {self.args.task}")
-        self.env, self.env_cfg = create_env_and_config(self.args, self.config)
+        self.env, self.env_cfg = setup_environment(self.args, self.config)
         
         # Inject configuration to environment
         actual_env = getattr(self.env, 'unwrapped', self.env)
@@ -166,27 +165,24 @@ class MADDPGTrainer:
         inject_step_tracer(self.env, self.config, self.args.num_envs)
 
     def _setup_logging_and_wandb(self):
-        """Setup logging and WandB."""
-        # Create log directory
+        """Setup logging directory and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = f"logs/maddpg_configurable/{timestamp}"
-        
-        self.logger = TrainingLogger(log_dir)
-        
-        print(f"[SETUP] Log directory created: {log_dir}")
-        
+        self.log_dir = f"logs/maddpg_final/{timestamp}"
+        os.makedirs(self.log_dir, exist_ok=True)
+        print(f"[SETUP] Log directory created: {self.log_dir}")
+
         # Initialize WandB
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_configurable_{self.args.num_envs}envs_{timestamp}"
+            run_name = f"maddpg_final_{self.args.num_envs}envs_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
             print(f"[SETUP] WandB initialized with run name: {run_name}")
         else:
             print(f"[SETUP] WandB disabled")
 
     def _setup_training_components(self):
-        """Setup training components."""
+        """Initialize training components and metrics hub."""
         print(f"[SETUP] Setting up training components...")
         
         # Create MetricsHub
@@ -197,8 +193,8 @@ class MADDPGTrainer:
             self.wandb_logger.attach_metrics_hub(self.metrics_hub)
             print(f"[SETUP] WandB attached to MetricsHub")
         
-        # Create MADDPG trainer
-        self.maddpg = create_maddpg_trainer(self.env, self.config, self.args)
+        # Create MADDPG algorithm
+        self.maddpg = initialize_maddpg_algorithm(self.env, self.config, self.args)
         
         # Create TopK manager
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
@@ -219,7 +215,7 @@ class MADDPGTrainer:
         print(f"  Milestone episodes: {self.milestone_episodes}")
 
     def _setup_runners_and_evaluators(self):
-        """Setup runners and evaluators."""
+        """Initialize training runner and milestone evaluator."""
         print(f"[SETUP] Creating TrainingRunner and MilestoneEvaluator...")
         
         # Create TrainingRunner with noise scheduling
@@ -228,7 +224,7 @@ class MADDPGTrainer:
             maddpg=self.maddpg,
             replay=self.maddpg.replay,
             metrics_hub=self.metrics_hub,
-            reward_logger=None,  # No more reward_logger dependency
+            reward_logger=None,  # No reward_logger dependency
             agent_ids=self.maddpg.agent_ids
         )
         
@@ -238,23 +234,20 @@ class MADDPGTrainer:
             maddpg=self.maddpg,
             topk_mgr=self.top_k_manager,
             metrics_hub=self.metrics_hub,
-            log_dir=self.logger.log_directory,
+            log_dir=self.log_dir,
             agent_ids=self.maddpg.agent_ids
         )
         
         print(f"[SETUP] TrainingRunner and MilestoneEvaluator created successfully")
 
     def _setup_milestone_management(self):
-        """Setup milestone management."""
+        """Initialize milestone tracking variables."""
         print(f"[SETUP] Setting up milestone management...")
-        
-        # Milestone tracking (simplified, no old MilestoneManager)
-        self.max_milestone_triggered = 0
-        
+        self.max_milestone_triggered = 0  # Highest milestone reached
         print(f"[SETUP] Milestone management configured for {len(self.milestone_episodes)} milestones")
 
     def _print_configuration_summary(self):
-        """Print configuration summary."""
+        """Print network and exploration configuration summary."""
         networks_cfg = self.config.params.get('networks', {})
         if networks_cfg:
             print(f"[CONFIG] Network Architecture:")
@@ -273,8 +266,8 @@ class MADDPGTrainer:
             print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
-    def check_and_trigger_milestone(self):
-        """Check and trigger milestone evaluation with observation refresh fix."""
+    def evaluate_milestone_if_due(self):
+        """Check and trigger milestone evaluation if threshold crossed."""
         if not self.milestone_episodes:
             return
             
@@ -292,12 +285,11 @@ class MADDPGTrainer:
             print(f"[MILESTONE] Triggering evaluation (previous max: {self.max_milestone_triggered})")
             
             # Direct call to evaluator
-            result = self.evaluator.handle(candidate, self.runner.global_step)
+            result = self.evaluator.run_evaluation(candidate, self.runner.global_step)
             if result.get("skip_episode_once", False):
                 self.runner.mark_skip_episode_once()
             
-            # === CRITICAL FIX: Refresh current observations after evaluation ===
-            # This prevents "old observation + new environment" state mismatch
+            # Refresh current observations after evaluation
             env = getattr(self.env, "unwrapped", self.env)
             if hasattr(env, "_get_observations"):
                 self.runner._current_obs = env._get_observations()
@@ -311,9 +303,6 @@ class MADDPGTrainer:
 
     def train(self) -> None:
         """Main training loop with configurable networks and noise scheduling."""
-        # Record training start
-        self.logger.log_training_start(self.args, self.config.params)
-        
         print(f"[TRAIN] Starting training with configurable networks and noise scheduling:")
         print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
         print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
@@ -328,7 +317,6 @@ class MADDPGTrainer:
                     "train/episodes_done": 0,
                     "replay/buffer_size": 0,
                     "exploration/noise_scale": self.runner.sigma_start,
-                    "exploration/sigma_ratio": 1.0,
                 }
                 self.metrics_hub.push_update(0, initial_stats)
             
@@ -341,18 +329,17 @@ class MADDPGTrainer:
             # Main training loop
             while self.runner.global_step < self.max_global_steps:
                 # Execute one training step
-                obs_dict = self.runner.run_step()
+                obs_dict = self.runner.execute_training_step()
                 
                 # Milestone checking
-                self.check_and_trigger_milestone()
+                self.evaluate_milestone_if_due()
                 
                 # Progress reporting
                 if self.runner.global_step % 2000 == 0:
-                    self.logger.log_training_progress(
-                        self.runner.global_step, 
-                        self.runner.global_episodes, 
-                        self.top_k_manager
-                    )
+                    print(f"[Step {self.runner.global_step}] Episodes so far: {self.runner.global_episodes}")
+                    if self.top_k_manager.top_models:
+                        scores = [m[0] for m in self.top_k_manager.top_models]
+                        print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}")
                 
                 # Check termination condition
                 if self.runner.global_step >= self.max_global_steps:
@@ -366,25 +353,21 @@ class MADDPGTrainer:
             print(f"  Max milestone triggered: {self.max_milestone_triggered}")
             print(f"  Final noise scale: {self.runner._calculate_noise_scale():.4f}")
             
-            self.logger.log_training_complete(self.top_k_manager)
+            print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
+            print("\nFinal Top-K Models:")
+            for i, (performance, _, milestone) in enumerate(self.top_k_manager.get_top_models()):
+                print(f"  #{i+1} Milestone {milestone}: {performance:.2f}")
+            print(f"\nResults saved in: {self.log_dir}")
             
             # Save final model
             save_final_shared_networks(
-                log_directory=self.logger.log_directory,
+                log_directory=self.log_dir,
                 maddpg=self.maddpg,
                 global_step=self.runner.global_step,
                 global_episodes=self.runner.global_episodes,
                 max_milestone_triggered=self.max_milestone_triggered
             )
             
-            # Save training results
-            self.logger.save_final_results(
-                self.runner.global_step,
-                self.runner.global_episodes,
-                self.top_k_manager,
-                self.config.params,
-                self.args
-            )
             print(f"[TRAIN] Final results saved successfully")
         
         except KeyboardInterrupt:
@@ -398,7 +381,7 @@ class MADDPGTrainer:
 
 
 def main():
-    """Main entry point."""
+    """Main entry point for MADDPG training."""
     print("="*80)
     print("MADDPG Configurable Network Training")
     print("Enhanced with exponential noise scheduling and network flexibility")

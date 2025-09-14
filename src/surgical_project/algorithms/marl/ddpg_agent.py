@@ -10,7 +10,6 @@ class DDPGAgent:
     """
     Deep Deterministic Policy Gradient agent for shared network MADDPG.
     
-    FINAL VERSION: Unified action selection interface supporting batch processing.
     Features:
     - Stochastic actor with mean and variance outputs
     - Centralized critic for multi-agent coordination  
@@ -42,7 +41,7 @@ class DDPGAgent:
         maddpg_cfg = params.get('maddpg_config', {})
         self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.001))
         self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.001))
-        self.tau = float(maddpg_cfg.get('tau', 0.002))
+        self.tau = float(maddpg_cfg.get('tau', 0.002))  # Target network update rate
         hidden_dim = int(maddpg_cfg.get('hidden_units', 512))
         
         # Get agent-specific force constraints
@@ -59,14 +58,14 @@ class DDPGAgent:
         actor_cfg = net_cfg.get('actor', {})
         critic_cfg = net_cfg.get('critic', {})
 
-        hidden_dim = int(params.get('maddpg_config', {}).get('hidden_units', 512))  # 兼容旧字段
+        hidden_dim = int(params.get('maddpg_config', {}).get('hidden_units', 512))  # Compatibility with old field
 
         actor_hidden_layers = actor_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
         actor_dropout = float(actor_cfg.get('dropout_p', 0.0))
         actor_ortho = bool(actor_cfg.get('orthogonal_init', False))
         actor_gain_h = float(actor_cfg.get('ortho_gain_hidden', 1.0))
         actor_gain_o = float(actor_cfg.get('ortho_gain_output', 0.01))
-        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))  # 新
+        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))  # New parameter
 
         critic_hidden_layers = critic_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
         critic_dropout = float(critic_cfg.get('dropout_p', 0.0))
@@ -140,15 +139,7 @@ class DDPGAgent:
         print(f"[DDPG AGENT] {agent_id} initialized successfully")
 
     def update_actor(self, loss: torch.Tensor) -> Dict[str, float]:
-        """
-        Update actor network using provided loss.
-        
-        Args:
-            loss: Actor loss tensor (should be scalar)
-            
-        Returns:
-            Dictionary containing training statistics
-        """
+        """Update actor network using provided loss."""
         # Zero gradients
         self.actor_optimizer.zero_grad()
         
@@ -166,17 +157,7 @@ class DDPGAgent:
         }
 
     def update_critic(self, states: torch.Tensor, actions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-        """
-        Update critic network using Huber loss.
-        
-        Args:
-            states: Concatenated states from all agents
-            actions: Concatenated actions from all agents
-            targets: Target Q-values
-            
-        Returns:
-            Dictionary containing training statistics
-        """
+        """Update critic network using Huber loss."""
         # Forward pass through critic
         q_values = self.critic(states, actions)
         
@@ -204,12 +185,7 @@ class DDPGAgent:
         }
 
     def soft_update(self) -> None:
-        """
-        Perform soft update of target networks using Polyak averaging.
-        
-        Updates both actor and critic target networks using the formula:
-        target_param = tau * param + (1 - tau) * target_param
-        """
+        """Perform soft update of target networks using Polyak averaging."""
         # Update actor target network
         for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
             target_param.data.copy_(

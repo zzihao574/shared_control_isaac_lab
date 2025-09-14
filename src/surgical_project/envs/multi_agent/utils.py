@@ -1,9 +1,11 @@
 """
 Environment utilities for shared network MADDPG training.
-CLEANED VERSION: Only essential environment components, no old logging chain.
-MODIFIED: Removed RewardLogger and MilestoneManager completely
-MODIFIED: Kept CompleteConstraintChecker, TrajectoryManager, StepTracer
-MODIFIED: Replaced wide try/except with explicit checks
+Essential environment components for physics-based constraint analysis and console debugging.
+
+Features:
+- CompleteConstraintChecker: Physics-based constraint analysis
+- TrajectoryManager: Trajectory management for path following
+- StepTracer: Console debugging with four-zone reward system monitoring
 """
 
 import torch
@@ -18,7 +20,14 @@ from carb._carb import Float3
 
 
 class CompleteConstraintChecker:
-    """Physics-based constraint analysis."""
+    """
+    Physics-based constraint analysis for surgical robot environment.
+    
+    Features:
+    - Batch constraint state analysis
+    - Distance and overlap detection
+    - Normal vector calculation
+    """
     
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
         self.device = device
@@ -96,10 +105,7 @@ class CompleteConstraintChecker:
                 filtered_result = raycast_result
         
         # Determine state
-        if distance > 1.2 or distance < 1e-8:
-            is_overlapping, is_inside = True, False
-            distance = 0.0
-        elif distance < 0.002:
+        if distance > 1.2 or distance < 0.0005:
             is_overlapping, is_inside = True, False
             distance = 0.0
         elif not filtered_result or 'faceIndex' not in filtered_result:
@@ -122,7 +128,14 @@ class CompleteConstraintChecker:
 
 
 class TrajectoryManager:
-    """Trajectory management for path following."""
+    """
+    Trajectory management for surgical robot path following.
+    
+    Features:
+    - Progress calculation along trajectory
+    - Deviation measurement from ideal path
+    - Task completion detection
+    """
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
         self.device = device
@@ -169,7 +182,13 @@ class TrajectoryManager:
 class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
-    Unified global_step integration for shared network training.
+    Provides detailed per-environment console output for debugging and analysis.
+    
+    Features:
+    - Four-zone reward system monitoring
+    - Per-environment state visualization
+    - Actor network output tracking
+    - Unified global_step integration
     """
     
     def __init__(self, num_envs: int, device: torch.device,
@@ -178,19 +197,14 @@ class StepTracer:
                  max_envs_to_print: int = 2):
         self.num_envs = num_envs
         self.device = device
-        self.enable_console_logging = enable_console_logging
-        self.print_every_steps = print_every_steps
-        self.max_envs_to_print = max_envs_to_print
+        self.enable_console_logging = enable_console_logging  # Console logging flag
+        self.print_every_steps = print_every_steps  # Print frequency
+        self.max_envs_to_print = max_envs_to_print  # Max environments to show
 
     def maybe_print_step(self, env, rewards: Dict, global_step: int):
         """
         Complete zone-based console printing using unified global_step.
         Console print (zero storage) - only when enabled and throttled by step frequency.
-        
-        Args:
-            env: Environment instance
-            rewards: Reward dictionary
-            global_step: Unified global step from trainer (hand-maintained)
         """
         if not self.enable_console_logging:
             return
@@ -312,6 +326,7 @@ class StepTracer:
         }
 
         def _val(x):
+            """Extract value from tensor or scalar."""
             if torch.is_tensor(x):
                 if x.ndim > 0 and x.shape[0] > env_id:
                     return float(x[env_id].item())

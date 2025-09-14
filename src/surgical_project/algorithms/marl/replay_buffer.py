@@ -1,7 +1,12 @@
 """
-Replay buffer implementation for shared network MADDPG.
-FINAL VERSION: Joint replay buffer with concatenated observations/actions.
-MODIFIED: Removed MultiAgentReplayBuffer completely as per modification plan.
+Joint replay buffer implementation for shared network MADDPG.
+Stores concatenated multi-agent experiences for centralized training.
+
+Features:
+- Joint experience storage with concatenated observations/actions
+- Efficient numpy-based storage with torch tensor sampling
+- Circular buffer implementation for memory efficiency
+- Per-agent reward tracking with logical OR done signals
 """
 import numpy as np
 import torch
@@ -21,15 +26,15 @@ class JointReplayBuffer:
     """
     
     def __init__(self, capacity: int, total_obs_dim: int, total_action_dim: int, num_agents: int, device: torch.device):
-        self.capacity = int(capacity)
-        self.total_obs_dim = int(total_obs_dim)
-        self.total_action_dim = int(total_action_dim)
-        self.num_agents = int(num_agents)
-        self.device = device
+        self.capacity = int(capacity)  # Buffer capacity
+        self.total_obs_dim = int(total_obs_dim)  # Total observation dimension
+        self.total_action_dim = int(total_action_dim)  # Total action dimension
+        self.num_agents = int(num_agents)  # Number of agents
+        self.device = device  # PyTorch device
         
         # Circular buffer state
-        self.ptr = 0
-        self.size = 0
+        self.ptr = 0  # Current write pointer
+        self.size = 0  # Current buffer size
         
         # Storage arrays (numpy for memory efficiency)
         self.obs = np.zeros((capacity, total_obs_dim), dtype=np.float32)
@@ -42,16 +47,7 @@ class JointReplayBuffer:
 
     def add(self, obs_all: np.ndarray, act_all: np.ndarray, rewards_vec: np.ndarray, 
             next_obs_all: np.ndarray, done_any: bool) -> None:
-        """
-        Add joint experience to buffer.
-        
-        Args:
-            obs_all: Concatenated observations [total_obs_dim]
-            act_all: Concatenated actions [total_action_dim]
-            rewards_vec: Per-agent rewards [num_agents]
-            next_obs_all: Concatenated next observations [total_obs_dim]
-            done_any: Logical OR of agent done signals
-        """
+        """Add joint experience to buffer."""
         i = self.ptr
         self.obs[i] = obs_all
         self.act[i] = act_all
@@ -63,16 +59,7 @@ class JointReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """
-        Sample random batch from joint buffer.
-        
-        Returns:
-            obs_all: [batch_size, total_obs_dim]
-            act_all: [batch_size, total_action_dim]
-            rew_all: [batch_size, num_agents]
-            nobs_all: [batch_size, total_obs_dim]
-            done_any: [batch_size, 1]
-        """
+        """Sample random batch from joint buffer."""
         if self.size < batch_size:
             return None
             

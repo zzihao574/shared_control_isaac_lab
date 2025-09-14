@@ -1,9 +1,15 @@
 # surgical_direct_marl_env.py - Cleaned version with single evaluation chain
-# MODIFIED: Removed old RewardLogger/MilestoneManager dependencies
-# MODIFIED: Only do physics + rewards + optional console printing
-# MODIFIED: Configuration only from Trainer injection (no self-loading YAML)
-# MODIFIED: Added conditional console printing via injected StepTracer
-# MODIFIED: Removed __del__ and cleaned up old chain references
+"""
+Human-robot collaborative surgical MARL environment for shared networks.
+
+Features:
+- Multi-agent force control for surgical tasks
+- Physics-based constraint checking and collision detection
+- Four-zone reward system: Track/Surface/Danger/Rejoin
+- Unified global_step integration with trainer
+- Optional console logging via injected StepTracer
+- Configuration only from trainer injection (no self-loading)
+"""
 
 from __future__ import annotations
 
@@ -24,7 +30,6 @@ from .utils import CompleteConstraintChecker, TrajectoryManager
 class SurgicalDirectMARLEnv(DirectMARLEnv):
     """
     Human-robot collaborative surgical MARL environment for shared networks.
-    CLEANED VERSION: Only physics + rewards + optional console printing.
     
     Features:
     - Multi-agent force control for surgical tasks
@@ -41,44 +46,31 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Initialize surgical MARL environment for shared networks."""
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Core configuration setup
         self._setup_core_configuration()
-        
-        # Initialize state variables and caches
         self._initialize_state_variables()
-        
-        # Initialize utility managers
         self._initialize_components()
-        
-        # Setup gymnasium spaces
         self._setup_gymnasium_spaces()
         
-        # Unified global_step integration
+        # Unified global_step integration with trainer
         self._trainer_global_step = None
         
     def _setup_core_configuration(self) -> None:
-        """Setup core configuration - only from trainer injection."""
-        # Configuration must be injected by trainer - no self-loading fallback
+        """Setup core configuration from trainer injection only."""
         if not hasattr(self, "params") or not isinstance(getattr(self, "params", None), dict):
             print("[WARNING] No configuration injected by trainer, using minimal defaults")
             self.params = self._get_minimal_defaults()
             
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
-        # Load constraint parameters
         self._load_constraint_parameters()
-        
-        # Load safety parameters  
         self._load_safety_parameters()
-        
-        # Load termination conditions
         self._load_termination_parameters()
         
         print(f"[ENV] Episode length: {self.cfg.episode_length_s}s")
         print(f"[ENV] Environment configured for physics + rewards only")
     
     def _get_minimal_defaults(self) -> dict:
-        """Get minimal default configuration if none injected."""
+        """Provide minimal default configuration if none injected by trainer."""
         return {
             'constraints': {
                 'min_z_position': 0.0,
@@ -99,7 +91,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         }
     
     def _load_constraint_parameters(self) -> None:
-        """Load constraint-related parameters."""
+        """Load constraint-related parameters from configuration."""
         constraints = self.params['constraints']
         
         # Position and force limits
@@ -107,7 +99,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.max_robot_force = constraints['max_robot_force']
         self.max_human_force = constraints['max_human_force']
         
-        # Joint limits as tensors
+        # Joint limits as tensors for efficient constraint enforcement
         joint_limits = constraints['joint_limits']
         self.joint_lower_limits = torch.tensor([
             joint_limits['waist'][0], joint_limits['shoulder'][0], joint_limits['elbow'][0],
@@ -119,7 +111,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             joint_limits['yaw'][1], joint_limits['pitch'][1], joint_limits['roll'][1]
         ], device=self.device, dtype=torch.float32)
         
-        # Fixed end joints configuration
+        # Fixed end joints configuration for stable wrist orientation
         self.fixed_end_joints = torch.tensor([
             self.params['initial_conditions']['joint_positions']['yaw'],
             self.params['initial_conditions']['joint_positions']['pitch'],
@@ -139,36 +131,31 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _initialize_state_variables(self) -> None:
         """Initialize all state variables and caches."""
-        # Environment base positions
+        # Environment base positions for coordinate transformations
         self.env_base_positions = torch.zeros(self.num_envs, 3, device=self.device)
         
-        # Agent actions storage
+        # Agent actions storage for force application
         self.agent_actions = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
             for agent in self.cfg.possible_agents
         }
         
-        # Physics state (forces at time t)
         self._initialize_physics_state()
-        
-        # Observation cache (updated in _get_observations)
         self._initialize_observation_cache()
-        
-        # Reward system state caches
         self._initialize_reward_state_caches()
         
-        # Reward components cache
+        # Reward components cache for console logging
         self.reward_components = {}
         
-        # Body index for stylus/end-effector
+        # Body index for stylus/end-effector identification
         self.stylus_body_idx = None
     
     def _initialize_physics_state(self) -> None:
-        """Initialize physics interaction state."""
+        """Initialize physics interaction state variables."""
         self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
         
-        # Cache for actor network outputs (for debugging)
+        # Cache for actor network outputs (for debugging console display)
         self.actor_mean_forces = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
             for agent in self.cfg.possible_agents
@@ -179,7 +166,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         }
     
     def _initialize_observation_cache(self) -> None:
-        """Initialize observation caching variables."""
+        """Initialize observation caching variables for efficient updates."""
         self.stylus_pos_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.stylus_vel_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.safety_distances_t1 = torch.ones(self.num_envs, device=self.device) * 0.01
@@ -188,13 +175,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.constraint_results_t1 = None
 
     def _initialize_reward_state_caches(self) -> None:
-        """Initialize reward system state caches."""
-        # Progress/distance caches for delta calculations
+        """Initialize reward system state caches for delta calculations."""
+        # Progress/distance caches for reward delta calculations
         self.prev_safety_distances = torch.ones(self.num_envs, device=self.device) * 0.02
         self.prev_progress = torch.zeros(self.num_envs, device=self.device)
         self.best_progress = torch.zeros(self.num_envs, device=self.device)
         
-        # Rejoin zone stability gate
+        # Rejoin zone stability gate counter
         self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         
         # Goal point for rejoin zone calculations
@@ -202,7 +189,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _initialize_components(self) -> None:
         """Initialize utility managers and components."""
-        # Trajectory manager for path following
+        # Trajectory manager for path following and progress tracking
         self.trajectory_manager = TrajectoryManager(
             device=self.device,
             params=self.params,
@@ -210,19 +197,18 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             env_base_positions=self.env_base_positions
         )
         
-        # Initialize goal point
-        t = self.trajectory_manager.line_direction
+        # Initialize goal point for rejoin zone calculations
         self._goal_point = self.trajectory_manager.end_pos_local.to(self.device)
         print(f"[ENV] Goal point: {self._goal_point}")
         
-        # Constraint checker for collision detection
+        # Constraint checker for collision detection and safety analysis
         self.constraint_checker = CompleteConstraintChecker(
             device=self.device, 
             collision_threshold=self.collision_threshold
         )
     
     def _setup_gymnasium_spaces(self) -> None:
-        """Setup Gymnasium compatibility spaces."""
+        """Setup Gymnasium compatibility spaces for multi-agent interface."""
         import gymnasium as gym
         self.action_space = gym.spaces.Dict({
             agent: gym.spaces.Box(
@@ -241,21 +227,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         })
     
     def set_trainer_global_step(self, global_step: int) -> None:
-        """
-        Set the current global step from trainer for unified logging.
-        
-        Args:
-            global_step: Current global step from MADDPGTrainer (hand-maintained)
-        """
+        """Set the current global step from trainer for unified logging."""
         self._trainer_global_step = global_step
         
     def _setup_scene(self):
-        """Setup the simulation scene with robot and constraints."""
+        """Setup the simulation scene with robot and constraint objects."""
         # Initialize robot articulation
         self._omni_robot = Articulation(self.cfg.phantom_omni)
         self.scene.articulations["phantom_omni"] = self._omni_robot
         
-        # Initialize constraint object
+        # Initialize constraint object for collision detection
         self._constraint = RigidObject(self.cfg.constraint)
         self.scene.rigid_objects["constraint"] = self._constraint
         
@@ -265,19 +246,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         light_cfg.func("/World/Light", light_cfg)
         
     def _setup_post_scene_creation(self):
-        """Post-scene creation setup."""
+        """Post-scene creation setup and manager updates."""
         super()._setup_post_scene_creation()
         
-        # Initialize robot-specific configurations
         self._initialize_body_indices()
-
-        # Update managers with robot data
         self._update_managers_with_robot_data()
 
     def _update_managers_with_robot_data(self) -> None:
-        """Update managers with robot position data."""
+        """Update managers with robot position data after scene creation."""
         if hasattr(self, '_omni_robot'):
-            # Update environment base positions
+            # Update environment base positions for coordinate transformations
             self.env_base_positions = self._omni_robot.data.root_link_pos_w.clone()
             self.trajectory_manager.env_base_positions = self.env_base_positions
             
@@ -289,7 +267,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if not hasattr(self._omni_robot, 'body_names'):
             return
         
-        # Find stylus body - fail fast if not found
+        # Find stylus body in robot hierarchy
         target_name = "stylus"
         
         for i, name in enumerate(self._omni_robot.body_names):
@@ -298,14 +276,14 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 print(f"[ENV] Found stylus body: {name} (index {i})")
                 return
         
-        # Raise error if stylus not found
+        # Fail fast if stylus not found
         raise RuntimeError(f"stylus link not found in robot body names: {self._omni_robot.body_names}")
     
     # =========================================================================
-    # Weight accessor methods - simplified without try/except
+    # Weight accessor methods - simplified configuration access
     # =========================================================================
     
-    def _w(self, key: str, default: float = 0.0) -> float:
+    def _get_weight(self, key: str, default: float = 0.0) -> float:
         """Get weight from flat YAML structure with fallback."""
         return float(
             self.params.get('reward_parameters', {})
@@ -313,16 +291,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                        .get(key, default)
         )
 
-    def _zone_w(self, zone_letter: str, agent: str) -> float:
-        """Get zone weight."""
-        return self._w(f'zone{zone_letter}_weight_{agent}', 0.0)
+    def _get_zone_weight(self, zone_letter: str, agent: str) -> float:
+        """Get zone weight for specific agent."""
+        return self._get_weight(f'zone{zone_letter}_weight_{agent}', 0.0)
 
-    def _comp_w(self, zone_letter: str, comp: str, agent: str) -> float:
-        """Get component weight."""
-        return self._w(f'zone{zone_letter}_{comp}_{agent}', 0.0)
+    def _get_component_weight(self, zone_letter: str, comp: str, agent: str) -> float:
+        """Get component weight for specific zone and agent."""
+        return self._get_weight(f'zone{zone_letter}_{comp}_{agent}', 0.0)
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
-        """Pre-physics step processing."""
+        """Pre-physics step processing with action validation and force application."""
         # Extract actor detail info if available (passed from MADDPG)
         if hasattr(self, '_detail_actor_info') and self._detail_actor_info is not None:
             for agent in self.cfg.possible_agents:
@@ -331,12 +309,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 if agent in self._detail_actor_info['noise_actions']:
                     self.actor_noise_forces[agent] = self._detail_actor_info['noise_actions'][agent].clone()
         
-        # Process and validate actions with assertions
+        # Process and validate actions with force constraints
         for agent, action in actions.items():
             assert agent in self.cfg.possible_agents, f"Unknown agent: {agent}"
             assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
             
-            # Apply force constraints
+            # Apply force constraints based on agent type
             max_force = self.max_robot_force if agent == "robot" else self.max_human_force
             self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
         
@@ -344,25 +322,22 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.robot_forces_t = self.agent_actions["robot"]
         self.human_forces_t = self.agent_actions["human"]
         
-        # Apply external forces to end-effector
         self._apply_external_forces()
-        
-        # Enforce joint constraints
         self._enforce_joint_constraints()
     
     def set_detail_actor_info(self, detail_info: Dict[str, Any]) -> None:
-        """Set detail information from MADDPG actor outputs."""
+        """Set detail information from MADDPG actor outputs for console logging."""
         self._detail_actor_info = detail_info
         
     def _apply_external_forces(self) -> None:
-        """Apply external forces to the robot end-effector."""
+        """Apply external forces to the robot end-effector in world coordinates."""
         total_forces = self.robot_forces_t + self.human_forces_t
         stylus_quat = self._omni_robot.data.body_link_quat_w[:, self.stylus_body_idx, :]
         
-        # Transform forces to local frame
+        # Transform forces to local frame for proper force application
         forces_local = quat_rotate_inverse(stylus_quat, total_forces)
         
-        # Reshape for Isaac Lab API
+        # Reshape for Isaac Lab API requirements
         forces_with_body_dim = forces_local.unsqueeze(1)
         torques_with_body_dim = torch.zeros_like(forces_with_body_dim)
         
@@ -373,30 +348,35 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         
     def _enforce_joint_constraints(self) -> None:
-        """Enforce joint limits and fix end joints."""
+        """Enforce joint limits and fix end joints for stable operation."""
         joint_pos = self._omni_robot.data.joint_pos.clone()
         joint_vel = self._omni_robot.data.joint_vel.clone()
         
-        # Apply joint limits
+        # Apply joint limits to prevent mechanical damage
         joint_pos = torch.clamp(joint_pos, self.joint_lower_limits, self.joint_upper_limits)
         
-        # Fix end joints (wrist orientation)
+        # Fix end joints (wrist orientation) for stable task execution
         joint_pos[:, 3:6] = self.fixed_end_joints.unsqueeze(0).expand(self.num_envs, -1)
         joint_vel[:, 3:6] = 0.0
         
         self._omni_robot.write_joint_state_to_sim(joint_pos, joint_vel)
         
     def _apply_action(self) -> None:
-        """Apply actions to simulation."""
+        """Apply actions to simulation - required by Isaac Lab interface."""
         self._omni_robot.write_data_to_sim()
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """Compute observations for all agents and update state cache."""
-        # Update state cache
+        """
+        Compute observations for all agents and update state cache.
+        
+        Returns:
+            Dictionary mapping agent_id to observation tensor [num_envs, obs_dim]
+        """
+        # Update state cache with current physics state
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
         
-        # Update constraint state
+        # Update constraint state for collision detection
         current_base_positions = self._omni_robot.data.root_link_pos_w.clone()
         self.constraint_results_t1 = self.constraint_checker.analyze_constraint_state_batch(
             self.stylus_pos_t1, current_base_positions
@@ -405,7 +385,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
         self.normal_t1 = self.constraint_results_t1['normal_vectors']
 
-        # Ensure constraint distances have correct shape
+        # Ensure constraint distances have correct shape for concatenation
         constraint_distances = self.safety_distances_t1.unsqueeze(-1)  # [num_envs, 1]
 
         # Concatenate observation components (7 dimensions total)
@@ -415,12 +395,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             constraint_distances,     # Distance measurements (1)
         ], dim=-1)                    # Total: 7 dimensions
         
-        # Update reward state caches
+        # Update reward state caches for delta calculations
         s_t = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         self.prev_safety_distances = self.safety_distances_t1.detach().clone()
         self.prev_progress = s_t.detach().clone()
         
-        # Create observation dictionary for each agent
+        # Create observation dictionary for each agent (shared observations)
         observations = {}
         for agent in self.cfg.possible_agents:
             observations[agent] = obs
@@ -428,20 +408,25 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return observations
 
     # =========================================================================
-    # FOUR-ZONE REWARD SYSTEM (unchanged from original)
+    # FOUR-ZONE REWARD SYSTEM - Core reward calculation logic
     # =========================================================================
 
     def _build_zone_masks(self):
-        """Build zone masks and alpha mixing coefficient."""
+        """
+        Build zone masks and alpha mixing coefficient for four-zone reward system.
+        
+        Returns:
+            Tuple of (outside, surface, danger, rejoin, alpha) masks
+        """
         D, O = 0.0075, 0.015  # Danger threshold, Obstacle boundary
         d = self.safety_distances_t1
         
-        # Basic zone masks
+        # Basic zone masks based on safety distance
         surface = (d > D) & (d < O)
         outside = (d >= O) 
         danger = (d <= D)
         
-        # Rejoin zone geometric conditions
+        # Rejoin zone geometric conditions for trajectory recovery
         t = self.trajectory_manager.line_direction
         if self._goal_point is not None:
             goal_vec = self._goal_point.unsqueeze(0) - self.stylus_pos_t1
@@ -454,7 +439,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         oppose_norm = (self.normal_t1 * t.unsqueeze(0)).sum(dim=-1) <= -c2
         rejoin_geom = surface & align_goal & oppose_norm
         
-        # 10-step stability gate
+        # 10-step stability gate for rejoin zone activation
         self.rejoin_streak = torch.where(
             rejoin_geom, 
             self.rejoin_streak + 1, 
@@ -462,16 +447,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         rejoin = self.rejoin_streak >= 10
         
-        # Alpha mixing coefficient
+        # Alpha mixing coefficient for smooth zone transitions
         alpha = ((d - D) / (O - D)).clamp(0.0, 1.0)
         
         return outside, surface, danger, rejoin, alpha
 
     def _zone_A_reward(self, masks, agent: str):
-        """Zone A (Track): Outside obstacle boundary - Inline calculations."""
+        """Zone A (Track): Outside obstacle boundary - Progress and deviation rewards."""
         outside, surface, danger, rejoin, alpha = masks
         
-        # Simplified progress: Binary penalty system
+        # Progress reward with binary penalty system
         T = 1200.0
         p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
         best_p_tm1 = self.best_progress.clone()
@@ -480,17 +465,17 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         reward_forward = torch.clamp(delta_p * T, min=0.0, max=0.1)
         prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
         
-        # Update historical best progress
+        # Update historical best progress for monotonic improvement
         self.best_progress = torch.maximum(best_p_tm1, p_t)
         
-        # Linear deviation penalty
+        # Linear deviation penalty from desired trajectory
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         dev_raw = -torch.clamp(deviations * 0.5, min=0.0, max=0.1)
         
-        # Zone A combination
-        wp = self._comp_w('A', 'progress', agent)
-        wd = self._comp_w('A', 'deviation', agent)
-        zw = self._zone_w('A', agent)
+        # Zone A combination with configurable weights
+        wp = self._get_component_weight('A', 'progress', agent)
+        wd = self._get_component_weight('A', 'deviation', agent)
+        zw = self._get_zone_weight('A', agent)
 
         prog_contrib = wp * prog_raw
         dev_contrib = wd * dev_raw
@@ -513,15 +498,15 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return out
 
     def _zone_B_reward(self, masks, agent: str):
-        """Zone B (Surface): Near obstacle - Inline calculations."""
+        """Zone B (Surface): Near obstacle - Gap optimization and surface following."""
         outside, surface, danger, rejoin, alpha = masks
         
-        # Gap calculation
+        # Gap reward for maintaining optimal distance from constraint
         beta = 8.0e4
         d = self.safety_distances_t1
         gap_raw = -beta * (d - 0.010) ** 2
         
-        # Surface tangent calculation
+        # Surface tangent reward for following constraint boundary
         gamma = 10.0
         t = self.trajectory_manager.line_direction
         n = self.normal_t1
@@ -533,16 +518,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         v_surf = (self.stylus_vel_t1 * t_surf).sum(dim=-1)
         surf_raw = gamma * v_surf
         
-        # Unified inward calculation (penalize moving toward obstacle)
+        # Unified inward penalty (penalize moving toward obstacle)
         lam = 30.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
         inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
         
-        # Zone B combination
-        wg = self._comp_w('B', 'gap', agent)
-        ws = self._comp_w('B', 'surftangent', agent)
-        wi = self._comp_w('B', 'inward', agent)
-        zw = self._zone_w('B', agent)
+        # Zone B combination with configurable weights
+        wg = self._get_component_weight('B', 'gap', agent)
+        ws = self._get_component_weight('B', 'surftangent', agent)
+        wi = self._get_component_weight('B', 'inward', agent)
+        zw = self._get_zone_weight('B', agent)
         
         gap_contrib = wg * gap_raw
         surf_contrib = ws * surf_raw
@@ -570,22 +555,22 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return out
 
     def _zone_C_reward(self, masks, agent: str):
-        """Zone C (Danger): Inside obstacle - Inline calculations."""
+        """Zone C (Danger): Inside obstacle - Heavy penalties for collision."""
         outside, surface, danger, rejoin, alpha = masks
         
-        # Off-penalty calculation
+        # Off-penalty for being inside constraint (safety violation)
         R_off = -0.6
         offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
         
-        # Unified inward calculation (penalize moving toward obstacle)
+        # Unified inward penalty (penalize moving toward obstacle)
         lam = 30.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
         inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
         
-        # Zone C combination
-        wo = self._comp_w('C', 'offpen', agent)
-        wi = self._comp_w('C', 'inward', agent)
-        zw = self._zone_w('C', agent)
+        # Zone C combination with configurable weights
+        wo = self._get_component_weight('C', 'offpen', agent)
+        wi = self._get_component_weight('C', 'inward', agent)
+        zw = self._get_zone_weight('C', agent)
         
         offpen_contrib = wo * offpen_raw
         inward_contrib = wi * inward_raw
@@ -608,10 +593,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return out
 
     def _zone_D_reward(self, masks, agent: str):
-        """Zone D (Rejoin): Simplified - Progress + Deviation + Inward only."""
+        """Zone D (Rejoin): Trajectory recovery - Progress + Deviation + Outward movement."""
         outside, surface, danger, rejoin, alpha = masks
 
-        # Simplified progress: Binary penalty system
+        # Enhanced progress reward for trajectory recovery
         T = 1200.0
         p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
         best_p_tm1 = self.best_progress.clone()
@@ -621,11 +606,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -2.0))
         self.best_progress = torch.maximum(best_p_tm1, p_t)
 
-        # Deviation (same as Zone A)
+        # Enhanced deviation penalty for trajectory recovery
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         dev_raw = -torch.clamp(deviations * 50.0, min=0.0, max=4.0)
 
-        # Inward (Zone D: reward moving away, penalize moving toward)
+        # Inward movement handling (reward moving away, penalize moving toward)
         lam = 30.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
         inward_raw = torch.where(
@@ -634,10 +619,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             lam * (-v_dot_n)     # Moving away from obstacle, reward
         )
 
-        wp = self._comp_w('D', 'progress', agent)
-        wd = self._comp_w('D', 'deviation', agent)
-        wi = self._comp_w('D', 'inward', agent)
-        zw = self._zone_w('D', agent)
+        wp = self._get_component_weight('D', 'progress', agent)
+        wd = self._get_component_weight('D', 'deviation', agent)
+        wi = self._get_component_weight('D', 'inward', agent)
+        zw = self._get_zone_weight('D', agent)
 
         prog_contrib = wp * prog_raw
         dev_contrib  = wd * dev_raw
@@ -647,7 +632,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         out = torch.zeros_like(prog_raw)
         out[rejoin] = zone_total[rejoin]
 
-        # Console detail
+        # Store for console display
         RC, device = self.reward_components, prog_raw.device
         RC[f'zoneD_weight_{agent}'] = torch.tensor(zw, device=device)
         RC[f'zoneD_total_{agent}'] = zone_total
@@ -664,61 +649,61 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return out
 
     # =========================================================================
-    # Global reward functions with three-piece structure
+    # Global reward functions - Task-level objectives
     # =========================================================================
 
     def _globals_for_agent(self, agent: str):
         """Calculate global rewards for agent with three-piece structure."""
         RC, dev = self.reward_components, self.device
 
-        # Z penalty
+        # Z position penalty for safety constraint
         z_raw = self._calculate_z_penalty()
-        zw = self._w(f'zpenalty_{agent}', 0.0)
+        zw = self._get_weight(f'zpenalty_{agent}', 0.0)
         RC[f'global_zpenalty_{agent}_raw'] = z_raw
         RC[f'global_zpenalty_{agent}_weight'] = torch.tensor(zw, device=dev)
         RC[f'global_zpenalty_{agent}_contrib'] = z_raw * zw
 
-        # completion
+        # Task completion reward
         c_raw = self._calculate_completion_reward()
-        cw = self._w(f'completion_{agent}', 0.0)
+        cw = self._get_weight(f'completion_{agent}', 0.0)
         RC[f'global_completion_{agent}_raw'] = c_raw
         RC[f'global_completion_{agent}_weight'] = torch.tensor(cw, device=dev)
         RC[f'global_completion_{agent}_contrib'] = c_raw * cw
 
-        # time efficiency
+        # Time efficiency reward
         t_raw = self._calculate_time_efficiency_reward()
-        tw = self._w(f'timeeff_{agent}', 0.0)
+        tw = self._get_weight(f'timeeff_{agent}', 0.0)
         RC[f'global_timeeff_{agent}_raw'] = t_raw
         RC[f'global_timeeff_{agent}_weight'] = torch.tensor(tw, device=dev)
         RC[f'global_timeeff_{agent}_contrib'] = t_raw * tw
 
-        # own force
+        # Own force efficiency penalty
         f_raw = self._calculate_force_penalties()[agent]
-        fw = self._w(f'forceeff_{agent}', 0.0)
+        fw = self._get_weight(f'forceeff_{agent}', 0.0)
         RC[f'{agent}force_raw'] = f_raw
         RC[f'{agent}force_weight'] = torch.tensor(fw, device=dev)
         RC[f'{agent}force_contrib'] = f_raw * fw
 
-        # awareness (other agent)
+        # Cross-agent awareness reward
         other = 'human' if agent == 'robot' else 'robot'
         aw_key = 'humanaware_robot' if agent == 'robot' else 'robotaware_human'
         aw_raw = self._calculate_force_penalties()[other]
-        aw_w = self._w(aw_key, 0.0)
+        aw_w = self._get_weight(aw_key, 0.0)
         label = 'humanaware' if agent == 'robot' else 'robotaware'
         RC[f'{label}_raw'] = aw_raw
         RC[f'{label}_weight'] = torch.tensor(aw_w, device=dev)
         RC[f'{label}_contrib'] = aw_raw * aw_w
 
-    # =========================================================================
-    # Isaac Lab required method name: _get_rewards (CANNOT be changed)
-    # =========================================================================
-
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
-        """Four-zone reward system with robot/human symmetric rewards (Isaac Lab required method)."""
+        """
+        Four-zone reward system with robot/human symmetric rewards.
+        Isaac Lab required method - cannot be renamed.
+        """
         self.reward_components = {}  # Reset each step
         masks = self._build_zone_masks()
 
         def _agent_zone_sum(agent: str):
+            """Calculate total zone rewards for specific agent."""
             ZA = self._zone_A_reward(masks, agent)
             ZB = self._zone_B_reward(masks, agent)
             ZC = self._zone_C_reward(masks, agent)
@@ -732,6 +717,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._globals_for_agent('human')
 
         def _agent_total(agent: str):
+            """Calculate total reward including zones and globals for agent."""
             RC = self.reward_components
             globals_sum = (
                 RC[f'global_zpenalty_{agent}_contrib'] +
@@ -744,7 +730,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
         rewards = {'robot': _agent_total('robot'), 'human': _agent_total('human')}
 
-        # UNIFIED KEYS: Public indicators for console logging with consistent naming
+        # Add unified keys for console logging consistency
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         distance_to_final = torch.norm(
@@ -752,7 +738,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         completion_reward = self._calculate_completion_reward()
         
-        # Add unified keys for console logging consistency
         self.reward_components.update({
             'deviation': deviations,
             'progress_ratio': progress_ratio,
@@ -761,14 +746,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             'min_safety_distance': self.safety_distances_t1,
         })
         
-        # Ensure all required keys exist with default values if missing
+        # Ensure all required keys exist with default values
         default_keys = ['deviation', 'progress_ratio', 'min_safety_distance', 'completion_reward']
         for key in default_keys:
             if key not in self.reward_components:
                 self.reward_components[key] = torch.zeros(self.num_envs, device=self.device)
 
-        # === OPTIONAL CONSOLE LOGGING via injected StepTracer ===
-        # Only print if trainer injected a step_tracer
+        # Optional console logging via injected StepTracer
         if hasattr(self, "step_tracer") and self.step_tracer is not None:
             current_step = self._trainer_global_step if self._trainer_global_step is not None else 0
             self.step_tracer.maybe_print_step(self, rewards, current_step)
@@ -776,18 +760,18 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return rewards
 
     # =========================================================================
-    # PRESERVED GLOBAL REWARD FUNCTIONS (unchanged)
+    # Global reward calculation functions
     # =========================================================================
 
     def _calculate_force_penalties(self) -> Dict[str, torch.Tensor]:
-        """Calculate force efficiency penalties - shared across all phases."""
+        """Calculate force efficiency penalties for both agents."""
         return {
             'robot': -50.0 * torch.norm(self.robot_forces_t, dim=-1),
             'human': -50.0 * torch.norm(self.human_forces_t, dim=-1)
         }
 
     def _calculate_z_penalty(self) -> torch.Tensor:
-        """Calculate Z-axis constraint penalty - shared across all phases."""
+        """Calculate Z-axis constraint penalty for safety."""
         return torch.where(
             self.stylus_pos_t1[:, 2] < 0.0,
             -500.0 * torch.abs(self.stylus_pos_t1[:, 2]),
@@ -795,7 +779,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
 
     def _calculate_completion_reward(self) -> torch.Tensor:
-        """Calculate task completion reward using unified threshold - shared across all phases."""
+        """Calculate task completion reward using unified threshold."""
         is_final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         return torch.where(
             is_final_reached,
@@ -804,31 +788,31 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
 
     def _calculate_time_efficiency_reward(self) -> torch.Tensor:
-        """Calculate time efficiency reward using episode step tracking."""
+        """Calculate time efficiency reward based on episode progress."""
         max_steps = 1200  # 20s * 60fps = 1200 steps per episode
         
-        # Use environment's own step counter
+        # Use environment's episode step counter
         current_steps = self.episode_length_buf.to(self.device).float()
         
-        # Time efficiency: higher reward for completing tasks faster
+        # Higher reward for completing tasks faster
         time_efficiency = (max_steps - current_steps) / max_steps
         time_efficiency = torch.clamp(time_efficiency, min=0.0, max=1.0)
 
-        return time_efficiency * 3.0  # Scale time efficiency reward
+        return time_efficiency * 3.0
 
     # =========================================================================
-    # SIMPLIFIED METHODS (removed complex progress management)
+    # Episode management and termination
     # =========================================================================
 
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Determine termination and truncation conditions."""
+        """Determine termination and truncation conditions for all agents."""
         
-        # Z-axis termination (safety)
+        # Z-axis termination for safety
         z_below_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.enable_z_termination:
             z_below_zero = self.stylus_pos_t1[:, 2] < self.min_z_pos
         
-        # Edge collision termination (safety)
+        # Edge collision termination for safety
         edge_collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.enable_edge_termination:
             edge_collision = self.safety_distances_t1 <= self.safety_distance_threshold
@@ -839,7 +823,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Combine termination conditions
         terminated_condition = z_below_zero | edge_collision | final_reached
 
-        # Time truncation - Isaac Lab manages episode_length_buf per environment
+        # Time truncation managed by Isaac Lab
         truncated_condition = self.episode_length_buf >= self.max_episode_length - 1
         
         terminated = {agent: terminated_condition for agent in self.cfg.possible_agents}
@@ -848,11 +832,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return terminated, truncated
         
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments with simplified logic."""
+        """Reset specified environments with stable initial configuration."""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
 
-        # SIMPLIFIED: Basic reset without complex progress management
         super()._reset_idx(env_ids)
         
         if self.stylus_body_idx is None:
@@ -860,7 +843,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         num_resets = len(env_ids)
         
-        # Use stable initial configuration
+        # Use stable initial joint configuration
         joint_pos = torch.zeros((num_resets, 6), device=self.device)
         joint_pos[:, 0] = -0.96    # waist
         joint_pos[:, 1] = 0.0      # shoulder
@@ -873,7 +856,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self._omni_robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         
-        # Reset state variables
+        # Reset state variables for specified environments
         for agent in self.cfg.possible_agents:
             self.agent_actions[agent][env_ids] = 0.0
         
@@ -883,7 +866,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.is_violating_t1[env_ids] = False
         self.normal_t1[env_ids] = torch.zeros((num_resets, 3), device=self.device)
 
-        # Reset simplified reward state caches
+        # Reset reward state caches
         self.prev_safety_distances[env_ids] = 0.02
         self.prev_progress[env_ids] = 0.0
         self.best_progress[env_ids] = 0.0
@@ -893,6 +876,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         for agent in self.cfg.possible_agents:
             self.actor_mean_forces[agent][env_ids] = 0.0
             self.actor_noise_forces[agent][env_ids] = 0.0
+
+    # =========================================================================
+    # Utility methods for state access
+    # =========================================================================
 
     def _get_stylus_position(self) -> torch.Tensor:
         """Get stylus position relative to robot base."""
@@ -911,7 +898,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
     
     def get_constraint_state(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """Get constraint state information."""
+        """Get constraint state information for specified environments."""
         if self.constraint_results_t1 is None:
             return {}
         
@@ -927,7 +914,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         }
     
     def get_reward_details(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """Get detailed reward component information."""
+        """Get detailed reward component information for analysis."""
         if not self.reward_components:
             return {}
         

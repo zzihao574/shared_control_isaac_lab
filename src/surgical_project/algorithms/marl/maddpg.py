@@ -1,19 +1,13 @@
 """
 Multi-environment parallel MADDPG algorithm with shared network architecture.
-FINAL VERSION: Complete implementation per document specifications.
-MODIFIED: Updated statistics keys to match new WHITELIST structure
-MODIFIED: Simplified _get_actual_env method
-MODIFIED: Updated interface calls (debug -> detail)
-MODIFIED: Added noise_scale parameter for global noise scheduling
+Enhanced with per-agent metrics and target Q-value statistics.
 
-Key Features:
+Features:
 - Single shared network per agent (not per environment)
 - Joint replay buffer with concatenated observations/actions
-- CTDE: Centralized training with joint state-action space
-- Decentralized execution with individual agent policies
+- CTDE: Centralized training with decentralized execution
 - Gradient norm monitoring for training stability
-- Enhanced detail information collection
-- New statistics key structure aligned with train/, model/ prefixes
+- Enhanced per-agent metrics with target Q-value tracking
 - Global noise scaling for exploration schedule
 """
 
@@ -32,12 +26,12 @@ class MADDPG:
     - self.agents[agent_id] = One shared network per agent type
     - 512 parallel environments share these networks
     - Joint replay buffer stores (obs_all, act_all, rewards_vec, next_obs_all, done_any)
-    - Training progress driven by global episode count (sum of all environment completions)
+    - Training progress driven by global episode count
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
         self.env = env
-        self.actual_env = self._get_actual_env(env)
+        self.actual_env = self._unwrap_environment(env)
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
@@ -49,8 +43,8 @@ class MADDPG:
         # Get dimensions from environment cfg
         self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
         self.action_dims = [self.actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
-        self.total_obs_dim = sum(self.obs_dims)
-        self.total_action_dim = sum(self.action_dims)
+        self.total_obs_dim = sum(self.obs_dims)  # Total observation dimension
+        self.total_action_dim = sum(self.action_dims)  # Total action dimension
 
         print(f"[MADDPG] Shared Network Architecture:")
         print(f"  Environments: {self.num_envs}")
@@ -71,20 +65,20 @@ class MADDPG:
         self.update_interval = int(maddpg_cfg.get('update_interval', 100))
         self.min_buffer_size = int(maddpg_cfg.get('min_buffer_size', 4096))
         
-        self.training_steps = 0
-        self.update_count = 0
+        self.training_steps = 0  # Total training steps
+        self.update_count = 0  # Update count
         
         print(f"[MADDPG] Shared network initialization complete")
         print(f"  Batch size: {self.batch_size}")
         print(f"  Update interval: {self.update_interval}")
         print(f"  Min buffer size: {self.min_buffer_size}")
     
-    def _get_actual_env(self, env):
-        """Get actual environment object - simplified single line implementation."""
+    def _unwrap_environment(self, env):
+        """Get actual environment object."""
         return getattr(env, 'unwrapped', env)
         
     def _initialize_agents(self) -> None:
-        """Initialize shared DDPG agents (one per agent type, not per environment)."""
+        """Initialize shared DDPG agents (one per agent type)."""
         self.agents = {}
         for i, agent_id in enumerate(self.agent_ids):
             self.agents[agent_id] = DDPGAgent(
@@ -114,9 +108,8 @@ class MADDPG:
     
     def _build_slices(self) -> None:
         """Build slicing indices for concatenated observations and actions."""
-        # Build slices for Σobs / Σact (MUST match agent_ids order exactly)
-        self.obs_slices = []
-        self.act_slices = []
+        self.obs_slices = []  # Observation slices for each agent
+        self.act_slices = []  # Action slices for each agent
         
         obs_offset = 0
         act_offset = 0
@@ -132,7 +125,7 @@ class MADDPG:
 
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """
-        Select actions using shared networks with batch processing and global noise scaling.
+        Select actions using shared networks with global noise scaling.
         
         Args:
             observations: {agent_id: Tensor[num_envs, obs_dim]}
@@ -144,7 +137,7 @@ class MADDPG:
             detail: Detail information for console display
         """
         actions = {}
-        detail = {"mean_actions": {}, "noise_actions": {}}
+        detail = {"mean_actions": {}, "noise_actions": {}}  # Debug information
         
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
@@ -167,7 +160,7 @@ class MADDPG:
         
         return actions, detail
 
-    def store_joint_transitions(self, obs, actions, rewards, next_obs, dones):
+    def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones):
         """
         Store transitions in joint replay buffer.
         
@@ -205,9 +198,9 @@ class MADDPG:
     def update(self) -> Dict[str, Any]:
         """
         CTDE update: Centralized Training, Decentralized Execution.
-        MODIFIED: Return statistics with new key structure matching WHITELIST
+        Enhanced with per-agent metrics and target Q-value statistics.
         
-        - Critics see global state-action space (Σobs, Σact)
+        - Critics see global state-action space (∑obs, ∑act)
         - Actors update with respect to their own actions only
         - Other agents' actions are detached from gradient flow
         """
@@ -225,17 +218,18 @@ class MADDPG:
             return {}
 
         obs_all, act_all, rew_all, nobs_all, done_any = batch
-        # obs_all: [B, Σobs], act_all: [B, Σact], rew_all: [B, N], nobs_all: [B, Σobs], done_any: [B, 1]
+        # obs_all: [B, ∑obs], act_all: [B, ∑act], rew_all: [B, N], nobs_all: [B, ∑obs], done_any: [B, 1]
         
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 
-        # New statistics structure matching WHITELIST
+        # Enhanced statistics structure with per-agent metrics
         stats = {
             "loss/actor": {}, "loss/critic": {}, "q_mean": {}, "q_std": {},
-            "grad_norm/actor": {}, "grad_norm/critic": {}, "action_std": {}
+            "q_target_mean": {}, "q_target_std": {},  # New: Target Q statistics
+            "grad_norm/actor": {}, "grad_norm/critic": {}
         }
 
-        # Compute target actions using target actors (deterministic: use mean)
+        # Compute target actions using target actors
         next_action_parts = []
         for i, agent_id in enumerate(self.agent_ids):
             slice_i = self.obs_slices[i]
@@ -248,7 +242,7 @@ class MADDPG:
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
 
-            # ----- Critic Update -----
+            # Critic Update with enhanced statistics
             with torch.no_grad():
                 q_next = agent.critic_target(nobs_all, next_act_all).squeeze(-1)  # [B]
                 y = rew_all[:, i] + (1.0 - done_any.squeeze(-1)) * gamma * q_next  # [B]
@@ -262,19 +256,20 @@ class MADDPG:
             torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), max_norm=1.0)
             agent.critic_optimizer.step()
 
+            # Store enhanced statistics including target Q values
             stats["loss/critic"][agent_id] = float(critic_loss.detach().cpu().item())
             stats["q_mean"][agent_id] = float(q.detach().cpu().mean().item())
             stats["q_std"][agent_id] = float(q.detach().cpu().std().item())
+            stats["q_target_mean"][agent_id] = float(y.detach().cpu().mean().item())
+            stats["q_target_std"][agent_id] = float(y.detach().cpu().std().item())
             stats["grad_norm/critic"][agent_id] = float(c_grad_norm)
 
-            # ----- Actor Update (CTDE: only own action has gradient) -----
+            # Actor Update (CTDE: only own action has gradient)
             action_parts = []
-            action_std_val = None
             for j, agent_j in enumerate(self.agent_ids):
                 slice_j = self.obs_slices[j]
                 if j == i:  # Current agent: needs gradient
-                    action_j, std_j = self.agents[agent_j].actor(obs_all[:, slice_j])
-                    action_std_val = float(std_j.detach().mean().item())
+                    action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
                 else:  # Other agents: detach gradients
                     with torch.no_grad():
                         action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
@@ -290,23 +285,19 @@ class MADDPG:
             torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), max_norm=1.0)
             agent.actor_optimizer.step()
 
+            # Soft target network updates
             agent.soft_update()
 
+            # Store actor statistics
             stats["loss/actor"][agent_id] = float(actor_loss.detach().cpu().item())
             stats["grad_norm/actor"][agent_id] = float(a_grad_norm)
-            if action_std_val is not None:
-                stats["action_std"][agent_id] = action_std_val
 
         # Aggregate statistics with averages
-        for k in ["loss/critic", "loss/actor", "q_mean", "q_std", "grad_norm/actor", "grad_norm/critic"]:
+        for k in ["loss/critic", "loss/actor", "q_mean", "q_std", "q_target_mean", "q_target_std", "grad_norm/actor", "grad_norm/critic"]:
             if stats[k]:
                 stats[f"{k}/avg"] = float(np.mean(list(stats[k].values())))
-        
-        if len(stats["action_std"]) > 0:
-            stats["action_std/avg"] = float(np.mean(list(stats["action_std"].values())))
 
         self.update_count += 1
-        # Use new key structure - this will be mapped by train_maddpg.py
         stats["training/updates"] = int(self.update_count)
 
         return stats

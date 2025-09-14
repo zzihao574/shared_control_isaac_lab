@@ -5,7 +5,7 @@ Training helper utilities for MADDPG multi-environment parallel training.
 Enhanced version with configurable network architecture and exponential noise decay support.
 
 Features:
-- TrainingRunner: Unified training loop execution with noise scheduling (no old reward_logger dependency)
+- TrainingRunner: Unified training loop execution with noise scheduling
 - MilestoneEvaluator: Milestone evaluation and TopK model management  
 - MetricsHub: Unified data pipeline for logging
 - Configurable network support and intelligent noise scheduling
@@ -34,8 +34,7 @@ except ImportError:
 
 class TrainingRunner:
     """
-    Unified training loop executor: rollout→replay→update→log→count with noise scheduling.
-    MODIFIED: Removed dependency on reward_logger (can be None)
+    Unified training loop executor with noise scheduling and metrics collection.
     
     Features:
     - Exponential noise decay scheduling (fast early, slow later)
@@ -51,10 +50,10 @@ class TrainingRunner:
         self.metrics = metrics_hub
         self.reward_logger = reward_logger  # Can be None now
         self.agent_ids = agent_ids
-        self.global_step = 0
-        self.global_episodes = 0
-        self._skip_episode_once = False
-        self._current_obs = None
+        self.global_step = 0  # Current training step
+        self.global_episodes = 0  # Total episodes completed
+        self._skip_episode_once = False  # Flag to skip episode counting once
+        self._current_obs = None  # Current observations cache
         
         # Load exploration parameters for noise scheduling
         expl = self.maddpg.params.get("exploration", {})
@@ -71,47 +70,42 @@ class TrainingRunner:
         print(f"  Max steps: {self.max_global_steps}")
 
     def _calculate_noise_scale(self) -> float:
-        """Calculate current noise scaling factor (exponential decay: fast early, slow later)."""
+        """Calculate current noise scaling factor using exponential decay."""
         if self.max_global_steps <= 0:
             return self.sigma_start
             
-        # ratio ∈ [0,1]
         ratio = min(1.0, float(self.global_step) / float(max(1, self.max_global_steps)))
-        
-        # Exponential decay: noise_scale = sigma_end + (sigma_start - sigma_end) * exp(-k * ratio)
         noise_scale = self.sigma_end + (self.sigma_start - self.sigma_end) * math.exp(-self.decay_k * ratio)
         
         return noise_scale
 
-    def run_step(self):
-        """Execute one training step with noise scheduling."""
+    def execute_training_step(self):
+        """Execute one training step with noise scheduling and metrics collection."""
         # Use current observations
         current_obs = self._current_obs
         if current_obs is None:
-            # Prioritize environment's real-time observation function; reset if none
             if hasattr(self.env, "_get_observations"):
                 current_obs = self.env._get_observations()
             else:
                 current_obs, _ = self.env.reset()
             self._current_obs = current_obs
             
-        # 1) Calculate noise scaling factor
+        # Calculate noise scaling factor
         noise_scale = self._calculate_noise_scale()
         
-        # 2) Select actions (with noise, training mode, using global noise scheduling)
+        # Select actions with noise and global noise scheduling
         actions, detail = self.maddpg.select_actions(current_obs, add_noise=True, noise_scale=noise_scale)
 
-        # 3) Let environment record actor detail info
+        # Let environment record actor detail info
         self.env.unwrapped.set_detail_actor_info(detail)
 
-        # 4) Environment interaction
+        # Environment interaction
         next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-        # 5) Store joint transitions
+        # Store joint transitions
         done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
-
         
-        self.maddpg.store_joint_transitions(
+        self.maddpg.add_experience_to_buffer(
             obs=current_obs,
             actions=actions,
             rewards=rewards,
@@ -119,10 +113,10 @@ class TrainingRunner:
             dones=done_any_dict
         )
 
-        # 6) Update networks
+        # Update networks
         stats = self.maddpg.update()
 
-        # 7) Count episodes (OR aggregation)
+        # Count episodes using OR aggregation
         done_any = None
         for aid in self.agent_ids:
             d = done_any_dict[aid].to(torch.bool)
@@ -134,51 +128,48 @@ class TrainingRunner:
             self._skip_episode_once = False
         self.global_episodes += episode_increment
 
-        # 8) Unified logging with noise scheduling information
+        # Unified logging with noise scheduling information
         if stats and stats.get("training/updates", 0) > 0:
             payload = {
                 "train/actor_loss": stats.get("loss/actor/avg"),
                 "train/critic_loss": stats.get("loss/critic/avg"),
                 "model/q_mean": stats.get("q_mean/avg"),
                 "model/q_std": stats.get("q_std/avg"),
-                "model/td_error_mean": stats.get("model/td_error_mean"),
-                "model/td_rmse": stats.get("model/td_rmse"),
                 "replay/buffer_size": len(self.maddpg.replay) if hasattr(self.maddpg, "replay") else None,
                 "train/episodes_done": self.global_episodes,
                 "train/updates": stats.get("training/updates"),
                 "exploration/noise_scale": noise_scale,
-                "exploration/sigma_ratio": noise_scale / self.sigma_start if self.sigma_start > 0 else 0,
             }
             # Clean None values
             payload = {k: v for k, v in payload.items() if v is not None}
             self.metrics.push_update(self.global_step, payload)
 
-        # 9) Step counting + env synchronization
+        # Step counting and environment synchronization
         self.global_step += 1
         actual_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(actual_env, "set_trainer_global_step"):
             actual_env.set_trainer_global_step(self.global_step)
 
-        # 10) Update current observations for next round
+        # Update current observations for next round
         self._current_obs = next_obs
 
         return next_obs
 
     def mark_skip_episode_once(self):
-        """Mark to skip episode counting once (for milestone evaluation)."""
+        """Mark to skip episode counting once for milestone evaluation."""
         self._skip_episode_once = True
 
     def run_until(self, max_global_steps: int):
-        """Run until reaching maximum steps."""
+        """Run training until reaching maximum steps."""
         obs, _ = self.env.reset()
         self._current_obs = obs
         while self.global_step < max_global_steps:
-            self.run_step()
+            self.execute_training_step()
 
 
 class MilestoneEvaluator:
     """
-    Milestone evaluator: triggers evaluation→TopK→logging→return skip flag.
+    Milestone evaluator with single environment evaluation and TopK model management.
     
     Features:
     - Single environment evaluation for efficiency
@@ -194,20 +185,20 @@ class MilestoneEvaluator:
         self.log_dir = log_dir
         self.agent_ids = agent_ids
 
-    def handle(self, milestone: int, global_step: int) -> dict:
-        """Handle milestone trigger."""
-        # 1) In-place evaluation
-        avg_return, num_eps = self._evaluate_env0_once()
+    def run_evaluation(self, milestone: int, global_step: int) -> dict:
+        """Handle milestone evaluation and model saving."""
+        # In-place evaluation
+        avg_return, num_eps = self._run_single_evaluation_episode()
 
-        # 2) Extract model weights
+        # Extract model weights
         model_state = self._extract_model_state()
 
-        # 3) Update TopK and save
+        # Update TopK and save
         self.topk.update(avg_return, model_state, milestone)
         ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
         self.topk.save_checkpoint(ckpt_path, self.agent_ids)
 
-        # 4) Push milestone logs
+        # Push milestone logs
         payload = {
             "eval/return_mean": float(avg_return),
             "eval/num_episodes": int(num_eps),
@@ -218,11 +209,10 @@ class MilestoneEvaluator:
         }
         self.metrics.push_milestone(global_step, milestone, payload)
 
-        # 5) Notify training loop to skip episode counting once
         return {"skip_episode_once": True}
 
-    def _evaluate_env0_once(self):
-        """In-place evaluation (env0 single episode)."""
+    def _run_single_evaluation_episode(self):
+        """Run single environment evaluation episode."""
         active_env = 0
         target_episodes = 1
         
@@ -246,10 +236,10 @@ class MilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # Select actions (deterministic, no noise)
+                # Select actions deterministically
                 actions, _ = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
                 
-                # Only env0 executes real actions, others are masked to zero
+                # Only env0 executes real actions
                 for aid, act in actions.items():
                     if act.ndim == 2:
                         masked = torch.zeros_like(act)
@@ -258,7 +248,7 @@ class MilestoneEvaluator:
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 
-                # Only accumulate env0 rewards
+                # Accumulate env0 rewards only
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
                 avg_step_rewards = step_rewards.mean(dim=0)
                 ep_returns[active_env] += avg_step_rewards[active_env]
@@ -315,10 +305,10 @@ class MetricsHub:
     """
     
     def __init__(self, ring: int = 100):
-        self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)
-        self.episode_state: dict[int, dict] = {}
-        self.milestone_scores: DefaultDict[int, dict] = defaultdict(dict)
-        self.update_ring: Deque[dict] = deque(maxlen=ring)
+        self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)  # Event subscribers
+        self.episode_state: dict[int, dict] = {}  # Episode state cache
+        self.milestone_scores: DefaultDict[int, dict] = defaultdict(dict)  # Milestone score cache
+        self.update_ring: Deque[dict] = deque(maxlen=ring)  # Update history ring buffer
 
     def subscribe(self, event: str, handler: Callable[[dict], None]) -> None:
         """Subscribe to an event type with a handler function."""
@@ -368,17 +358,17 @@ class MetricsHub:
 
 class WandBLogger:
     """
-    Enhanced WandB logger with configurable networks and noise scheduling support.
+    Enhanced WandB logger with per-agent metrics and configurable networks support.
     
     Features:
+    - Per-agent training metrics
     - Network configuration logging
     - Exploration metrics tracking
     - Milestone and evaluation logging
-    - Fail-fast initialization
     """
     
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
-        self.enabled = enabled and WANDB_AVAILABLE
+        self.enabled = enabled and WANDB_AVAILABLE  # WandB availability flag
         self.project_name = project_name
         self.run = None
         
@@ -431,89 +421,66 @@ class WandBLogger:
         if not self.enabled:
             return
 
-        # Training update level: direct logging with exploration metrics
-        hub.subscribe("update", lambda data: self.log_algorithm_statistics(data, data["step"]))
+        # Subscribe to training update events
+        hub.subscribe("update", lambda data: self.log_metrics(data, data["step"]))
 
-        # Episode level: available for future use
-        def _on_episode(ep):
-            pass
-        hub.subscribe("episode", _on_episode)
-
-        # Milestone completion: calculate and upload milestone metrics
+        # Subscribe to milestone completion events
         def _on_ms(ms):
-            scores = ms.get("scores", {})
             step = ms.get("step", 0)
-            
-            if scores:
-                score_values = list(scores.values())
-                best = max(score_values) if score_values else 0.0
-                avg = sum(score_values) / len(score_values) if score_values else 0.0
-                count = len(score_values)
-            else:
-                best = ms.get("milestone/topk_best_score", ms.get("eval/return_mean", 0.0))
-                avg = ms.get("milestone/topk_avg_score", ms.get("eval/return_mean", 0.0))
-                count = ms.get("milestone/topk_count", 1)
-            
-            log_data = {
-                "milestone/topk_best_score": best,
-                "milestone/topk_avg_score": avg,
-                "milestone/topk_count": count,
-                "milestone/latest_completed": ms.get("milestone", ms.get("milestone/latest_completed", 0)),
-            }
-            
+            payload_to_log = {}
             if "eval/return_mean" in ms:
-                log_data["eval/return_mean"] = ms["eval/return_mean"]
-            if "eval/num_episodes" in ms:
-                log_data["eval/num_episodes"] = ms["eval/num_episodes"]
-            
-            self.log_algorithm_statistics(log_data, step)
-            
+                payload_to_log["eval/return_mean"] = ms["eval/return_mean"]
+            if "milestone/topk_best_score" in ms:
+                payload_to_log["milestone/topk_best_score"] = ms["milestone/topk_best_score"]
+            if "milestone" in ms:
+                payload_to_log["milestone/latest_completed"] = ms["milestone"]
+
+            if payload_to_log:
+                self.log_metrics(payload_to_log, step)
+
         hub.subscribe("milestone_summary", _on_ms)
-        
-        print("[WANDB] Attached to MetricsHub with exploration metrics support")
+        print("[WANDB] Attached to MetricsHub with new focused logging.")
 
-    def log_algorithm_statistics(self, algorithm_stats: Dict[str, Any], step: int) -> None:
-        """Log algorithm diagnostics with WHITELIST filtering."""
-        if not self.enabled or not algorithm_stats:
+    def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
+        """Log metrics with per-agent structure and global metrics."""
+        if not self.enabled or not metrics_data:
             return
 
-        # WHITELIST with exploration metrics
-        WHITELIST = {
-            # Training
-            "train/actor_loss", "train/critic_loss",
-            "train/action_std/robot", "train/action_std/human",
-            "train/episodes_done", "train/updates",
-            
-            # Model statistics
-            "model/q_mean", "model/q_std",
-            "model/q_target_mean", "model/q_target_std",
-            "model/td_error_mean", "model/td_rmse", "model/q_qt_corr",
-            "model/grad_norm/actor", "model/grad_norm/critic",
-            
-            # Exploration metrics
-            "exploration/noise_scale", "exploration/sigma_ratio",
-            
-            # Replay buffer
-            "replay/buffer_size",
-            
-            # Evaluation
-            "eval/return_mean", "eval/num_episodes",
-            
-            # Milestones
-            "milestone/topk_best_score", "milestone/topk_avg_score",
-            "milestone/topk_count", "milestone/latest_completed",
+        log_data = {}
+
+        # Handle Per-Agent training metrics
+        if "loss/actor" in metrics_data and isinstance(metrics_data.get('loss/actor'), dict):
+            agent_ids = list(metrics_data['loss/actor'].keys())
+            for agent_id in agent_ids:
+                # Loss metrics
+                log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
+                log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
+                # Q-Value metrics
+                log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
+                log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
+                # Target Q-Value metrics
+                if 'q_target_mean' in metrics_data and agent_id in metrics_data['q_target_mean']:
+                     log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
+                if 'q_target_std' in metrics_data and agent_id in metrics_data['q_target_std']:
+                     log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
+                # Gradient norm metrics
+                log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
+                log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
+
+        # Handle global and milestone metrics
+        global_keys = {
+            "exploration/noise_scale": "exploration/noise_scale",
+            "train/episodes_done": "train/global_episodes",
+            "replay/buffer_size": "replay/buffer_size",
+            "train/updates": "train/updates",
+            "eval/return_mean": "milestone/actor_return",
+            "milestone/topk_best_score": "milestone/topk_best_return",
+            "milestone/latest_completed": "milestone/latest_completed",
         }
+        for src_key, dest_key in global_keys.items():
+            if src_key in metrics_data and metrics_data[src_key] is not None:
+                log_data[dest_key] = metrics_data[src_key]
 
-        # Allow milestone/eval data to bypass training check
-        has_milestone_data = any(key.startswith(("milestone/", "eval/")) 
-                               for key in algorithm_stats.keys())
-        
-        # Only log when actual update occurred, except for milestone/eval data
-        has_training_data = algorithm_stats.get("train/updates", 0) > 0 or algorithm_stats.get("train/episodes_done", 0) > 0
-        if not has_milestone_data and not has_training_data:
-            return
-
-        log_data = {k: v for k, v in algorithm_stats.items() if k in WHITELIST}
         if log_data:
             wandb.log(log_data, step=step)
 
@@ -554,21 +521,19 @@ class TopKModelManager:
     """
     
     def __init__(self, k: int = 10, mode: str = "max"):
-        self.k = k
-        self.mode = mode
-        self.top_models: List[Tuple[float, Dict, int]] = []
+        self.k = k  # Number of top models to keep
+        self.mode = mode  # Ranking mode
+        self.top_models: List[Tuple[float, Dict, int]] = []  # (performance, model_state, milestone)
     
     def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
         """Update top-K models with new performance data."""
-        # Use raw performance value - no clipping to preserve true performance
-        
         # Add new model
         if len(self.top_models) < self.k:
             self.top_models.append((performance, model_state, milestone))
         elif performance > self.top_models[-1][0]:
             self.top_models[-1] = (performance, model_state, milestone)
         
-        # Sort by performance (descending)
+        # Sort by performance descending
         self.top_models.sort(key=lambda x: x[0], reverse=True)
     
     def get_top_models(self) -> List[Tuple[float, Dict, int]]:
@@ -600,100 +565,6 @@ class TopKModelManager:
             scores = [m[0] for m in self.top_models]
             print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: "
                   f"{scores[0]:.2f} ~ {scores[-1]:.2f}")
-
-
-class TrainingLogger:
-    """
-    Handles training progress logging and file operations.
-    
-    Features:
-    - Progress tracking with unified global step
-    - Configuration logging with network and exploration info
-    - Final results persistence
-    """
-    
-    def __init__(self, log_directory: str):
-        self.log_directory = log_directory
-        os.makedirs(log_directory, exist_ok=True)
-        self.global_step = 0
-    
-    def log_message(self, message: str) -> None:
-        """Log a message to file."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_file = os.path.join(self.log_directory, "training.log")
-        with open(log_file, 'a') as f:
-            f.write(f"[{timestamp}] {message}\n")
-    
-    def log_training_start(self, args: argparse.Namespace, params: Dict[str, Any]) -> None:
-        """Log training start information with configuration details."""
-        print("=" * 70, "\nMADDPG Multi-Environment Parallel Training (Configurable Networks)")
-        
-        # Read CLI or YAML max_global_steps for display
-        cfg_steps = params.get('maddpg_config', {}).get('max_global_steps', 0) or 0
-        cli_steps = getattr(args, "max_global_steps", 0) or 0
-        max_steps = int(cli_steps if cli_steps > 0 else cfg_steps) or float('inf')
-        target_str = f"{max_steps} steps" if max_steps != float('inf') else "∞ steps"
-        
-        print(f"Environments: {args.num_envs}, Target: {target_str}")
-        print(f"Log Directory: {self.log_directory}")
-        
-        # Log network configuration
-        networks_cfg = params.get('networks', {})
-        if networks_cfg:
-            actor_cfg = networks_cfg.get('actor', {})
-            critic_cfg = networks_cfg.get('critic', {})
-            print(f"Network Configuration:")
-            print(f"  Actor layers: {actor_cfg.get('hidden_layers', 'default')}")
-            print(f"  Critic layers: {critic_cfg.get('hidden_layers', 'default')}")
-            print(f"  Dropout: Actor {actor_cfg.get('dropout_p', 0.0)}, Critic {critic_cfg.get('dropout_p', 0.0)}")
-            print(f"  Orthogonal init: {actor_cfg.get('orthogonal_init', False)}")
-            print(f"  Std scale: {actor_cfg.get('std_scale', 1.0)}")
-        
-        # Log exploration configuration
-        exploration_cfg = params.get('exploration', {})
-        if exploration_cfg:
-            print(f"Exploration Configuration:")
-            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
-            print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
-        
-        # Log unified completion threshold
-        completion_threshold = params.get('reward_parameters', {}).get('completion_threshold', 0.01)
-        print(f"Unified completion threshold: {completion_threshold}m")
-        print(f"\n", "="*70)    
-    
-    def log_training_progress(self, global_step: int, global_episodes: int, top_k_manager: TopKModelManager) -> None:
-        """Log periodic training progress."""
-        self.global_step = global_step
-        print(f"[Step {global_step}] Episodes so far: {global_episodes}")
-        if top_k_manager.top_models:
-            scores = [m[0] for m in top_k_manager.top_models]
-            print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}")
-    
-    def log_training_complete(self, top_k_manager: TopKModelManager) -> None:
-        """Log training completion summary."""
-        print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
-        print("\nFinal Top-K Models:")
-        for i, (performance, _, milestone) in enumerate(top_k_manager.get_top_models()):
-            print(f"  #{i+1} Milestone {milestone}: {performance:.2f}")
-        print(f"\nResults saved in: {self.log_directory}")
-    
-    def save_final_results(self, global_step: int, global_episodes: int, 
-                          top_k_manager: TopKModelManager, params: Dict[str, Any], args: argparse.Namespace) -> None:
-        """Save final training results to disk."""
-        stats = {
-            'total_steps': global_step, 
-            'total_episodes': global_episodes,
-            'top_k_scores': [(p, m) for p, _, m in top_k_manager.get_top_models()],
-            'final_config': {
-                'networks': params.get('networks', {}),
-                'exploration': params.get('exploration', {}),
-            }
-        }
-        with open(os.path.join(self.log_directory, "training_stats.pkl"), 'wb') as f:
-            pickle.dump(stats, f)
-        params['command_line_args'] = vars(args)
-        with open(os.path.join(self.log_directory, "used_config.yaml"), 'w') as f:
-            yaml.dump(params, f, default_flow_style=False)
 
 
 def save_final_shared_networks(log_directory: str, maddpg, global_step: int, global_episodes: int, max_milestone_triggered: Optional[int]) -> None:

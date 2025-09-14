@@ -80,7 +80,7 @@ initial_conditions:
 # ==============================================================================
 constraint_geometry:
   center: [0.14, 0.0, 0.0]           # Constraint center position (meters)
-  collision_threshold: 0.001         # Collision detection threshold (meters)
+  collision_threshold: 0.0005         # Collision detection threshold (meters)
   y_range_positive: [0.038, 0.048]   # Positive Y constraint boundaries
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
@@ -94,8 +94,8 @@ reward_parameters:
   weights:
     # ===== ROBOT (Active Agent) =====
     zoneA_weight_robot: 1.0
-    zoneA_progress_robot: 5.0
-    zoneA_deviation_robot: 15.0
+    zoneA_progress_robot: 1.0
+    zoneA_deviation_robot: 1.0
 
     zoneB_weight_robot: 1.0
     zoneB_gap_robot: 1.0
