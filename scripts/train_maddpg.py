@@ -10,6 +10,7 @@ Features:
 - Unified global step tracking for consistent logging
 - TopK model management with milestone evaluation
 - WandB integration with exploration metrics
+- Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator (no old RewardLogger chain)
 """
 
 import sys
@@ -87,60 +88,20 @@ def create_maddpg_trainer(env, config, args):
     return maddpg
 
 
-def setup_reward_logger(env, config, metrics_hub):
-    """Configure reward logger."""
-    # Get existing reward_logger
-    reward_logger = None
-    if hasattr(env, 'reward_logger'):
-        reward_logger = env.reward_logger
-    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'reward_logger'):
-        reward_logger = env.unwrapped.reward_logger
+def inject_step_tracer(env, config, num_envs):
+    """Inject StepTracer into environment for console logging (post-creation, zero-intrusion)."""
+    actual_env = getattr(env, "unwrapped", env)
     
-    if not reward_logger:
-        print("[INFO] No existing reward_logger found, will create a new one")
-        return None
-        
-    # Get environment count
-    num_envs = getattr(env, 'num_envs', getattr(getattr(env, 'unwrapped', env), 'num_envs', 512))
+    from surgical_project.envs.multi_agent.utils import StepTracer
     
-    # Create new RewardLogger
-    from surgical_project.envs.multi_agent.utils import RewardLogger
-    milestones = config.params.get('training_monitor', {}).get('milestone_episodes', [])
-    
-    new_logger = RewardLogger(
+    actual_env.step_tracer = StepTracer(
         num_envs=num_envs,
-        device=config.get_compute_device(),
-        metrics_hub=metrics_hub,
-        enable_console_logging=config.params.get('logging', {}).get('enable_console_logging', False),
-        milestones=milestones
+        device=getattr(actual_env, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
+        enable_console_logging=config.params.get("logging", {}).get("enable_console_logging", False)
     )
     
-    # Replace logger in environment
-    if hasattr(env, 'reward_logger'):
-        env.reward_logger = new_logger
-    elif hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'reward_logger'):
-        env.unwrapped.reward_logger = new_logger
-    
-    # Configure new logger
-    new_logger.configure_logging(config.params)
-    
-    print(f"[INFO] RewardLogger configured:")
-    print(f"  Console logging: {'enabled' if new_logger.step_tracer.enable_console_logging else 'disabled'}")
-    print(f"  Milestone management: Legacy compatibility mode")
-    
-    return new_logger
-
-
-def create_milestone_callback(evaluator, runner):
-    """Create milestone callback function."""
-    def _on_milestone(milestone):
-        """Milestone callback: evaluation→TopK→skip episode counting"""
-        print(f"[MILESTONE CALLBACK] Processing milestone {milestone}")
-        result = evaluator.handle(milestone, runner.global_step)
-        if result.get("skip_episode_once", False):
-            runner.mark_skip_episode_once()
-            print(f"[MILESTONE CALLBACK] Marked skip_episode_once for milestone {milestone}")
-    return _on_milestone
+    print(f"[INFO] StepTracer injected:")
+    print(f"  Console logging: {'enabled' if actual_env.step_tracer.enable_console_logging else 'disabled'}")
 
 
 class MADDPGTrainer:
@@ -152,6 +113,7 @@ class MADDPGTrainer:
     - Exponential noise decay scheduling
     - Milestone evaluation with TopK model selection
     - Comprehensive WandB logging with exploration metrics
+    - Single evaluation chain (no old RewardLogger/MilestoneManager)
     """
     
     def __init__(self, args):
@@ -199,6 +161,9 @@ class MADDPGTrainer:
             print(f"[SETUP] Injected configuration parameters to environment")
         else:
             print("[WARNING] Environment does not support config injection")
+        
+        # Inject StepTracer for console logging
+        inject_step_tracer(self.env, self.config, self.args.num_envs)
 
     def _setup_logging_and_wandb(self):
         """Setup logging and WandB."""
@@ -235,9 +200,6 @@ class MADDPGTrainer:
         # Create MADDPG trainer
         self.maddpg = create_maddpg_trainer(self.env, self.config, self.args)
         
-        # Setup reward logger
-        self.reward_logger = setup_reward_logger(self.env, self.config, self.metrics_hub)
-        
         # Create TopK manager
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
@@ -266,7 +228,7 @@ class MADDPGTrainer:
             maddpg=self.maddpg,
             replay=self.maddpg.replay,
             metrics_hub=self.metrics_hub,
-            reward_logger=self.reward_logger,
+            reward_logger=None,  # No more reward_logger dependency
             agent_ids=self.maddpg.agent_ids
         )
         
@@ -286,15 +248,7 @@ class MADDPGTrainer:
         """Setup milestone management."""
         print(f"[SETUP] Setting up milestone management...")
         
-        # Create MilestoneManager for compatibility
-        from surgical_project.envs.multi_agent.utils import MilestoneManager
-        self.milestone_manager = MilestoneManager(self.milestone_episodes)
-        
-        # Set callback (actual management handled by check_and_trigger_milestone)
-        milestone_callback = create_milestone_callback(self.evaluator, self.runner)
-        self.milestone_manager.set_callback(milestone_callback)
-        
-        # Milestone tracking
+        # Milestone tracking (simplified, no old MilestoneManager)
         self.max_milestone_triggered = 0
         
         print(f"[SETUP] Milestone management configured for {len(self.milestone_episodes)} milestones")
@@ -320,7 +274,7 @@ class MADDPGTrainer:
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
     def check_and_trigger_milestone(self):
-        """Check and trigger milestone evaluation."""
+        """Check and trigger milestone evaluation with observation refresh fix."""
         if not self.milestone_episodes:
             return
             
@@ -341,6 +295,16 @@ class MADDPGTrainer:
             result = self.evaluator.handle(candidate, self.runner.global_step)
             if result.get("skip_episode_once", False):
                 self.runner.mark_skip_episode_once()
+            
+            # === CRITICAL FIX: Refresh current observations after evaluation ===
+            # This prevents "old observation + new environment" state mismatch
+            env = getattr(self.env, "unwrapped", self.env)
+            if hasattr(env, "_get_observations"):
+                self.runner._current_obs = env._get_observations()
+            else:
+                obs_dict, _ = self.env.reset()
+                self.runner._current_obs = obs_dict
+            print(f"[MILESTONE] Refreshed current observations after evaluation")
             
             self.max_milestone_triggered = candidate
             print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
@@ -373,6 +337,7 @@ class MADDPGTrainer:
             obs_dict, _ = self.env.reset()
             print(f"[TRAIN] Environment reset complete, starting training loop")
             self.runner._current_obs = obs_dict  
+            
             # Main training loop
             while self.runner.global_step < self.max_global_steps:
                 # Execute one training step
@@ -426,8 +391,6 @@ class MADDPGTrainer:
             print(f"\nTraining interrupted by user")
         finally:
             # Cleanup resources
-            if self.reward_logger and hasattr(self.reward_logger, 'close_all_files'):
-                self.reward_logger.close_all_files()
             self.env.close()
             self.wandb_logger.finalize_run()
             print("[TRAIN] Cleanup completed")

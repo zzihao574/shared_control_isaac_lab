@@ -1,18 +1,14 @@
-# surgical_direct_marl_env.py - Final version with unified global_step integration
-# MODIFIED: Integrated with unified global_step from trainer for console logging
-# MODIFIED: Added trainer global_step injection method for unified logging
-# MODIFIED: Updated reward logging to work with new key structure
-# MODIFIED: Renamed set_debug_actor_info -> set_detail_actor_info
-# MODIFIED: Removed try/except from _w and _initialize_body_indices
-# MODIFIED: Added assert for agent validation in _pre_physics_step
+# surgical_direct_marl_env.py - Cleaned version with single evaluation chain
+# MODIFIED: Removed old RewardLogger/MilestoneManager dependencies
+# MODIFIED: Only do physics + rewards + optional console printing
+# MODIFIED: Configuration only from Trainer injection (no self-loading YAML)
+# MODIFIED: Added conditional console printing via injected StepTracer
+# MODIFIED: Removed __del__ and cleaned up old chain references
 
 from __future__ import annotations
 
 import torch
 import numpy as np
-import yaml
-import os
-import gymnasium as gym  
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 
@@ -22,22 +18,21 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import sample_uniform, quat_rotate_inverse
 
 from .surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
-from .utils import CompleteConstraintChecker, TrajectoryManager, RewardLogger
+from .utils import CompleteConstraintChecker, TrajectoryManager
 
 
 class SurgicalDirectMARLEnv(DirectMARLEnv):
     """
     Human-robot collaborative surgical MARL environment for shared networks.
-    FINAL VERSION: Integrated with unified global_step tracking for console logging.
+    CLEANED VERSION: Only physics + rewards + optional console printing.
     
     Features:
     - Multi-agent force control for surgical tasks
     - Physics-based constraint checking and collision detection
     - Four-zone reward system: Track/Surface/Danger/Rejoin
     - Unified global_step integration with trainer
-    - Actor network detail information display
-    - Console logging via unified global_step
-    - Updated metrics integration with new key structure
+    - Optional console logging via injected StepTracer
+    - Configuration only from trainer injection (no self-loading)
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -46,7 +41,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Initialize surgical MARL environment for shared networks."""
         super().__init__(cfg, render_mode, **kwargs)
         
-        # Load configuration
+        # Core configuration setup
         self._setup_core_configuration()
         
         # Initialize state variables and caches
@@ -62,10 +57,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._trainer_global_step = None
         
     def _setup_core_configuration(self) -> None:
-        """Load and setup core configuration parameters."""
-        # Use injected params if available, otherwise load from YAML
+        """Setup core configuration - only from trainer injection."""
+        # Configuration must be injected by trainer - no self-loading fallback
         if not hasattr(self, "params") or not isinstance(getattr(self, "params", None), dict):
-            self.params = self._load_training_params()
+            print("[WARNING] No configuration injected by trainer, using minimal defaults")
+            self.params = self._get_minimal_defaults()
             
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
@@ -79,15 +75,28 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._load_termination_parameters()
         
         print(f"[ENV] Episode length: {self.cfg.episode_length_s}s")
-        print(f"[ENV] Shared network environment initialized")
+        print(f"[ENV] Environment configured for physics + rewards only")
     
-    def _load_training_params(self) -> dict:
-        """Load training parameters from YAML configuration."""
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        yaml_path = os.path.join(current_dir, "agents", "training_params.yaml")
-        
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+    def _get_minimal_defaults(self) -> dict:
+        """Get minimal default configuration if none injected."""
+        return {
+            'constraints': {
+                'min_z_position': 0.0,
+                'max_robot_force': 0.04,
+                'max_human_force': 0.04,
+                'joint_limits': {
+                    'waist': [-0.98, 0.98], 'shoulder': [0.0, 1.75], 'elbow': [-0.7854, 1.5],
+                    'yaw': [-1.5, 1.5], 'pitch': [0.0, 2.5], 'roll': [-2.58, 2.58]
+                }
+            },
+            'initial_conditions': {
+                'joint_positions': {'waist': -0.96, 'shoulder': 0.0, 'elbow': 1.0, 'yaw': 0.0, 'pitch': 2.0944, 'roll': 0.0}
+            },
+            'constraint_geometry': {'collision_threshold': 0.001},
+            'trajectory': {'start_point': [0.14, -0.2, 0.03], 'end_point': [0.14, 0.2, 0.03]},
+            'reward_parameters': {'completion_threshold': 0.01, 'weights': {}},
+            'termination_conditions': {'z_below_zero': False, 'edge_collision': False, 'safety_distance_threshold': 0.0}
+        }
     
     def _load_constraint_parameters(self) -> None:
         """Load constraint-related parameters."""
@@ -206,9 +215,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._goal_point = self.trajectory_manager.end_pos_local.to(self.device)
         print(f"[ENV] Goal point: {self._goal_point}")
         
-        # Simple reward logger (will be replaced by trainer if needed)
-        self.reward_logger = RewardLogger(self.num_envs, self.device)
-        
         # Constraint checker for collision detection
         self.constraint_checker = CompleteConstraintChecker(
             device=self.device, 
@@ -217,6 +223,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _setup_gymnasium_spaces(self) -> None:
         """Setup Gymnasium compatibility spaces."""
+        import gymnasium as gym
         self.action_space = gym.spaces.Dict({
             agent: gym.spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -282,7 +289,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         if not hasattr(self._omni_robot, 'body_names'):
             return
         
-        # Find stylus body - no fallback, fail fast if not found
+        # Find stylus body - fail fast if not found
         target_name = "stylus"
         
         for i, name in enumerate(self._omni_robot.body_names):
@@ -291,7 +298,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 print(f"[ENV] Found stylus body: {name} (index {i})")
                 return
         
-        # No fallback - raise error if stylus not found
+        # Raise error if stylus not found
         raise RuntimeError(f"stylus link not found in robot body names: {self._omni_robot.body_names}")
     
     # =========================================================================
@@ -640,7 +647,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         out = torch.zeros_like(prog_raw)
         out[rejoin] = zone_total[rejoin]
 
-        # ===== Console detail =====
+        # Console detail
         RC, device = self.reward_components, prog_raw.device
         RC[f'zoneD_weight_{agent}'] = torch.tensor(zw, device=device)
         RC[f'zoneD_total_{agent}'] = zone_total
@@ -737,21 +744,21 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
         rewards = {'robot': _agent_total('robot'), 'human': _agent_total('human')}
 
-        # UNIFIED KEYS: Public indicators for RewardLogger with consistent naming
+        # UNIFIED KEYS: Public indicators for console logging with consistent naming
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         distance_to_final = torch.norm(
             self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0), dim=-1
         )
-        completion_reward = self._calculate_completion_reward()  # For completion detection
+        completion_reward = self._calculate_completion_reward()
         
-        # Add unified keys for RewardLogger consistency
+        # Add unified keys for console logging consistency
         self.reward_components.update({
-            'deviation': deviations,                    # UNIFIED: trajectory deviation
-            'progress_ratio': progress_ratio,           # UNIFIED: progress along trajectory
-            'distance_to_final': distance_to_final,     # Additional: distance to end
-            'completion_reward': completion_reward,      # UNIFIED: completion detection key
-            'min_safety_distance': self.safety_distances_t1,  # UNIFIED: safety distance key
+            'deviation': deviations,
+            'progress_ratio': progress_ratio,
+            'distance_to_final': distance_to_final,
+            'completion_reward': completion_reward,
+            'min_safety_distance': self.safety_distances_t1,
         })
         
         # Ensure all required keys exist with default values if missing
@@ -760,19 +767,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             if key not in self.reward_components:
                 self.reward_components[key] = torch.zeros(self.num_envs, device=self.device)
 
-        # Console logging using unified global_step from trainer
-        if hasattr(self, 'reward_logger') and self.reward_logger:
-            # Try to get global_step from trainer context, fallback to local step counter
-            if self._trainer_global_step is not None:
-                current_step = self._trainer_global_step
-            else:
-                current_step = getattr(self, 'step_counter', getattr(self, '_sim_step_counter', 0))
-            
-            self.reward_logger.log_console_if_enabled(self, rewards, current_step)
-            self.reward_logger.update_step_metrics_batch(self.reward_components, self.safety_distances_t1, rewards)
-        
-        # Store for debug consistency check (ensure MADDPG can read last rewards)
-        self.debug_last_rewards = rewards
+        # === OPTIONAL CONSOLE LOGGING via injected StepTracer ===
+        # Only print if trainer injected a step_tracer
+        if hasattr(self, "step_tracer") and self.step_tracer is not None:
+            current_step = self._trainer_global_step if self._trainer_global_step is not None else 0
+            self.step_tracer.maybe_print_step(self, rewards, current_step)
         
         return rewards
 
@@ -910,11 +909,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             return torch.zeros(self.num_envs, 3, device=self.device)
         
         return self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
-    
-    def __del__(self):
-        """Destructor to clean up resources."""
-        if hasattr(self, 'reward_logger') and self.reward_logger:
-            self.reward_logger.close_all_files()
     
     def get_constraint_state(self, env_ids: Optional[List[int]] = None) -> Dict:
         """Get constraint state information."""

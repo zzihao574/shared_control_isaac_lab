@@ -1,15 +1,16 @@
 """
 Environment utilities for shared network MADDPG training.
-FINAL VERSION: Essential components only, minimal complexity.
-MODIFIED: Removed all try/except from CompleteConstraintChecker, force import at top
-MODIFIED: Simplified RewardLogger for TrainingRunner/MilestoneEvaluator integration
+CLEANED VERSION: Only essential environment components, no old logging chain.
+MODIFIED: Removed RewardLogger and MilestoneManager completely
+MODIFIED: Kept CompleteConstraintChecker, TrajectoryManager, StepTracer
+MODIFIED: Replaced wide try/except with explicit checks
 """
 
 import torch
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
-# 强制导入依赖 - 若没装则直接抛ImportError
+# Force import dependencies - fail fast if not installed
 from omni.physx.bindings._physx import (
     acquire_physx_attachment_interface, acquire_physx_scene_query_interface
 )
@@ -22,7 +23,7 @@ class CompleteConstraintChecker:
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
         self.device = device
         self.collision_threshold = collision_threshold        
-        # 直接初始化，失败就让异常抛出
+        # Direct initialization - let exceptions bubble up if failed
         self.physics_attachment_interface = acquire_physx_attachment_interface()
         self.physics_scene_query_interface = acquire_physx_scene_query_interface()
     
@@ -42,7 +43,7 @@ class CompleteConstraintChecker:
             stylus_world_pos = stylus_positions[env_id] + env_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
-            # 删除try/except，让真实异常暴露
+            # Direct call - let real exceptions surface
             result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
             if result is not None:
                 batch_results['distances_constraint'][env_id] = result['distance']
@@ -55,7 +56,7 @@ class CompleteConstraintChecker:
     
     def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str):
         """Analyze constraint state for single environment."""
-        # 删除try/except，直接执行必达路径
+        # Direct execution - no try/except wrapper
         pos = stylus_position.cpu().numpy()
         current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
         
@@ -212,7 +213,7 @@ class StepTracer:
 
     def _print_env_snapshot(self, env, env_id: int):
         """Print complete four-zone reward breakdown for a single environment."""
-        # 添加安全检查
+        # Explicit attribute checks instead of wide try/except
         if not hasattr(env, 'reward_components') or not env.reward_components:
             print(f"[DEBUG] Environment {env_id}: Reward components not yet calculated")
             return
@@ -220,42 +221,55 @@ class StepTracer:
         if not hasattr(env, 'stylus_pos_t1') or env.stylus_pos_t1 is None:
             print(f"[DEBUG] Environment {env_id}: Stylus position not available")
             return
+        
+        # Check tensor shapes before accessing
+        if env.stylus_pos_t1.shape[0] <= env_id:
+            print(f"[DEBUG] Environment {env_id}: Index out of range for stylus position")
+            return
             
-        try:
-            stylus = env.stylus_pos_t1[env_id]
-            safety = float(env.safety_distances_t1[env_id].item())
-            normal = env.normal_t1[env_id]
-            
-            # 安全地获取奖励组件
-            dev = float(env.reward_components.get('deviation', torch.zeros(self.num_envs, device=self.device))[env_id].item())
-            prog = float(env.reward_components.get('progress_ratio', torch.zeros(self.num_envs, device=self.device))[env_id].item())
-            dist = float(env.reward_components.get('distance_to_final', torch.zeros(self.num_envs, device=self.device))[env_id].item())
+        stylus = env.stylus_pos_t1[env_id]
+        safety = float(env.safety_distances_t1[env_id].item())
+        normal = env.normal_t1[env_id]
+        
+        # Safe reward component access with defaults
+        dev = self._safe_get_reward_component(env, 'deviation', env_id, 0.0)
+        prog = self._safe_get_reward_component(env, 'progress_ratio', env_id, 0.0)
+        dist = self._safe_get_reward_component(env, 'distance_to_final', env_id, 0.0)
 
-            print(f"\n--- Environment {env_id} ---")
-            print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
-            print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
+        print(f"\n--- Environment {env_id} ---")
+        print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
+        print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
 
-            self._print_actor_detail_info(env, env_id)
+        self._print_actor_detail_info(env, env_id)
 
-            print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
+        print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
-            D, O = 0.0075, 0.015
-            if safety >= O:      active_zone = "A (Track)"
-            elif safety <= D:    active_zone = "C (Danger)"
+        D, O = 0.0075, 0.015
+        if safety >= O:      active_zone = "A (Track)"
+        elif safety <= D:    active_zone = "C (Danger)"
+        else:
+            if hasattr(env, 'rejoin_streak') and env.rejoin_streak.shape[0] > env_id and env.rejoin_streak[env_id] >= 10:
+                active_zone = "D (Rejoin)"
             else:
-                if hasattr(env, 'rejoin_streak') and env.rejoin_streak[env_id] >= 10:
-                    active_zone = "D (Rejoin)"
-                else:
-                    active_zone = "B (Surface)"
-            print(f"Active Zone: {active_zone}")
+                active_zone = "B (Surface)"
+        print(f"Active Zone: {active_zone}")
 
-            self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
-            self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+        self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
+        self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+
+    def _safe_get_reward_component(self, env, key: str, env_id: int, default: float) -> float:
+        """Safely get reward component value with explicit checks."""
+        if not hasattr(env, 'reward_components') or key not in env.reward_components:
+            return default
+        
+        component = env.reward_components[key]
+        if not torch.is_tensor(component):
+            return float(component) if isinstance(component, (int, float)) else default
+        
+        if component.shape[0] <= env_id:
+            return default
             
-        except Exception as e:
-            print(f"[DEBUG] Error printing environment {env_id} snapshot: {e}")
-            import traceback
-            traceback.print_exc()
+        return float(component[env_id].item())
 
     def _print_actor_detail_info(self, env, env_id: int):
         """Print actor network outputs and noise information with force consistency check."""
@@ -270,13 +284,13 @@ class StepTracer:
         human_mean = env.actor_mean_forces.get('human')
         human_noise = env.actor_noise_forces.get('human')
         
-        if robot_mean is not None and robot_noise is not None:
+        if robot_mean is not None and robot_noise is not None and robot_mean.shape[0] > env_id:
             rm = robot_mean[env_id]
             rn = robot_noise[env_id]
             print(f"Forces (Robot): Fx={rm[0]:+.3f}, Fy={rm[1]:+.3f}, Fz={rm[2]:+.3f}")
             print(f"  Noise: Nx={rn[0]:+.3f}, Ny={rn[1]:+.3f}, Nz={rn[2]:+.3f}")
         
-        if human_mean is not None and human_noise is not None:
+        if human_mean is not None and human_noise is not None and human_mean.shape[0] > env_id:
             hm = human_mean[env_id]
             hn = human_noise[env_id]
             print(f"Forces (Human): Fx={hm[0]:+.3f}, Fy={hm[1]:+.3f}, Fz={hm[2]:+.3f}")
@@ -299,8 +313,13 @@ class StepTracer:
 
         def _val(x):
             if torch.is_tensor(x):
-                return float(x[env_id].item()) if x.ndim>0 else float(x.item())
-            return float(x)
+                if x.ndim > 0 and x.shape[0] > env_id:
+                    return float(x[env_id].item())
+                elif x.ndim == 0:
+                    return float(x.item())
+                else:
+                    return 0.0
+            return float(x) if isinstance(x, (int, float)) else 0.0
 
         for Z in ['A','B','C','D']:
             zw_key = f'zone{Z}_weight_{agent_key}'
@@ -339,116 +358,3 @@ class StepTracer:
         contrib = env.reward_components.get(f"{aware_key}_contrib", 0.0)
         label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
         print(f"    {label:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
-
-
-class MilestoneManager:
-    """
-    统一的里程碑管理器，兼容新架构。
-    MODIFIED: 简化为与TrainingRunner和MilestoneEvaluator协作
-    """
-    
-    def __init__(self, milestones: List[int]):
-        self.milestones = sorted(milestones) if milestones else []
-        self.completed = set()
-        self.callback = None
-        print(f"[MILESTONE MANAGER] Initialized with milestones: {self.milestones}")
-    
-    def set_callback(self, callback_fn):
-        """设置里程碑回调函数"""
-        self.callback = callback_fn
-        print(f"[MILESTONE MANAGER] Callback set for {len(self.milestones)} milestones")
-    
-    def check(self, global_episodes: int) -> Optional[int]:
-        """检查是否达到里程碑（兼容性方法，实际使用由TrainingRunner处理）"""
-        for milestone in self.milestones:
-            if global_episodes >= milestone and milestone not in self.completed:
-                self.completed.add(milestone)
-                print(f"[MILESTONE {milestone}] Reached at {global_episodes} episodes")
-                
-                if self.callback:
-                    self.callback(milestone)
-                
-                return milestone
-        return None
-
-
-class RewardLogger:
-    """
-    简化的奖励日志器，用于控制台输出。
-    MODIFIED: 与TrainingRunner/MilestoneEvaluator架构兼容
-    MODIFIED: 专注于控制台日志功能，里程碑管理转移至TrainingRunner
-    """
-
-    def __init__(self, num_envs: int, device: torch.device, metrics_hub=None, 
-                 enable_console_logging: bool = False, milestones: List[int] = None):
-        self.num_envs = num_envs
-        self.device = device
-        self.metrics_hub = metrics_hub
-        
-        # Console debugging with unified global_step support
-        self.step_tracer = StepTracer(
-            num_envs, device,
-            enable_console_logging=enable_console_logging,
-            print_every_steps=10,
-            max_envs_to_print=2
-        )
-        
-        # Milestone management (Legacy compatibility - now handled by MADDPGTrainer)
-        self.milestone_manager = MilestoneManager(milestones or [])
-        
-        print(f"[RewardLogger] Initialized with {num_envs} environments")
-        print(f"  Console logging: {'enabled' if enable_console_logging else 'disabled'}")
-        print(f"  Milestone management: Legacy compatibility mode")
-    
-    def configure_logging(self, params: Dict):
-        """配置日志参数"""
-        logging_config = params.get('logging', {})
-        enable_console = logging_config.get('enable_console_logging', False)
-        
-        # Get milestones from config
-        training_monitor = params.get('training_monitor', {})
-        milestones = training_monitor.get('milestone_episodes', [])
-        
-        self.milestone_manager = MilestoneManager(milestones)
-        self.step_tracer.enable_console_logging = enable_console
-        
-        print(f"[RewardLogger] Configuration updated:")
-        print(f"  Console logging: {'enabled' if enable_console else 'disabled'}")
-        print(f"  Milestones: {milestones}")
-    
-    def set_topk_update_callback(self, callback_fn):
-        """设置TopK回调（遗留兼容性）"""
-        self.milestone_manager.set_callback(callback_fn)
-        print(f"[RewardLogger] TopK callback registered (legacy mode - actual handling by MADDPGTrainer)")
-    
-    def update_step_metrics_batch(self, reward_components: Dict, safety_distances: torch.Tensor, rewards: Dict):
-        """更新步骤指标到MetricsHub"""
-        if self.metrics_hub:
-            robot_avg = rewards.get("robot", torch.zeros(1, device=self.device)).mean().item()
-            human_avg = rewards.get("human", torch.zeros(1, device=self.device)).mean().item()
-            safety_avg = safety_distances.mean().item()
-            
-            self.metrics_hub.push_update(0, {
-                "reward/robot_avg": robot_avg,
-                "reward/human_avg": human_avg, 
-                "safety/distance_avg": safety_avg,
-            })
-    
-    def log_console_if_enabled(self, env, rewards: Dict, global_step: int):
-        """
-        Console logging using unified global_step from trainer.
-        
-        Args:
-            env: Environment instance
-            rewards: Reward dictionary  
-            global_step: Unified global step from trainer (hand-maintained)
-        """
-        self.step_tracer.maybe_print_step(env, rewards, global_step)
-    
-    def check_milestone(self, global_episodes: int):
-        """检查里程碑（遗留兼容性 - 现在由MADDPGTrainer处理）"""
-        return self.milestone_manager.check(global_episodes)
-    
-    def close_all_files(self):
-        """清理（此实现为空操作）"""
-        print("[RewardLogger] Cleanup completed (no files to close)")

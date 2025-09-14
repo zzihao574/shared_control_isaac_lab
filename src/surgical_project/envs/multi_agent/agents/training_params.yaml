@@ -153,7 +153,7 @@ termination_conditions:
 maddpg_config:
   lr_actor: 0.001                      # Actor learning rate
   lr_critic: 0.001                     # Critic learning rate
-  gamma: 0.95                          # Discount factor
+  gamma: 0.99                          # Discount factor
   batch_size: 512                     # Training batch size (increased for stability)
   hidden_units: 512                   # Hidden layer units
   num_episodes: 600                   # Legacy parameter (kept for compatibility, not used for termination)

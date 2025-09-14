@@ -5,7 +5,7 @@ Training helper utilities for MADDPG multi-environment parallel training.
 Enhanced version with configurable network architecture and exponential noise decay support.
 
 Features:
-- TrainingRunner: Unified training loop execution with noise scheduling
+- TrainingRunner: Unified training loop execution with noise scheduling (no old reward_logger dependency)
 - MilestoneEvaluator: Milestone evaluation and TopK model management  
 - MetricsHub: Unified data pipeline for logging
 - Configurable network support and intelligent noise scheduling
@@ -35,6 +35,7 @@ except ImportError:
 class TrainingRunner:
     """
     Unified training loop executor: rollout→replay→update→log→count with noise scheduling.
+    MODIFIED: Removed dependency on reward_logger (can be None)
     
     Features:
     - Exponential noise decay scheduling (fast early, slow later)
@@ -48,7 +49,7 @@ class TrainingRunner:
         self.maddpg = maddpg
         self.replay = replay
         self.metrics = metrics_hub
-        self.reward_logger = reward_logger
+        self.reward_logger = reward_logger  # Can be None now
         self.agent_ids = agent_ids
         self.global_step = 0
         self.global_episodes = 0
@@ -87,7 +88,7 @@ class TrainingRunner:
         # Use current observations
         current_obs = self._current_obs
         if current_obs is None:
-            # 优先用环境的即时观测函数；没有就 reset 一次
+            # Prioritize environment's real-time observation function; reset if none
             if hasattr(self.env, "_get_observations"):
                 current_obs = self.env._get_observations()
             else:
@@ -739,7 +740,6 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
     parser.add_argument("--seed", type=int, default=config.params.get('seed', 42))
     
-    # Training configuration
     parser.add_argument(
         "--max_global_steps", 
         type=int, 
