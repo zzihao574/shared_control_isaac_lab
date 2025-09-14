@@ -45,27 +45,23 @@ class CompleteConstraintChecker:
             'closest_points': torch.zeros(num_envs, 3, device=self.device),
             'normal_vectors': torch.ones(num_envs, 3, device=self.device),
             'is_overlapping': torch.zeros(num_envs, dtype=torch.bool, device=self.device),
-            'is_inside': torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         }
         
         for env_id in range(num_envs):
             stylus_world_pos = stylus_positions[env_id] + env_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
-            # Direct call - let real exceptions surface
             result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
             if result is not None:
                 batch_results['distances_constraint'][env_id] = result['distance']
                 batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
                 batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
                 batch_results['is_overlapping'][env_id] = result['is_overlapping']
-                batch_results['is_inside'][env_id] = result['is_inside']
         
         return batch_results
     
     def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str):
         """Analyze constraint state for single environment."""
-        # Direct execution - no try/except wrapper
         pos = stylus_position.cpu().numpy()
         current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
         
@@ -85,7 +81,7 @@ class CompleteConstraintChecker:
             return {
                 'distance': 0.0, 'closest_point': closest_pos,
                 'normal_vector': np.array([1.0, 0.0, 0.0]),
-                'is_overlapping': True, 'is_inside': False
+                'is_overlapping': True,
             }
         
         direction_normalized = direction_vec / direction_length
@@ -104,26 +100,24 @@ class CompleteConstraintChecker:
             if constraint_path in raycast_result['collision']:
                 filtered_result = raycast_result
         
-        # Determine state
-        if distance > 1.2 or distance < 0.0005:
-            is_overlapping, is_inside = True, False
+        # --- 简化的新逻辑 ---
+        is_overlapping = (distance < self.collision_threshold) or \
+                         (not filtered_result or 'faceIndex' not in filtered_result)
+
+        if distance > 1.2:
+            is_overlapping = True
             distance = 0.0
-        elif not filtered_result or 'faceIndex' not in filtered_result:
-            is_overlapping, is_inside = False, True
-        else:
-            is_overlapping, is_inside = False, False
         
         normal_vector = np.array([1.0, 0.0, 0.0])
         if filtered_result and 'normal' in filtered_result:
             normal_carb = filtered_result['normal']
             normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-            if not is_inside:
-                normal_vector = -normal_vector
+            normal_vector = -normal_vector
         
         return {
             'distance': distance, 'closest_point': closest_pos,
             'normal_vector': normal_vector,
-            'is_overlapping': is_overlapping, 'is_inside': is_inside
+            'is_overlapping': is_overlapping,
         }
 
 
@@ -221,13 +215,17 @@ class StepTracer:
         for env_id in to_show:
             self._print_env_snapshot(env, env_id)
 
-        robot_total = rewards.get("robot", torch.zeros(self.num_envs, device=self.device)).mean().item()
-        human_total = rewards.get("human", torch.zeros(self.num_envs, device=self.device)).mean().item()
-        print(f"\n[TOTALS] Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {robot_total + human_total:+.3f}")
+        # --- 新的 [TOTALS] 逻辑: 显示每个环境的单独奖励 ---
+        print("\n[REWARDS FOR THIS STEP]")
+        for env_id in to_show:
+            robot_total = rewards.get("robot", torch.zeros(self.num_envs, device=self.device))[env_id].item()
+            human_total = rewards.get("human", torch.zeros(self.num_envs, device=self.device))[env_id].item()
+            combined_total = robot_total + human_total
+            print(f"  Env {env_id}: Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
+
 
     def _print_env_snapshot(self, env, env_id: int):
         """Print complete four-zone reward breakdown for a single environment."""
-        # Explicit attribute checks instead of wide try/except
         if not hasattr(env, 'reward_components') or not env.reward_components:
             print(f"[DEBUG] Environment {env_id}: Reward components not yet calculated")
             return
@@ -236,7 +234,6 @@ class StepTracer:
             print(f"[DEBUG] Environment {env_id}: Stylus position not available")
             return
         
-        # Check tensor shapes before accessing
         if env.stylus_pos_t1.shape[0] <= env_id:
             print(f"[DEBUG] Environment {env_id}: Index out of range for stylus position")
             return
@@ -245,7 +242,6 @@ class StepTracer:
         safety = float(env.safety_distances_t1[env_id].item())
         normal = env.normal_t1[env_id]
         
-        # Safe reward component access with defaults
         dev = self._safe_get_reward_component(env, 'deviation', env_id, 0.0)
         prog = self._safe_get_reward_component(env, 'progress_ratio', env_id, 0.0)
         dist = self._safe_get_reward_component(env, 'distance_to_final', env_id, 0.0)
@@ -259,8 +255,16 @@ class StepTracer:
         print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
         D, O = 0.0075, 0.015
-        if safety >= O:      active_zone = "A (Track)"
-        elif safety <= D:    active_zone = "C (Danger)"
+        is_colliding = env.is_violating_t1[env_id].item()
+
+        # --- 新的 Active Zone 逻辑: 显示小区 ---
+        if safety >= O:
+            active_zone = "A (Track)"
+        elif safety <= D:
+            if is_colliding:
+                active_zone = "C (Danger - Overlapping)"
+            else:
+                active_zone = "C (Danger - Outside)"
         else:
             if hasattr(env, 'rejoin_streak') and env.rejoin_streak.shape[0] > env_id and env.rejoin_streak[env_id] >= 10:
                 active_zone = "D (Rejoin)"
@@ -270,6 +274,89 @@ class StepTracer:
 
         self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
         self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+
+
+    def _print_agent_zones_with_globals_flat(self, env, env_id: int, agent_label: str):
+        """Print complete zone breakdown and global rewards for a single agent using flat keys."""
+        agent_key = agent_label.lower()
+        print(f"\n[{agent_label}] ZONE REWARDS:")
+
+        is_colliding = env.is_violating_t1[env_id].item()
+
+        def _val(x):
+            if torch.is_tensor(x):
+                if x.ndim > 0 and x.shape[0] > env_id:
+                    return float(x[env_id].item())
+                elif x.ndim == 0:
+                    return float(x.item())
+                else:
+                    return 0.0
+            return float(x) if isinstance(x, (int, float)) else 0.0
+
+        for Z in ['A', 'B', 'C', 'D']:
+            if Z == 'C':
+                zw_key = f'zoneC_weight_{agent_key}'
+                zt_key = f'zoneC_total_{agent_key}'
+                zone_w = env.reward_components.get(zw_key, 0.0)
+                zone_total = env.reward_components.get(zt_key, 0.0)
+                
+                if is_colliding:
+                    print(f"  C Danger-Overlapping (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
+                    base = f"zoneC_overlap_{agent_key}"
+                    raw = env.reward_components.get(f"{base}_raw", 0.0)
+                    weight = env.reward_components.get(f"{base}_weight", 0.0)
+                    contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+                    print(f"    {'Overlap_Pen':<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+                else:
+                    print(f"  C Danger-Outside   (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
+                    for comp_key, comp_label in [('offpen', 'Off_Penalty'), ('inward', 'Inward_Pen')]:
+                        base = f"zoneC_{comp_key}_{agent_key}"
+                        raw = env.reward_components.get(f"{base}_raw", 0.0)
+                        weight = env.reward_components.get(f"{base}_weight", 0.0)
+                        contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+                        print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+                continue
+            
+            zone_title = {'A':'A Track   ', 'B':'B Surface ', 'D':'D Rejoin  '}
+            mapping = {
+                'A': [('progress','Progress'), ('deviation','Deviation')],
+                'B': [('gap','Gap'), ('surftangent','Surf_Tangent'), ('inward','Inward_Pen')],
+                'D': [('progress','Progress'), ('deviation','Deviation'), ('inward','Inward_Pen')],
+            }
+            zw_key = f'zone{Z}_weight_{agent_key}'
+            zt_key = f'zone{Z}_total_{agent_key}'
+            zone_w = env.reward_components.get(zw_key, 0.0)
+            zone_total = env.reward_components.get(zt_key, 0.0)
+            print(f"  {zone_title[Z]} (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
+
+            for comp_key, comp_label in mapping[Z]:
+                base = f"zone{Z}_{comp_key}_{agent_key}"
+                raw     = env.reward_components.get(f"{base}_raw", 0.0)
+                weight  = env.reward_components.get(f"{base}_weight", 0.0)
+                contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+                print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+
+        print("  Global Rewards:")
+        for gk, glabel in [('zpenalty','Z Penalty      '),
+                           ('completion','Completion     '),
+                           ('timeeff','Time Efficiency')]:
+            base = f"global_{gk}_{agent_key}"
+            raw     = env.reward_components.get(f"{base}_raw", 0.0)
+            weight  = env.reward_components.get(f"{base}_weight", 0.0)
+            contrib = env.reward_components.get(f"{base}_contrib", 0.0)
+            print(f"    {glabel:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+
+        raw     = env.reward_components.get(f"{agent_key}force_raw", 0.0)
+        weight  = env.reward_components.get(f"{agent_key}force_weight", 0.0)
+        contrib = env.reward_components.get(f"{agent_key}force_contrib", 0.0)
+        print(f"    {agent_label} Force   {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+
+        aware_key = 'humanaware' if agent_key == 'robot' else 'robotaware'
+        raw     = env.reward_components.get(f"{aware_key}_raw", 0.0)
+        weight  = env.reward_components.get(f"{aware_key}_weight", 0.0)
+        contrib = env.reward_components.get(f"{aware_key}_contrib", 0.0)
+        label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
+        print(f"    {label:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
 
     def _safe_get_reward_component(self, env, key: str, env_id: int, default: float) -> float:
         """Safely get reward component value with explicit checks."""
@@ -309,67 +396,3 @@ class StepTracer:
             hn = human_noise[env_id]
             print(f"Forces (Human): Fx={hm[0]:+.3f}, Fy={hm[1]:+.3f}, Fz={hm[2]:+.3f}")
             print(f"  Noise: Nx={hn[0]:+.3f}, Ny={hn[1]:+.3f}, Nz={hn[2]:+.3f}")
-
-    def _print_agent_zones_with_globals_flat(self, env, env_id: int, agent_label: str):
-        """Print complete zone breakdown and global rewards for a single agent using flat keys."""
-        agent_key = agent_label.lower()
-        print(f"\n[{agent_label}] ZONE REWARDS:")
-
-        zone_title = {'A':'A Track   ', 'B':'B Surface ', 'C':'C Danger  ', 'D':'D Rejoin  '}
-        
-        # Complete zone mapping
-        mapping = {
-            'A': [('progress','Progress'), ('deviation','Deviation')],
-            'B': [('gap','Gap'), ('surftangent','Surf_Tangent'), ('inward','Inward_Pen')],
-            'C': [('offpen','Off_Penalty'), ('inward','Inward_Pen')],
-            'D': [('progress','Progress'), ('deviation','Deviation'), ('inward','Inward_Pen')],
-        }
-
-        def _val(x):
-            """Extract value from tensor or scalar."""
-            if torch.is_tensor(x):
-                if x.ndim > 0 and x.shape[0] > env_id:
-                    return float(x[env_id].item())
-                elif x.ndim == 0:
-                    return float(x.item())
-                else:
-                    return 0.0
-            return float(x) if isinstance(x, (int, float)) else 0.0
-
-        for Z in ['A','B','C','D']:
-            zw_key = f'zone{Z}_weight_{agent_key}'
-            zt_key = f'zone{Z}_total_{agent_key}'
-            zone_w = env.reward_components.get(zw_key, 0.0)
-            zone_total = env.reward_components.get(zt_key, 0.0)
-            print(f"  {zone_title[Z]} (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
-
-            for comp_key, comp_label in mapping[Z]:
-                base = f"zone{Z}_{comp_key}_{agent_key}"
-                raw     = env.reward_components.get(f"{base}_raw", 0.0)
-                weight  = env.reward_components.get(f"{base}_weight", 0.0)
-                contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-                print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
-
-        print("  Global Rewards:")
-        for gk, glabel in [('zpenalty','Z Penalty      '),
-                           ('completion','Completion     '),
-                           ('timeeff','Time Efficiency')]:
-            base = f"global_{gk}_{agent_key}"
-            raw     = env.reward_components.get(f"{base}_raw", 0.0)
-            weight  = env.reward_components.get(f"{base}_weight", 0.0)
-            contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-            print(f"    {glabel:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
-
-        # Self force
-        raw     = env.reward_components.get(f"{agent_key}force_raw", 0.0)
-        weight  = env.reward_components.get(f"{agent_key}force_weight", 0.0)
-        contrib = env.reward_components.get(f"{agent_key}force_contrib", 0.0)
-        print(f"    {agent_label} Force   {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
-
-        # Awareness of other agent
-        aware_key = 'humanaware' if agent_key == 'robot' else 'robotaware'
-        raw     = env.reward_components.get(f"{aware_key}_raw", 0.0)
-        weight  = env.reward_components.get(f"{aware_key}_weight", 0.0)
-        contrib = env.reward_components.get(f"{aware_key}_contrib", 0.0)
-        label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
-        print(f"    {label:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")

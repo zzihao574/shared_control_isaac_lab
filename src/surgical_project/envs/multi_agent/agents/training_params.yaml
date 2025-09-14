@@ -16,23 +16,23 @@ networks:
     hidden_layers: [512, 512, 256, 256]
     dropout_p: 0.10
     orthogonal_init: true
-    ortho_gain_hidden: 1.414   # ReLU建议√2
-    ortho_gain_output: 0.001    # Actor输出小一点更稳
-    std_scale: 1.0             # 等价于去掉原来*0.2的限制
+    ortho_gain_hidden: 1.414   
+    ortho_gain_output: 0.001    
+    std_scale: 1.0             
   critic:
     hidden_layers: [512, 512, 256, 256]
     dropout_p: 0.10
     orthogonal_init: true
-    ortho_gain_hidden: 1.414   # 同样的ReLU补偿
-    ortho_gain_output: 1.0     # Critic可以用标准增益
+    ortho_gain_hidden: 1.414   
+    ortho_gain_output: 1.0     
 
 # ==============================================================================
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.6   # 初始噪声 = 0.6 × max_action
-  sigma_end: 0.1     # 收尾噪声 = 0.1 × max_action
-  decay_k: 3.0       # 衰减快慢（可省略，代码里给默认）
+  sigma_start: 0.6   # åˆå§‹å™ªå£° = 0.6 Ã— max_action
+  sigma_end: 0.1     # æ"¶å°¾å™ªå£° = 0.1 Ã— max_action
+  decay_k: 6.0       # è¡°å‡å¿«æ…¢ï¼ˆå¯çœç•¥ï¼Œä»£ç é‡Œç»™é»˜è®¤ï¼‰
 
 # ==============================================================================
 # Logging Configuration
@@ -105,6 +105,7 @@ reward_parameters:
     zoneC_weight_robot: 1.0
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
+    zoneC_overlap_robot: 1.0          # 新增：碰撞惩罚权重
 
     zoneD_weight_robot: 1.0
     zoneD_progress_robot: 1.0
@@ -122,17 +123,22 @@ reward_parameters:
     zoneA_weight_human: 0.0
     zoneA_progress_human: 0.0
     zoneA_deviation_human: 0.0
+
     zoneB_weight_human: 0.0
     zoneB_gap_human: 0.0
     zoneB_surftangent_human: 0.0
     zoneB_inward_human: 0.0
+
     zoneC_weight_human: 0.0
     zoneC_offpen_human: 0.0
     zoneC_inward_human: 0.0
+    zoneC_overlap_human: 0.0 
+
     zoneD_weight_human: 0.0
     zoneD_progress_human: 0.0
     zoneD_deviation_human: 0.0
     zoneD_inward_human: 0.0
+
     zpenalty_human: 0.0
     completion_human: 0.0
     timeeff_human: 0.0

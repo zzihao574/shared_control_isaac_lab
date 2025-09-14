@@ -555,43 +555,64 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return out
 
     def _zone_C_reward(self, masks, agent: str):
-        """Zone C (Danger): Inside obstacle - Heavy penalties for collision."""
+        """
+        Zone C (Danger): Implements a binary penalty system using raw * weight model.
+        - If overlapping: A single, large, constant penalty is applied.
+        - If too close (but not overlapping): The original penalties apply.
+        """
         outside, surface, danger, rejoin, alpha = masks
         
-        # Off-penalty for being inside constraint (safety violation)
+        # 模式 A: 物理重叠惩罚 (raw * weight)
+        R_overlap_raw = -10.0  # 在代码中直接定义原始惩罚值
+        w_overlap = self._get_component_weight('C', 'overlap', agent)
+        overlap_contrib = w_overlap * R_overlap_raw
+
+        # 模式 B: 危险接近惩罚 (原有逻辑)
         R_off = -0.6
         offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
-        
-        # Unified inward penalty (penalize moving toward obstacle)
         lam = 30.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
         inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
-        
-        # Zone C combination with configurable weights
         wo = self._get_component_weight('C', 'offpen', agent)
         wi = self._get_component_weight('C', 'inward', agent)
+        too_close_contrib = (wo * offpen_raw) + (wi * inward_raw)
+
+        # 使用 torch.where 根据是否碰撞选择最终的贡献值
+        zone_c_total_contrib = torch.where(
+            self.is_violating_t1,
+            torch.tensor(overlap_contrib, device=self.device),
+            too_close_contrib
+        )
+
+        # 应用区域权重
         zw = self._get_zone_weight('C', agent)
+        zone_total = zw * zone_c_total_contrib
         
-        offpen_contrib = wo * offpen_raw
-        inward_contrib = wi * inward_raw
-        zone_total = zw * (offpen_contrib + inward_contrib)
-        
-        out = torch.zeros_like(offpen_raw)
+        out = torch.zeros_like(zone_total)
         out[danger] = zone_total[danger]
-        
-        # Store for console display
-        RC, device = self.reward_components, offpen_raw.device
+
+        # --- 更新日志组件 ---
+        RC, device = self.reward_components, zone_total.device
         RC[f'zoneC_weight_{agent}'] = torch.tensor(zw, device=device)
         RC[f'zoneC_total_{agent}'] = zone_total
+
+        # 只有在不重叠时，offpen 和 inward 的贡献值才非零
+        RC[f'zoneC_offpen_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wo * offpen_raw)
+        RC[f'zoneC_inward_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wi * inward_raw)
+        
+        # 只有在重叠时，overlap 的贡献值才非零
+        RC[f'zoneC_overlap_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.tensor(overlap_contrib, device=self.device), torch.zeros_like(zone_total))
+
+        # 始终记录raw和weight，以便StepTracer可以读取
         RC[f'zoneC_offpen_{agent}_raw'] = offpen_raw
         RC[f'zoneC_offpen_{agent}_weight'] = torch.tensor(wo, device=device)
-        RC[f'zoneC_offpen_{agent}_contrib'] = offpen_contrib
         RC[f'zoneC_inward_{agent}_raw'] = inward_raw
         RC[f'zoneC_inward_{agent}_weight'] = torch.tensor(wi, device=device)
-        RC[f'zoneC_inward_{agent}_contrib'] = inward_contrib
-
+        RC[f'zoneC_overlap_{agent}_raw'] = torch.full_like(zone_total, R_overlap_raw)
+        RC[f'zoneC_overlap_{agent}_weight'] = torch.tensor(w_overlap, device=device)
+        
         return out
-
+    
     def _zone_D_reward(self, masks, agent: str):
         """Zone D (Rejoin): Trajectory recovery - Progress + Deviation + Outward movement."""
         outside, surface, danger, rejoin, alpha = masks

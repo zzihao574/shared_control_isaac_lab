@@ -263,7 +263,7 @@ class MADDPGTrainer:
         exploration_cfg = self.config.params.get('exploration', {})
         if exploration_cfg:
             print(f"[CONFIG] Exploration Schedule:")
-            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
+            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} â†’ {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
     def evaluate_milestone_if_due(self):
@@ -304,10 +304,10 @@ class MADDPGTrainer:
     def train(self) -> None:
         """Main training loop with configurable networks and noise scheduling."""
         print(f"[TRAIN] Starting training with configurable networks and noise scheduling:")
-        print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
-        print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
+        print(f"  - TrainingRunner: rolloutâ†’replayâ†’updateâ†’logâ†’count + exponential noise decay")
+        print(f"  - MilestoneEvaluator: milestoneâ†’evalâ†’topkâ†’log")
         print(f"  - Network layers configurable via YAML")
-        print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
+        print(f"  - Noise schedule: Ïƒ_start={self.runner.sigma_start} â†’ Ïƒ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
         
         try:
