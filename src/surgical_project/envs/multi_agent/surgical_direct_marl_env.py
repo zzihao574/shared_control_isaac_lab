@@ -413,10 +413,10 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _build_zone_masks(self):
         """
-        Build zone masks and alpha mixing coefficient for four-zone reward system.
+        Build zone masks and mixing coefficient for four-zone reward system.
         
         Returns:
-            Tuple of (outside, surface, danger, rejoin, alpha) masks
+            Tuple of (outside, surface, danger, rejoin) masks
         """
         D, O = 0.0075, 0.015  # Danger threshold, Obstacle boundary
         d = self.safety_distances_t1
@@ -447,22 +447,18 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         rejoin = self.rejoin_streak >= 10
         
-        # Alpha mixing coefficient for smooth zone transitions
-        alpha = ((d - D) / (O - D)).clamp(0.0, 1.0)
-        
-        return outside, surface, danger, rejoin, alpha
+        return outside, surface, danger, rejoin
 
     def _zone_A_reward(self, masks, agent: str):
         """Zone A (Track): Outside obstacle boundary - Progress and deviation rewards."""
-        outside, surface, danger, rejoin, alpha = masks
+        outside, surface, danger, rejoin = masks
         
         # Progress reward with binary penalty system
-        T = 1200.0
         p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
         best_p_tm1 = self.best_progress.clone()
         
-        delta_p = p_t - best_p_tm1
-        reward_forward = torch.clamp(delta_p * T, min=0.0, max=0.1)
+        delta_p = p_t - best_p_tm1 #1/1200-3/1200
+        reward_forward = torch.clamp(delta_p * 1200 * 0.04, min=0.0, max=0.16) #相对1/1200走了几倍，每倍奖励0.04，最高0.16
         prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
         
         # Update historical best progress for monotonic improvement
@@ -470,7 +466,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         # Linear deviation penalty from desired trajectory
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 0.5, min=0.0, max=0.1)
+        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2) #偏离1cm，惩罚0.04，最多惩罚0.2
         
         # Zone A combination with configurable weights
         wp = self._get_component_weight('A', 'progress', agent)
@@ -499,15 +495,14 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _zone_B_reward(self, masks, agent: str):
         """Zone B (Surface): Near obstacle - Gap optimization and surface following."""
-        outside, surface, danger, rejoin, alpha = masks
+        outside, surface, danger, rejoin = masks
         
         # Gap reward for maintaining optimal distance from constraint
-        beta = 8.0e4
+        beta = 6.0e3
         d = self.safety_distances_t1
-        gap_raw = -beta * (d - 0.010) ** 2
-        
+        gap_raw = -beta * (d - 0.010) ** 2 #偏差2.5mm，惩罚0.0375,偏差5mm，惩罚0.15
         # Surface tangent reward for following constraint boundary
-        gamma = 10.0
+        gamma = 1.0
         t = self.trajectory_manager.line_direction
         n = self.normal_t1
         
@@ -516,12 +511,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         t_surf = t_surf / torch.norm(t_surf, dim=-1, keepdim=True).clamp(min=1e-8)
         
         v_surf = (self.stylus_vel_t1 * t_surf).sum(dim=-1)
-        surf_raw = gamma * v_surf
+        surf_raw = gamma * v_surf #切向速度0.06m/s，奖励0.06
         
         # Unified inward penalty (penalize moving toward obstacle)
-        lam = 30.0
+        lam = 2.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
+        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0) #法向速度0.06m/s，惩罚0.12，权重 2，仅仅向内才有惩罚
         
         # Zone B combination with configurable weights
         wg = self._get_component_weight('B', 'gap', agent)
@@ -560,19 +555,19 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         - If overlapping: A single, large, constant penalty is applied.
         - If too close (but not overlapping): The original penalties apply.
         """
-        outside, surface, danger, rejoin, alpha = masks
+        outside, surface, danger, rejoin = masks
         
         # 模式 A: 物理重叠惩罚 (raw * weight)
-        R_overlap_raw = -10.0  # 在代码中直接定义原始惩罚值
+        R_overlap_raw = -0.3 #重叠固定惩罚0.3
         w_overlap = self._get_component_weight('C', 'overlap', agent)
         overlap_contrib = w_overlap * R_overlap_raw
 
         # 模式 B: 危险接近惩罚 (原有逻辑)
-        R_off = -0.6
+        R_off = -0.2 #重叠固定惩罚0.2
         offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
-        lam = 30.0
+        lam = 2.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
+        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0) #法向速度0.06m/s，惩罚0.12，权重 2，仅仅向内才有惩罚 
         wo = self._get_component_weight('C', 'offpen', agent)
         wi = self._get_component_weight('C', 'inward', agent)
         too_close_contrib = (wo * offpen_raw) + (wi * inward_raw)
@@ -615,30 +610,29 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _zone_D_reward(self, masks, agent: str):
         """Zone D (Rejoin): Trajectory recovery - Progress + Deviation + Outward movement."""
-        outside, surface, danger, rejoin, alpha = masks
+        outside, surface, danger, rejoin = masks
 
         # Enhanced progress reward for trajectory recovery
-        T = 1200.0
         p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
         best_p_tm1 = self.best_progress.clone()
 
         delta_p = p_t - best_p_tm1
-        reward_forward = torch.clamp(delta_p * T, min=0.0, max=4.0)
-        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -2.0))
+        reward_forward = torch.clamp(delta_p * 1200.0 * 0.04, min=0.0, max=0.16) #相对1/1200走了几倍，每倍奖励0.04，最高0.16
+        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
         self.best_progress = torch.maximum(best_p_tm1, p_t)
 
         # Enhanced deviation penalty for trajectory recovery
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 50.0, min=0.0, max=4.0)
+        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2) #偏离1cm，惩罚0.04，最多惩罚0.2
 
         # Inward movement handling (reward moving away, penalize moving toward)
-        lam = 30.0
+        lam = 2.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
         inward_raw = torch.where(
             v_dot_n >= 0,        # Moving toward obstacle
             -lam * v_dot_n,      # Penalize
             lam * (-v_dot_n)     # Moving away from obstacle, reward
-        )
+        ) #法向速度向内0.06m/s，惩罚0.12，向外奖励0.12，权重 2
 
         wp = self._get_component_weight('D', 'progress', agent)
         wd = self._get_component_weight('D', 'deviation', agent)
@@ -804,7 +798,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         is_final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         return torch.where(
             is_final_reached,
-            torch.full_like(self.safety_distances_t1, 100.0),
+            torch.full_like(self.safety_distances_t1, 1.0), #到达奖励1.0
             torch.zeros_like(self.safety_distances_t1)
         )
 

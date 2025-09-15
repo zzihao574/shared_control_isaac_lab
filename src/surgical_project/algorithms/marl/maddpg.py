@@ -218,7 +218,6 @@ class MADDPG:
             return {}
 
         obs_all, act_all, rew_all, nobs_all, done_any = batch
-        # obs_all: [B, ∑obs], act_all: [B, ∑act], rew_all: [B, N], nobs_all: [B, ∑obs], done_any: [B, 1]
         
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 

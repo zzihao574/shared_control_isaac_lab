@@ -43,7 +43,7 @@ class TrainingRunner:
     - Metrics collection and WandB logging
     """
     
-    def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids):
+    def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids, max_global_steps=None):
         self.env = env
         self.maddpg = maddpg
         self.replay = replay
@@ -61,9 +61,15 @@ class TrainingRunner:
         self.sigma_end = float(expl.get("sigma_end", 0.1))
         self.decay_k = float(expl.get("decay_k", 6.0))
         
-        # Get max_global_steps for noise scheduling
+        # Get max_global_steps for noise scheduling - CLI takes priority over YAML
         maddpg_cfg = self.maddpg.params.get('maddpg_config', {})
-        self.max_global_steps = int(maddpg_cfg.get('max_global_steps', 200000))
+        yaml_max_steps = int(maddpg_cfg.get('max_global_steps', 200000))
+        
+        # CLI parameter takes priority
+        if max_global_steps is not None and max_global_steps > 0:
+            self.max_global_steps = int(max_global_steps)
+        else:
+            self.max_global_steps = yaml_max_steps
         
         print(f"[NOISE SCHEDULE] Configured exponential decay:")
         print(f"  Start: {self.sigma_start}, End: {self.sigma_end}, k: {self.decay_k}")
@@ -131,10 +137,16 @@ class TrainingRunner:
         # Unified logging with noise scheduling information
         if stats and stats.get("training/updates", 0) > 0:
             payload = {
-                "train/actor_loss": stats.get("loss/actor/avg"),
-                "train/critic_loss": stats.get("loss/critic/avg"),
-                "model/q_mean": stats.get("q_mean/avg"),
-                "model/q_std": stats.get("q_std/avg"),
+                # Pass per-agent data directly to WandB (not averaged)
+                "loss/actor": stats.get("loss/actor"),
+                "loss/critic": stats.get("loss/critic"),
+                "q_mean": stats.get("q_mean"),
+                "q_std": stats.get("q_std"),
+                "q_target_mean": stats.get("q_target_mean"),
+                "q_target_std": stats.get("q_target_std"),
+                "grad_norm/actor": stats.get("grad_norm/actor"),
+                "grad_norm/critic": stats.get("grad_norm/critic"),
+                # Keep global metrics
                 "replay/buffer_size": len(self.maddpg.replay) if hasattr(self.maddpg, "replay") else None,
                 "train/episodes_done": self.global_episodes,
                 "train/updates": stats.get("training/updates"),
@@ -451,6 +463,7 @@ class WandBLogger:
         # Handle Per-Agent training metrics
         if "loss/actor" in metrics_data and isinstance(metrics_data.get('loss/actor'), dict):
             agent_ids = list(metrics_data['loss/actor'].keys())
+            
             for agent_id in agent_ids:
                 # Loss metrics
                 log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]

@@ -30,7 +30,7 @@ networks:
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.6   # åˆå§‹å™ªå£° = 0.6 Ã— max_action
+  sigma_start: 0.5   # åˆå§‹å™ªå£° = 0.5 Ã— max_action
   sigma_end: 0.1     # æ"¶å°¾å™ªå£° = 0.1 Ã— max_action
   decay_k: 6.0       # è¡°å‡å¿«æ…¢ï¼ˆå¯çœç•¥ï¼Œä»£ç é‡Œç»™é»˜è®¤ï¼‰
 
@@ -38,7 +38,7 @@ exploration:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true  # Enable detailed console logging for debugging
+  enable_console_logging: false  # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -93,27 +93,27 @@ reward_parameters:
   
   weights:
     # ===== ROBOT (Active Agent) =====
-    zoneA_weight_robot: 1.0
+    zoneA_weight_robot: 0.5
     zoneA_progress_robot: 1.0
     zoneA_deviation_robot: 1.0
 
-    zoneB_weight_robot: 1.0
+    zoneB_weight_robot: 0.5
     zoneB_gap_robot: 1.0
     zoneB_surftangent_robot: 1.0
     zoneB_inward_robot: 1.0
 
-    zoneC_weight_robot: 1.0
+    zoneC_weight_robot: 0.5
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
     zoneC_overlap_robot: 1.0          # 新增：碰撞惩罚权重
 
-    zoneD_weight_robot: 1.0
+    zoneD_weight_robot: 0.5
     zoneD_progress_robot: 1.0
     zoneD_deviation_robot: 1.0
     zoneD_inward_robot: 1.0
 
     zpenalty_robot: 0.0
-    completion_robot: 0.0
+    completion_robot: 1.0
     timeeff_robot: 0.0
     forceeff_robot: 0.0
     humanaware_robot: 0.0
@@ -157,17 +157,17 @@ termination_conditions:
 # MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS
 # ==============================================================================
 maddpg_config:
-  lr_actor: 0.001                      # Actor learning rate
-  lr_critic: 0.001                     # Critic learning rate
-  gamma: 0.99                          # Discount factor
+  lr_actor: 0.0005                    # Actor learning rate
+  lr_critic: 0.001                    # Critic learning rate
+  gamma: 0.99                         # Discount factor
   batch_size: 512                     # Training batch size (increased for stability)
   hidden_units: 512                   # Hidden layer units
   num_episodes: 600                   # Legacy parameter (kept for compatibility, not used for termination)
   max_global_steps: 200000            # PRIMARY TERMINATION CONDITION: Stop after this many training steps
   update_interval: 100                # Updates every N steps
-  min_buffer_size: 4096               # Minimum buffer size to start training (renamed from warmup)
+  min_buffer_size: 120000               # Minimum buffer size to start training (renamed from warmup)
   tau: 0.002                           # Target network update rate (slower for stability)
-  max_replay_buffer_len: 100000        # Maximum replay buffer size
+  max_replay_buffer_len: 480000        # Maximum replay buffer size
 
 # ==============================================================================
 # Training Monitoring - SIMPLIFIED
@@ -175,4 +175,4 @@ maddpg_config:
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
   # Episodes are counted as sum of all environment completions
-  milestone_episodes: [10, 20, 30, 40, 50, 100, 200, 300, 500]
+  milestone_episodes: [300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1500, 2000, 2500, 3000]
