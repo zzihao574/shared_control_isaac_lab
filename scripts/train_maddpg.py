@@ -182,7 +182,7 @@ class MADDPGTrainer:
             print(f"[SETUP] WandB disabled")
 
     def _setup_training_components(self):
-        """Initialize training components and metrics hub."""
+        """Initialize training components and metrics hub with unified max_global_steps logic."""
         print(f"[SETUP] Setting up training components...")
         
         # Create MetricsHub
@@ -199,13 +199,22 @@ class MADDPGTrainer:
         # Create TopK manager
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
-        # Setup training parameters
+        # UNIFIED max_global_steps logic: CLI takes priority over YAML
         maddpg_cfg = self.config.params.get('maddpg_config', {})
-        cfg_steps = maddpg_cfg.get('max_global_steps', 0) or 0
-        cli_steps = getattr(self.args, "max_global_steps", 0) or 0
-        self.max_global_steps = int(cli_steps if cli_steps > 0 else cfg_steps)
+        yaml_max_steps = int(maddpg_cfg.get('max_global_steps', 200000))
+        
+        # Check if CLI provided a value (0 means not specified)
+        if self.args.max_global_steps > 0:
+            self.max_global_steps = self.args.max_global_steps
+            print(f"[SETUP] Using CLI max_global_steps: {self.max_global_steps}")
+        else:
+            self.max_global_steps = yaml_max_steps
+            print(f"[SETUP] Using YAML max_global_steps: {self.max_global_steps}")
+        
+        # Ensure we have a valid value
         if self.max_global_steps <= 0:
-            self.max_global_steps = float('inf')
+            self.max_global_steps = 200000  # Default fallback
+            print(f"[SETUP] Using default max_global_steps: {self.max_global_steps}")
         
         self.milestone_episodes = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
         
@@ -218,14 +227,15 @@ class MADDPGTrainer:
         """Initialize training runner and milestone evaluator."""
         print(f"[SETUP] Creating TrainingRunner and MilestoneEvaluator...")
         
-        # Create TrainingRunner with noise scheduling
+        # Pass the resolved max_global_steps to TrainingRunner
         self.runner = TrainingRunner(
             env=self.env,
             maddpg=self.maddpg,
             replay=self.maddpg.replay,
             metrics_hub=self.metrics_hub,
             reward_logger=None,  # No reward_logger dependency
-            agent_ids=self.maddpg.agent_ids
+            agent_ids=self.maddpg.agent_ids,
+            max_global_steps=self.max_global_steps  # Pass the resolved value
         )
         
         # Create MilestoneEvaluator
@@ -263,7 +273,7 @@ class MADDPGTrainer:
         exploration_cfg = self.config.params.get('exploration', {})
         if exploration_cfg:
             print(f"[CONFIG] Exploration Schedule:")
-            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} â†’ {exploration_cfg.get('sigma_end', 0.1)}")
+            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
     def evaluate_milestone_if_due(self):
@@ -304,10 +314,10 @@ class MADDPGTrainer:
     def train(self) -> None:
         """Main training loop with configurable networks and noise scheduling."""
         print(f"[TRAIN] Starting training with configurable networks and noise scheduling:")
-        print(f"  - TrainingRunner: rolloutâ†’replayâ†’updateâ†’logâ†’count + exponential noise decay")
-        print(f"  - MilestoneEvaluator: milestoneâ†’evalâ†’topkâ†’log")
+        print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
+        print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
         print(f"  - Network layers configurable via YAML")
-        print(f"  - Noise schedule: Ïƒ_start={self.runner.sigma_start} â†’ Ïƒ_end={self.runner.sigma_end}")
+        print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
         
         try:
@@ -395,7 +405,7 @@ def main():
     print(f"[MAIN] Arguments parsed:")
     print(f"  Task: {args_cli.task}")
     print(f"  Environments: {args_cli.num_envs}")
-    print(f"  Max steps: {args_cli.max_global_steps}")
+    print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
     print(f"  WandB: {args_cli.wandb}")
     print(f"  Config: {args_cli.config}")
     

@@ -9,15 +9,16 @@ from .networks import Actor, Critic
 class DDPGAgent:
     """
     Deep Deterministic Policy Gradient agent for shared network MADDPG.
+    Modified: Removed max_action constraints at agent level.
     
     Features:
     - Stochastic actor with mean and variance outputs
     - Centralized critic for multi-agent coordination  
     - Soft target network updates
-    - Force constraint compliance
     - Batch processing support for shared network architecture
     - Gradient norm statistics for training diagnostics
     - Configurable network architecture via YAML
+    - Force constraints handled externally in MADDPG.select_actions
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
@@ -42,32 +43,21 @@ class DDPGAgent:
         self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.001))
         self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.001))
         self.tau = float(maddpg_cfg.get('tau', 0.002))  # Target network update rate
-        hidden_dim = int(maddpg_cfg.get('hidden_units', 512))
-        
-        # Get agent-specific force constraints
-        constraints = params.get('constraints', {})
-        if 'robot' in agent_id.lower():
-            max_action = constraints.get('max_robot_force', 0.04)
-        else:
-            max_action = constraints.get('max_human_force', 0.04)
-            
-        self.max_action = max_action
         
         # Load network configuration
         net_cfg = params.get('networks', {})
         actor_cfg = net_cfg.get('actor', {})
         critic_cfg = net_cfg.get('critic', {})
 
-        hidden_dim = int(params.get('maddpg_config', {}).get('hidden_units', 512))  # Compatibility with old field
-
-        actor_hidden_layers = actor_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
+        # Network architecture - use configured layers or sensible defaults
+        actor_hidden_layers = actor_cfg.get('hidden_layers', [256, 256])
         actor_dropout = float(actor_cfg.get('dropout_p', 0.0))
         actor_ortho = bool(actor_cfg.get('orthogonal_init', False))
         actor_gain_h = float(actor_cfg.get('ortho_gain_hidden', 1.0))
         actor_gain_o = float(actor_cfg.get('ortho_gain_output', 0.01))
-        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))  # New parameter
+        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))
 
-        critic_hidden_layers = critic_cfg.get('hidden_layers', [hidden_dim, hidden_dim])
+        critic_hidden_layers = critic_cfg.get('hidden_layers', [256, 256])
         critic_dropout = float(critic_cfg.get('dropout_p', 0.0))
         critic_ortho = bool(critic_cfg.get('orthogonal_init', False))
         critic_gain_h = float(critic_cfg.get('ortho_gain_hidden', 1.0))
@@ -76,7 +66,6 @@ class DDPGAgent:
         print(f"[DDPG AGENT] {agent_id}:")
         print(f"  State dim: {state_dim}, Action dim: {action_dim}")
         print(f"  Total state dim: {total_state_dim}, Total action dim: {total_action_dim}")
-        print(f"  Max action: {max_action}")
         print(f"  Actor layers: {actor_hidden_layers}, dropout: {actor_dropout}")
         print(f"  Critic layers: {critic_hidden_layers}, dropout: {critic_dropout}")
         print(f"  Orthogonal init - Actor: {actor_ortho}, Critic: {critic_ortho}")
@@ -84,11 +73,9 @@ class DDPGAgent:
         print(f"  LR - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
         print(f"  Target update rate (tau): {self.tau}")
         
-        # Initialize actor networks
+        # Initialize actor networks (no max_action_magnitude parameter)
         self.actor = Actor(
             state_dim, action_dim,
-            hidden_dimension=hidden_dim,
-            max_action_magnitude=max_action,
             hidden_layers=actor_hidden_layers,
             dropout_p=actor_dropout,
             orthogonal_init=actor_ortho,
@@ -99,8 +86,6 @@ class DDPGAgent:
 
         self.actor_target = Actor(
             state_dim, action_dim,
-            hidden_dimension=hidden_dim,
-            max_action_magnitude=max_action,
             hidden_layers=actor_hidden_layers,
             dropout_p=actor_dropout,
             orthogonal_init=actor_ortho,
@@ -113,7 +98,6 @@ class DDPGAgent:
         # Initialize critic networks (centralized training)
         self.critic = Critic(
             total_state_dim, total_action_dim,
-            hidden_dimension=hidden_dim,
             hidden_layers=critic_hidden_layers,
             dropout_p=critic_dropout,
             orthogonal_init=critic_ortho,
@@ -123,7 +107,6 @@ class DDPGAgent:
 
         self.critic_target = Critic(
             total_state_dim, total_action_dim,
-            hidden_dimension=hidden_dim,
             hidden_layers=critic_hidden_layers,
             dropout_p=critic_dropout,
             orthogonal_init=critic_ortho,
@@ -137,52 +120,6 @@ class DDPGAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
         
         print(f"[DDPG AGENT] {agent_id} initialized successfully")
-
-    def update_actor(self, loss: torch.Tensor) -> Dict[str, float]:
-        """Update actor network using provided loss."""
-        # Zero gradients
-        self.actor_optimizer.zero_grad()
-        
-        # Backpropagate loss
-        loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-        
-        # Update parameters
-        self.actor_optimizer.step()
-        
-        return {
-            'actor_loss': loss.item()
-        }
-
-    def update_critic(self, states: torch.Tensor, actions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-        """Update critic network using Huber loss."""
-        # Forward pass through critic
-        q_values = self.critic(states, actions)
-        
-        # Calculate Huber loss (smooth L1) for better robustness to outliers
-        critic_loss = F.smooth_l1_loss(q_values, targets)
-        
-        # Zero gradients
-        self.critic_optimizer.zero_grad()
-        
-        # Backpropagate loss
-        critic_loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
-        
-        # Update parameters
-        self.critic_optimizer.step()
-        
-        return {
-            'critic_loss': critic_loss.item(),
-            'q_mean': q_values.mean().item(),
-            'q_std': q_values.std().item(),
-            'target_mean': targets.mean().item(),
-            'target_std': targets.std().item()
-        }
 
     def soft_update(self) -> None:
         """Perform soft update of target networks using Polyak averaging."""

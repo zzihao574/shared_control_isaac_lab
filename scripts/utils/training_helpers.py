@@ -61,19 +61,17 @@ class TrainingRunner:
         self.sigma_end = float(expl.get("sigma_end", 0.1))
         self.decay_k = float(expl.get("decay_k", 6.0))
         
-        # Get max_global_steps for noise scheduling - CLI takes priority over YAML
-        maddpg_cfg = self.maddpg.params.get('maddpg_config', {})
-        yaml_max_steps = int(maddpg_cfg.get('max_global_steps', 200000))
-        
-        # CLI parameter takes priority
+        # Use the max_global_steps passed from trainer (already resolved CLI vs YAML priority)
         if max_global_steps is not None and max_global_steps > 0:
             self.max_global_steps = int(max_global_steps)
         else:
-            self.max_global_steps = yaml_max_steps
+            # Fallback to YAML config if not provided
+            maddpg_cfg = self.maddpg.params.get('maddpg_config', {})
+            self.max_global_steps = int(maddpg_cfg.get('max_global_steps', 200000))
         
         print(f"[NOISE SCHEDULE] Configured exponential decay:")
         print(f"  Start: {self.sigma_start}, End: {self.sigma_end}, k: {self.decay_k}")
-        print(f"  Max steps: {self.max_global_steps}")
+        print(f"  Max steps for noise decay: {self.max_global_steps}")
 
     def _calculate_noise_scale(self) -> float:
         """Calculate current noise scaling factor using exponential decay."""
@@ -135,7 +133,7 @@ class TrainingRunner:
         self.global_episodes += episode_increment
 
         # Unified logging with noise scheduling information
-        if stats and stats.get("training/updates", 0) > 0:
+        if stats and (stats.get("training/critic_updates", 0) > 0 or stats.get("training/actor_updates", 0) > 0):
             payload = {
                 # Pass per-agent data directly to WandB (not averaged)
                 "loss/actor": stats.get("loss/actor"),
@@ -149,11 +147,13 @@ class TrainingRunner:
                 # Keep global metrics
                 "replay/buffer_size": len(self.maddpg.replay) if hasattr(self.maddpg, "replay") else None,
                 "train/episodes_done": self.global_episodes,
-                "train/updates": stats.get("training/updates"),
+                "training/critic_updates": stats.get("training/critic_updates"),
+                "training/actor_updates": stats.get("training/actor_updates"),
                 "exploration/noise_scale": noise_scale,
             }
             # Clean None values
             payload = {k: v for k, v in payload.items() if v is not None}
+            
             self.metrics.push_update(self.global_step, payload)
 
         # Step counting and environment synchronization
@@ -166,7 +166,7 @@ class TrainingRunner:
         self._current_obs = next_obs
 
         return next_obs
-
+ 
     def mark_skip_episode_once(self):
         """Mark to skip episode counting once for milestone evaluation."""
         self._skip_episode_once = True
@@ -371,12 +371,14 @@ class MetricsHub:
 class WandBLogger:
     """
     Enhanced WandB logger with per-agent metrics and configurable networks support.
+    Updated: Support for asynchronous update statistics.
     
     Features:
     - Per-agent training metrics
     - Network configuration logging
     - Exploration metrics tracking
     - Milestone and evaluation logging
+    - Separate tracking of critic and actor updates
     """
     
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
@@ -397,17 +399,20 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["maddpg", "multi-agent", "surgical-robot", "configurable-networks"],
-            notes="Multi-environment parallel MADDPG training with configurable networks and noise scheduling",
+            tags=["maddpg", "multi-agent", "surgical-robot", "configurable-networks", "async-updates"],
+            notes="Multi-environment parallel MADDPG training with configurable networks, noise scheduling, and async critic-actor updates",
             settings=wandb.Settings(start_method="thread")
         )
         
         # Log key configuration for dashboard
         networks_cfg = config.get("networks", {})
         exploration_cfg = config.get("exploration", {})
+        maddpg_cfg = config.get("maddpg_config", {})
         
         wandb.config.update({
-            "update_interval": config.get("maddpg_config", {}).get("update_interval", 100),
+            "update_interval": maddpg_cfg.get("update_interval", 100),
+            "critic_update_interval": maddpg_cfg.get("update_interval", 100),
+            "actor_update_interval": maddpg_cfg.get("update_interval", 100) * 2,  # Actor updates 2x slower
             "reward_scale": 0.01,
             "agent_mode": "robot_only",
             "reward_components": "trajectory+progress+potential_field",
@@ -451,10 +456,10 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with new focused logging.")
+        print("[WANDB] Attached to MetricsHub with async update support.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-        """Log metrics with per-agent structure and global metrics."""
+        """Log metrics with per-agent structure, global metrics, and async update tracking."""
         if not self.enabled or not metrics_data:
             return
 
@@ -466,30 +471,41 @@ class WandBLogger:
             
             for agent_id in agent_ids:
                 # Loss metrics
-                log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
-                log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
+                if 'loss/actor' in metrics_data and agent_id in metrics_data['loss/actor']:
+                    log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
+                if 'loss/critic' in metrics_data and agent_id in metrics_data['loss/critic']:
+                    log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
+                
                 # Q-Value metrics
-                log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
-                log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
+                if 'q_mean' in metrics_data and agent_id in metrics_data['q_mean']:
+                    log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
+                if 'q_std' in metrics_data and agent_id in metrics_data['q_std']:
+                    log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
+                
                 # Target Q-Value metrics
                 if 'q_target_mean' in metrics_data and agent_id in metrics_data['q_target_mean']:
-                     log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
+                    log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
                 if 'q_target_std' in metrics_data and agent_id in metrics_data['q_target_std']:
-                     log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
+                    log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
+                
                 # Gradient norm metrics
-                log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
-                log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
+                if 'grad_norm/actor' in metrics_data and agent_id in metrics_data['grad_norm/actor']:
+                    log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
+                if 'grad_norm/critic' in metrics_data and agent_id in metrics_data['grad_norm/critic']:
+                    log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
 
         # Handle global and milestone metrics
         global_keys = {
             "exploration/noise_scale": "exploration/noise_scale",
             "train/episodes_done": "train/global_episodes",
             "replay/buffer_size": "replay/buffer_size",
-            "train/updates": "train/updates",
+            "training/critic_updates": "train/critic_updates",
+            "training/actor_updates": "train/actor_updates",
             "eval/return_mean": "milestone/actor_return",
             "milestone/topk_best_score": "milestone/topk_best_return",
             "milestone/latest_completed": "milestone/latest_completed",
         }
+        
         for src_key, dest_key in global_keys.items():
             if src_key in metrics_data and metrics_data[src_key] is not None:
                 log_data[dest_key] = metrics_data[src_key]
@@ -502,8 +518,7 @@ class WandBLogger:
         if self.enabled and self.run:
             wandb.finish()
             print("[WANDB] Run finished")
-
-
+            
 class TrainingConfiguration:
     """Training configuration loader and parameter manager."""
     
@@ -615,20 +630,20 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
-    config = TrainingConfiguration(config_path)
     parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with configurable networks")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
     parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
-    parser.add_argument("--seed", type=int, default=config.params.get('seed', 42))
+    parser.add_argument("--seed", type=int, default=42)
     
+    # Training termination - removed default value to allow proper priority handling in trainer
     parser.add_argument(
         "--max_global_steps", 
         type=int, 
-        default=config.maddpg_cfg.get('max_global_steps', 0),
-        help="Stop after this many global training steps; if >0, it becomes the sole stop condition."
+        default=0,  # 0 means unspecified, will use YAML config
+        help="Stop after this many global training steps; if >0, it becomes the primary stop condition."
     )
     
     # Model management

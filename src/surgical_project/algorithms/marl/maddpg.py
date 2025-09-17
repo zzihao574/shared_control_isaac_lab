@@ -1,6 +1,7 @@
 """
 Multi-environment parallel MADDPG algorithm with shared network architecture.
 Enhanced with per-agent metrics and target Q-value statistics.
+Modified: Asynchronous update frequencies - Critic updates 2x more than Actor.
 
 Features:
 - Single shared network per agent (not per environment)
@@ -9,6 +10,9 @@ Features:
 - Gradient norm monitoring for training stability
 - Enhanced per-agent metrics with target Q-value tracking
 - Global noise scaling for exploration schedule
+- IDENTICAL NETWORK INITIALIZATION with proper optimizer separation
+- Force constraints applied only in select_actions method
+- ASYNC UPDATES: Critic updates every interval, Actor updates every 2*interval
 """
 
 import torch
@@ -27,6 +31,8 @@ class MADDPG:
     - 512 parallel environments share these networks
     - Joint replay buffer stores (obs_all, act_all, rewards_vec, next_obs_all, done_any)
     - Training progress driven by global episode count
+    - IDENTICAL INITIALIZATION: Both agents start with identical weights
+    - ASYNC UPDATES: Critic:Actor = 2:1 update ratio
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
@@ -35,6 +41,9 @@ class MADDPG:
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
+        
+        # Set global seeds FIRST for identical initialization
+        self._set_global_seeds()
         
         # Get environment configuration
         self.agent_ids = list(self.actual_env.cfg.possible_agents)
@@ -53,8 +62,8 @@ class MADDPG:
         print(f"  Action dims: {self.action_dims} (total: {self.total_action_dim})")
         print(f"  Networks: ONE per agent type (shared across ALL environments)")
 
-        # Initialize shared agents and joint buffer
-        self._initialize_agents()
+        # Initialize shared agents with IDENTICAL weights
+        self._initialize_agents_with_identical_init()
         self._initialize_replay_buffers()
         self._build_slices()
         
@@ -66,31 +75,65 @@ class MADDPG:
         self.min_buffer_size = int(maddpg_cfg.get('min_buffer_size', 4096))
         
         self.training_steps = 0  # Total training steps
-        self.update_count = 0  # Update count
+        self.critic_update_count = 0  # Critic update count
+        self.actor_update_count = 0   # Actor update count
         
         print(f"[MADDPG] Shared network initialization complete")
         print(f"  Batch size: {self.batch_size}")
-        print(f"  Update interval: {self.update_interval}")
+        print(f"  Critic update interval: {self.update_interval}")
+        print(f"  Actor update interval: {self.update_interval * 2}")
         print(f"  Min buffer size: {self.min_buffer_size}")
+    
+    def _set_global_seeds(self) -> None:
+        """Set all random seeds for reproducible initialization."""
+        seed = int(self.params.get("seed", 42))
+        import random
+        random.seed(seed)
+        np.random.seed(seed)  
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"[SEED] Global seeds set to {seed}")
     
     def _unwrap_environment(self, env):
         """Get actual environment object."""
         return getattr(env, 'unwrapped', env)
         
-    def _initialize_agents(self) -> None:
-        """Initialize shared DDPG agents (one per agent type)."""
+    def _initialize_agents_with_identical_init(self) -> None:
+        """Initialize agents with identical network weights but separate optimizers."""
         self.agents = {}
-        for i, agent_id in enumerate(self.agent_ids):
-            self.agents[agent_id] = DDPGAgent(
-                agent_id=agent_id,
-                state_dim=self.obs_dims[i],
-                action_dim=self.action_dims[i],
-                total_state_dim=self.total_obs_dim,
-                total_action_dim=self.total_action_dim,
-                params=self.params,
-                device=self.device,
-            )
-            print(f"[SHARED] Created shared network for agent: {agent_id}")
+        
+        # Create first agent (human) with seeded initialization
+        first_agent_id = self.agent_ids[0]  # Usually "human"
+        self.agents[first_agent_id] = self._build_single_agent(0, first_agent_id)
+        print(f"[SHARED] Created shared network for agent: {first_agent_id}")
+        
+        # Create second agent (robot) with separate optimizers
+        second_agent_id = self.agent_ids[1]  # Usually "robot" 
+        second_agent = self._build_single_agent(1, second_agent_id)
+        
+        # Copy only the network weights, not the entire object (avoids optimizer sharing)
+        second_agent.actor.load_state_dict(self.agents[first_agent_id].actor.state_dict())
+        second_agent.actor_target.load_state_dict(self.agents[first_agent_id].actor_target.state_dict())
+        second_agent.critic.load_state_dict(self.agents[first_agent_id].critic.state_dict())
+        second_agent.critic_target.load_state_dict(self.agents[first_agent_id].critic_target.state_dict())
+        
+        self.agents[second_agent_id] = second_agent
+        print(f"[SHARED] Created shared network for agent: {second_agent_id} with identical weights")
+        
+        print(f"[INIT] {first_agent_id}/{second_agent_id} initialized with IDENTICAL weights (separate optimizers)")
+
+    def _build_single_agent(self, agent_idx: int, agent_id: str) -> DDPGAgent:
+        """Build a single DDPG agent."""
+        return DDPGAgent(
+            agent_id=agent_id,
+            state_dim=self.obs_dims[agent_idx],
+            action_dim=self.action_dims[agent_idx],
+            total_state_dim=self.total_obs_dim,
+            total_action_dim=self.total_action_dim,
+            params=self.params,
+            device=self.device,
+        )
     
     def _initialize_replay_buffers(self) -> None:
         """Initialize joint replay buffer for shared architecture."""
@@ -126,6 +169,7 @@ class MADDPG:
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """
         Select actions using shared networks with global noise scaling.
+        MODIFIED: Single point force constraint applied here only.
         
         Args:
             observations: {agent_id: Tensor[num_envs, obs_dim]}
@@ -139,21 +183,27 @@ class MADDPG:
         actions = {}
         detail = {"mean_actions": {}, "noise_actions": {}}  # Debug information
         
+        # Get force constraints from configuration
+        constraints = self.params.get('constraints', {})
+        max_robot_force = constraints.get('max_robot_force', 0.04)
+        max_human_force = constraints.get('max_human_force', 0.04)
+        
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
             obs_i = observations[agent_id]  # [num_envs, obs_dim]
             
+            # Determine force limit based on agent type
+            if 'robot' in agent_id.lower():
+                max_force = max_robot_force
+            else:
+                max_force = max_human_force
+            
             with torch.no_grad():
                 mean, std = agent.actor(obs_i)
                 noise = (noise_scale * std * torch.randn_like(mean)) if add_noise else torch.zeros_like(mean)
-                action = (mean + noise).clamp_(-agent.max_action, agent.max_action)
+                # SINGLE POINT FORCE CONSTRAINT: Only here
+                action = (mean + noise).clamp_(-max_force, max_force)
             
-            # Single agent training: zero out human actions
-            if agent_id == "human":
-                mean = torch.zeros_like(mean)
-                noise = torch.zeros_like(noise)
-                action = torch.zeros_like(action)
-
             actions[agent_id] = action
             detail["mean_actions"][agent_id] = mean
             detail["noise_actions"][agent_id] = noise
@@ -197,20 +247,19 @@ class MADDPG:
 
     def update(self) -> Dict[str, Any]:
         """
-        CTDE update: Centralized Training, Decentralized Execution.
-        Enhanced with per-agent metrics and target Q-value statistics.
-        
-        - Critics see global state-action space (∑obs, ∑act)
-        - Actors update with respect to their own actions only
-        - Other agents' actions are detached from gradient flow
+        CTDE update with asynchronous update frequencies.
+        Critic updates every interval, Actor updates every 2*interval.
         """
         if len(self.replay) < self.min_buffer_size:
             return {}
 
         self.training_steps += 1
         
-        # Only update every update_interval steps
-        if self.training_steps % self.update_interval != 0:
+        # Determine what to update based on step count
+        should_update_critic = (self.training_steps % self.update_interval == 0)
+        should_update_actor = (self.training_steps % (self.update_interval * 2) == 0)
+        
+        if not (should_update_critic or should_update_actor):
             return {}
 
         batch = self.replay.sample(self.batch_size)
@@ -218,13 +267,12 @@ class MADDPG:
             return {}
 
         obs_all, act_all, rew_all, nobs_all, done_any = batch
-        
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 
         # Enhanced statistics structure with per-agent metrics
         stats = {
             "loss/actor": {}, "loss/critic": {}, "q_mean": {}, "q_std": {},
-            "q_target_mean": {}, "q_target_std": {},  # New: Target Q statistics
+            "q_target_mean": {}, "q_target_std": {},
             "grad_norm/actor": {}, "grad_norm/critic": {}
         }
 
@@ -237,66 +285,76 @@ class MADDPG:
             next_action_parts.append(next_action_i)
         next_act_all = torch.cat(next_action_parts, dim=-1)
 
-        # Update each agent using CTDE
+        # Update each agent with async frequencies
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
 
-            # Critic Update with enhanced statistics
-            with torch.no_grad():
-                q_next = agent.critic_target(nobs_all, next_act_all).squeeze(-1)  # [B]
-                y = rew_all[:, i] + (1.0 - done_any.squeeze(-1)) * gamma * q_next  # [B]
+            # CRITIC UPDATE (every interval steps)
+            if should_update_critic:
+                with torch.no_grad():
+                    q_next = agent.critic_target(nobs_all, next_act_all).squeeze(-1)
+                    y = rew_all[:, i] + (1.0 - done_any.squeeze(-1)) * gamma * q_next
 
-            q = agent.critic(obs_all, act_all).squeeze(-1)  # [B]
-            critic_loss = torch.nn.functional.smooth_l1_loss(q, y)
+                q = agent.critic(obs_all, act_all).squeeze(-1)
+                critic_loss = torch.nn.functional.smooth_l1_loss(q, y)
 
-            agent.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            c_grad_norm = self._module_grad_norm(agent.critic)
-            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), max_norm=1.0)
-            agent.critic_optimizer.step()
+                agent.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                c_grad_norm = self._module_grad_norm(agent.critic)
+                agent.critic_optimizer.step()
 
-            # Store enhanced statistics including target Q values
-            stats["loss/critic"][agent_id] = float(critic_loss.detach().cpu().item())
-            stats["q_mean"][agent_id] = float(q.detach().cpu().mean().item())
-            stats["q_std"][agent_id] = float(q.detach().cpu().std().item())
-            stats["q_target_mean"][agent_id] = float(y.detach().cpu().mean().item())
-            stats["q_target_std"][agent_id] = float(y.detach().cpu().std().item())
-            stats["grad_norm/critic"][agent_id] = float(c_grad_norm)
+                # Store critic statistics
+                stats["loss/critic"][agent_id] = float(critic_loss.detach().cpu().item())
+                stats["q_mean"][agent_id] = float(q.detach().cpu().mean().item())
+                stats["q_std"][agent_id] = float(q.detach().cpu().std().item())
+                stats["q_target_mean"][agent_id] = float(y.detach().cpu().mean().item())
+                stats["q_target_std"][agent_id] = float(y.detach().cpu().std().item())
+                stats["grad_norm/critic"][agent_id] = float(c_grad_norm)
 
-            # Actor Update (CTDE: only own action has gradient)
-            action_parts = []
-            for j, agent_j in enumerate(self.agent_ids):
-                slice_j = self.obs_slices[j]
-                if j == i:  # Current agent: needs gradient
-                    action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
-                else:  # Other agents: detach gradients
-                    with torch.no_grad():
+            # ACTOR UPDATE (every 2*interval steps)
+            if should_update_actor:
+                action_parts = []
+                for j, agent_j in enumerate(self.agent_ids):
+                    slice_j = self.obs_slices[j]
+                    if j == i:
                         action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
-                    action_j = action_j.detach()
-                action_parts.append(action_j)
-            
-            action_pred_all = torch.cat(action_parts, dim=-1)
-            actor_loss = -agent.critic(obs_all, action_pred_all).mean()
+                    else:
+                        with torch.no_grad():
+                            action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
+                        action_j = action_j.detach()
+                    action_parts.append(action_j)
+                
+                action_pred_all = torch.cat(action_parts, dim=-1)
+                actor_loss = -agent.critic(obs_all, action_pred_all).mean()
 
-            agent.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            a_grad_norm = self._module_grad_norm(agent.actor)
-            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), max_norm=1.0)
-            agent.actor_optimizer.step()
+                agent.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                a_grad_norm = self._module_grad_norm(agent.actor)
+                agent.actor_optimizer.step()
+
+                # Store actor statistics
+                stats["loss/actor"][agent_id] = float(actor_loss.detach().cpu().item())
+                stats["grad_norm/actor"][agent_id] = float(a_grad_norm)
 
             # Soft target network updates
-            agent.soft_update()
+            if should_update_critic or should_update_actor:
+                agent.soft_update()
 
-            # Store actor statistics
-            stats["loss/actor"][agent_id] = float(actor_loss.detach().cpu().item())
-            stats["grad_norm/actor"][agent_id] = float(a_grad_norm)
+        # Update counters
+        if should_update_critic:
+            self.critic_update_count += 1
+        if should_update_actor:
+            self.actor_update_count += 1
 
-        # Aggregate statistics with averages
+        # Aggregate statistics
         for k in ["loss/critic", "loss/actor", "q_mean", "q_std", "q_target_mean", "q_target_std", "grad_norm/actor", "grad_norm/critic"]:
             if stats[k]:
                 stats[f"{k}/avg"] = float(np.mean(list(stats[k].values())))
 
-        self.update_count += 1
-        stats["training/updates"] = int(self.update_count)
-
+        # Include update statistics
+        if should_update_critic or should_update_actor:
+            stats["training/critic_updates"] = int(self.critic_update_count)
+            stats["training/actor_updates"] = int(self.actor_update_count)
+        
         return stats
+    

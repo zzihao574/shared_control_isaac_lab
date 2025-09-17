@@ -257,7 +257,7 @@ class StepTracer:
         D, O = 0.0075, 0.015
         is_colliding = env.is_violating_t1[env_id].item()
 
-        # --- 新的 Active Zone 逻辑: 显示小区 ---
+        # --- 新的 Active Zone 逻辑: 显示区间 ---
         if safety >= O:
             active_zone = "A (Track)"
         elif safety <= D:

@@ -8,7 +8,7 @@ Features:
 - Four-zone reward system: Track/Surface/Danger/Rejoin
 - Unified global_step integration with trainer
 - Optional console logging via injected StepTracer
-- Configuration only from trainer injection (no self-loading)
+- Configuration from YAML file via trainer injection
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
+import yaml
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
@@ -37,7 +38,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Four-zone reward system: Track/Surface/Danger/Rejoin
     - Unified global_step integration with trainer
     - Optional console logging via injected StepTracer
-    - Configuration only from trainer injection (no self-loading)
+    - Configuration from YAML file via trainer injection
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -53,12 +54,32 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         # Unified global_step integration with trainer
         self._trainer_global_step = None
-        
+    
     def _setup_core_configuration(self) -> None:
-        """Setup core configuration from trainer injection only."""
-        if not hasattr(self, "params") or not isinstance(getattr(self, "params", None), dict):
-            print("[WARNING] No configuration injected by trainer, using minimal defaults")
-            self.params = self._get_minimal_defaults()
+        """Setup core configuration from trainer injection or direct YAML reading."""
+        # Always try trainer injection first (standard flow)
+        if hasattr(self, "params") and isinstance(getattr(self, "params", None), dict):
+            print("[ENV] Using configuration injected by trainer")
+        else:
+            # Fallback: direct YAML reading (for standalone testing)
+            print("[ENV] Configuration not injected by trainer, loading directly from YAML")
+            try:
+                import yaml
+                import os
+                # Get absolute path from current file location
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                yaml_file = os.path.join(current_dir, "agents", "training_params.yaml")
+                
+                if not os.path.exists(yaml_file):
+                    raise FileNotFoundError(f"YAML config not found at: {yaml_file}")
+                
+                with open(yaml_file, 'r') as f:
+                    self.params = yaml.safe_load(f)
+                print(f"[ENV] Loaded configuration from: {yaml_file}")
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to load YAML configuration: {e}")
+                raise RuntimeError(f"Could not load configuration: {e}")
             
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
@@ -69,35 +90,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         print(f"[ENV] Episode length: {self.cfg.episode_length_s}s")
         print(f"[ENV] Environment configured for physics + rewards only")
     
-    def _get_minimal_defaults(self) -> dict:
-        """Provide minimal default configuration if none injected by trainer."""
-        return {
-            'constraints': {
-                'min_z_position': 0.0,
-                'max_robot_force': 0.04,
-                'max_human_force': 0.04,
-                'joint_limits': {
-                    'waist': [-0.98, 0.98], 'shoulder': [0.0, 1.75], 'elbow': [-0.7854, 1.5],
-                    'yaw': [-1.5, 1.5], 'pitch': [0.0, 2.5], 'roll': [-2.58, 2.58]
-                }
-            },
-            'initial_conditions': {
-                'joint_positions': {'waist': -0.96, 'shoulder': 0.0, 'elbow': 1.0, 'yaw': 0.0, 'pitch': 2.0944, 'roll': 0.0}
-            },
-            'constraint_geometry': {'collision_threshold': 0.001},
-            'trajectory': {'start_point': [0.14, -0.2, 0.03], 'end_point': [0.14, 0.2, 0.03]},
-            'reward_parameters': {'completion_threshold': 0.01, 'weights': {}},
-            'termination_conditions': {'z_below_zero': False, 'edge_collision': False, 'safety_distance_threshold': 0.0}
-        }
-    
     def _load_constraint_parameters(self) -> None:
         """Load constraint-related parameters from configuration."""
         constraints = self.params['constraints']
         
         # Position and force limits
         self.min_z_pos = constraints['min_z_position']
-        self.max_robot_force = constraints['max_robot_force']
-        self.max_human_force = constraints['max_human_force']
         
         # Joint limits as tensors for efficient constraint enforcement
         joint_limits = constraints['joint_limits']
@@ -176,11 +174,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _initialize_reward_state_caches(self) -> None:
         """Initialize reward system state caches for delta calculations."""
-        # Progress/distance caches for reward delta calculations
-        self.prev_safety_distances = torch.ones(self.num_envs, device=self.device) * 0.02
-        self.prev_progress = torch.zeros(self.num_envs, device=self.device)
-        self.best_progress = torch.zeros(self.num_envs, device=self.device)
-        
         # Rejoin zone stability gate counter
         self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         
@@ -298,6 +291,35 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     def _get_component_weight(self, zone_letter: str, comp: str, agent: str) -> float:
         """Get component weight for specific zone and agent."""
         return self._get_weight(f'zone{zone_letter}_{comp}_{agent}', 0.0)
+
+    # =========================================================================
+    # NEW: Non-incremental progress calculation with velocity-based direction
+    # =========================================================================
+    
+    def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
+        # 轨迹单位方向
+        t = self.trajectory_manager.line_direction
+        # 当前速度
+        v = self.stylus_vel_t1
+        v_along = (v * t.unsqueeze(0)).sum(dim=-1)  # [N]
+
+        # 当前绝对进度 p ∈ [0,1]
+        p = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)  # [N]
+
+        # 奖励参数
+        MIN_REWARD = 0.1        # 起点处的最小奖励幅度
+        MAX_REWARD = 0.2        # 终点处的最大奖励幅度
+        EPS_V = 1e-4           # 速度死区阈值
+
+        # 计算奖励幅度：从0.1（起点）到0.2（终点）线性插值
+        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p  # [N] ∈ [0.1, 0.2]
+
+        # 方向判断
+        pos = (v_along >  EPS_V).float()   # 正方向
+        neg = (v_along < -EPS_V).float()   # 负方向
+        
+        # 最终奖励：正方向为正，负方向为负
+        return (pos - neg) * reward_magnitude  # [N] ∈ [-0.2, 0.2]
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing with action validation and force application."""
@@ -309,14 +331,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 if agent in self._detail_actor_info['noise_actions']:
                     self.actor_noise_forces[agent] = self._detail_actor_info['noise_actions'][agent].clone()
         
-        # Process and validate actions with force constraints
+        # Process actions without additional force constraints (已在select_actions中限制)
         for agent, action in actions.items():
             assert agent in self.cfg.possible_agents, f"Unknown agent: {agent}"
             assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
             
-            # Apply force constraints based on agent type
-            max_force = self.max_robot_force if agent == "robot" else self.max_human_force
-            self.agent_actions[agent] = torch.clamp(action, -max_force, max_force)
+            # 直接使用动作，不再重复限制
+            self.agent_actions[agent] = action
         
         # Cache forces for reward calculation
         self.robot_forces_t = self.agent_actions["robot"]
@@ -395,11 +416,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             constraint_distances,     # Distance measurements (1)
         ], dim=-1)                    # Total: 7 dimensions
         
-        # Update reward state caches for delta calculations
-        s_t = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-        self.prev_safety_distances = self.safety_distances_t1.detach().clone()
-        self.prev_progress = s_t.detach().clone()
-        
         # Create observation dictionary for each agent (shared observations)
         observations = {}
         for agent in self.cfg.possible_agents:
@@ -453,20 +469,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Zone A (Track): Outside obstacle boundary - Progress and deviation rewards."""
         outside, surface, danger, rejoin = masks
         
-        # Progress reward with binary penalty system
-        p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
-        best_p_tm1 = self.best_progress.clone()
-        
-        delta_p = p_t - best_p_tm1 #1/1200-3/1200
-        reward_forward = torch.clamp(delta_p * 1200 * 0.04, min=0.0, max=0.16) #相对1/1200走了几倍，每倍奖励0.04，最高0.16
-        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
-        
-        # Update historical best progress for monotonic improvement
-        self.best_progress = torch.maximum(best_p_tm1, p_t)
+        # NEW: Non-incremental progress based on velocity direction
+        prog_raw = self._progress_raw_signed_by_velocity()
         
         # Linear deviation penalty from desired trajectory
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2) #偏离1cm，惩罚0.04，最多惩罚0.2
+        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2)  # 1cm deviation gives -0.04 penalty, max -0.2
         
         # Zone A combination with configurable weights
         wp = self._get_component_weight('A', 'progress', agent)
@@ -500,7 +508,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # Gap reward for maintaining optimal distance from constraint
         beta = 6.0e3
         d = self.safety_distances_t1
-        gap_raw = -beta * (d - 0.010) ** 2 #偏差2.5mm，惩罚0.0375,偏差5mm，惩罚0.15
+        gap_raw = -beta * (d - 0.010) ** 2  # 2.5mm deviation gives -0.0375 penalty, 5mm gives -0.15
         # Surface tangent reward for following constraint boundary
         gamma = 1.0
         t = self.trajectory_manager.line_direction
@@ -511,12 +519,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         t_surf = t_surf / torch.norm(t_surf, dim=-1, keepdim=True).clamp(min=1e-8)
         
         v_surf = (self.stylus_vel_t1 * t_surf).sum(dim=-1)
-        surf_raw = gamma * v_surf #切向速度0.06m/s，奖励0.06
+        surf_raw = gamma * v_surf  # Tangential velocity 0.06m/s gives 0.06 reward
         
         # Unified inward penalty (penalize moving toward obstacle)
         lam = 2.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0) #法向速度0.06m/s，惩罚0.12，权重 2，仅仅向内才有惩罚
+        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)  # Normal velocity 0.06m/s gives -0.12 penalty, weight 2, only inward movement penalized
         
         # Zone B combination with configurable weights
         wg = self._get_component_weight('B', 'gap', agent)
@@ -557,48 +565,48 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """
         outside, surface, danger, rejoin = masks
         
-        # 模式 A: 物理重叠惩罚 (raw * weight)
-        R_overlap_raw = -0.3 #重叠固定惩罚0.3
+        # Mode A: Physical overlap penalty (raw * weight)
+        R_overlap_raw = -0.3  # Fixed overlap penalty of 0.3
         w_overlap = self._get_component_weight('C', 'overlap', agent)
         overlap_contrib = w_overlap * R_overlap_raw
 
-        # 模式 B: 危险接近惩罚 (原有逻辑)
-        R_off = -0.2 #重叠固定惩罚0.2
+        # Mode B: Dangerous proximity penalty (original logic)
+        R_off = -0.2  # Fixed proximity penalty of 0.2
         offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
         lam = 2.0
         v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0) #法向速度0.06m/s，惩罚0.12，权重 2，仅仅向内才有惩罚 
+        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)  # Normal velocity 0.06m/s gives -0.12 penalty, weight 2, only inward movement penalized
         wo = self._get_component_weight('C', 'offpen', agent)
         wi = self._get_component_weight('C', 'inward', agent)
         too_close_contrib = (wo * offpen_raw) + (wi * inward_raw)
 
-        # 使用 torch.where 根据是否碰撞选择最终的贡献值
+        # Use torch.where to select final contribution based on collision status
         zone_c_total_contrib = torch.where(
             self.is_violating_t1,
             torch.tensor(overlap_contrib, device=self.device),
             too_close_contrib
         )
 
-        # 应用区域权重
+        # Apply zone weight
         zw = self._get_zone_weight('C', agent)
         zone_total = zw * zone_c_total_contrib
         
         out = torch.zeros_like(zone_total)
         out[danger] = zone_total[danger]
 
-        # --- 更新日志组件 ---
+        # --- Update logging components ---
         RC, device = self.reward_components, zone_total.device
         RC[f'zoneC_weight_{agent}'] = torch.tensor(zw, device=device)
         RC[f'zoneC_total_{agent}'] = zone_total
 
-        # 只有在不重叠时，offpen 和 inward 的贡献值才非零
+        # Only when not overlapping, offpen and inward contributions are non-zero
         RC[f'zoneC_offpen_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wo * offpen_raw)
         RC[f'zoneC_inward_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wi * inward_raw)
         
-        # 只有在重叠时，overlap 的贡献值才非零
+        # Only when overlapping, overlap contribution is non-zero
         RC[f'zoneC_overlap_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.tensor(overlap_contrib, device=self.device), torch.zeros_like(zone_total))
 
-        # 始终记录raw和weight，以便StepTracer可以读取
+        # Always record raw and weight for StepTracer access
         RC[f'zoneC_offpen_{agent}_raw'] = offpen_raw
         RC[f'zoneC_offpen_{agent}_weight'] = torch.tensor(wo, device=device)
         RC[f'zoneC_inward_{agent}_raw'] = inward_raw
@@ -612,18 +620,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Zone D (Rejoin): Trajectory recovery - Progress + Deviation + Outward movement."""
         outside, surface, danger, rejoin = masks
 
-        # Enhanced progress reward for trajectory recovery
-        p_t = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
-        best_p_tm1 = self.best_progress.clone()
-
-        delta_p = p_t - best_p_tm1
-        reward_forward = torch.clamp(delta_p * 1200.0 * 0.04, min=0.0, max=0.16) #相对1/1200走了几倍，每倍奖励0.04，最高0.16
-        prog_raw = torch.where(reward_forward > 0.0, reward_forward, torch.full_like(reward_forward, -0.04))
-        self.best_progress = torch.maximum(best_p_tm1, p_t)
+        # NEW: Non-incremental progress based on velocity direction
+        prog_raw = self._progress_raw_signed_by_velocity()
 
         # Enhanced deviation penalty for trajectory recovery
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2) #偏离1cm，惩罚0.04，最多惩罚0.2
+        dev_raw = -torch.clamp(deviations * 4, min=0.0, max=0.2)  # 1cm deviation gives -0.04 penalty, max -0.2
 
         # Inward movement handling (reward moving away, penalize moving toward)
         lam = 2.0
@@ -632,7 +634,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             v_dot_n >= 0,        # Moving toward obstacle
             -lam * v_dot_n,      # Penalize
             lam * (-v_dot_n)     # Moving away from obstacle, reward
-        ) #法向速度向内0.06m/s，惩罚0.12，向外奖励0.12，权重 2
+        )  # Normal velocity inward 0.06m/s gives -0.12 penalty, outward gives +0.12 reward, weight 2
 
         wp = self._get_component_weight('D', 'progress', agent)
         wd = self._get_component_weight('D', 'deviation', agent)
@@ -798,7 +800,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         is_final_reached = self.trajectory_manager.is_final_setpoint_reached(self.stylus_pos_t1)
         return torch.where(
             is_final_reached,
-            torch.full_like(self.safety_distances_t1, 1.0), #到达奖励1.0
+            torch.full_like(self.safety_distances_t1, 1.0),  # Completion reward of 1.0
             torch.zeros_like(self.safety_distances_t1)
         )
 
@@ -881,10 +883,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.is_violating_t1[env_ids] = False
         self.normal_t1[env_ids] = torch.zeros((num_resets, 3), device=self.device)
 
-        # Reset reward state caches
-        self.prev_safety_distances[env_ids] = 0.02
-        self.prev_progress[env_ids] = 0.0
-        self.best_progress[env_ids] = 0.0
+        # Reset reward state caches (no more best_progress)
         self.rejoin_streak[env_ids] = 0
 
         # Reset actor detail info caches

@@ -2,6 +2,7 @@
 # SIMPLIFIED: Removed per-environment complexity, optimized for shared network architecture
 # MODIFIED: Added max_global_steps as primary termination condition
 # MODIFIED: Added networks and exploration configuration sections
+# CLEANED: Removed redundant hidden_units parameter
 
 # ==============================================================================
 # Global Settings
@@ -13,26 +14,26 @@ seed: 42
 # ==============================================================================
 networks:
   actor:
-    hidden_layers: [512, 512, 256, 256]
-    dropout_p: 0.10
+    hidden_layers: [128, 128, 128]
+    dropout_p: 0.0
     orthogonal_init: true
-    ortho_gain_hidden: 1.414   
-    ortho_gain_output: 0.001    
+    ortho_gain_hidden: 1.414
+    ortho_gain_output: 0.01    
     std_scale: 1.0             
   critic:
-    hidden_layers: [512, 512, 256, 256]
-    dropout_p: 0.10
+    hidden_layers: [128, 128, 128]
+    dropout_p: 0.0
     orthogonal_init: true
-    ortho_gain_hidden: 1.414   
-    ortho_gain_output: 1.0     
+    ortho_gain_hidden: 1.414
+    ortho_gain_output: 0.01
 
 # ==============================================================================
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.5   # åˆå§‹å™ªå£° = 0.5 Ã— max_action
-  sigma_end: 0.1     # æ"¶å°¾å™ªå£° = 0.1 Ã— max_action
-  decay_k: 6.0       # è¡°å‡å¿«æ…¢ï¼ˆå¯çœç•¥ï¼Œä»£ç é‡Œç»™é»˜è®¤ï¼‰
+  sigma_start: 0.5   # Initial noise = 0.5 × max_action
+  sigma_end: 0.1     # Final noise = 0.1 × max_action
+  decay_k: 6.0       # Decay rate (optional, default value provided in code)
 
 # ==============================================================================
 # Logging Configuration
@@ -93,21 +94,21 @@ reward_parameters:
   
   weights:
     # ===== ROBOT (Active Agent) =====
-    zoneA_weight_robot: 0.5
-    zoneA_progress_robot: 1.0
+    zoneA_weight_robot: 5.0
+    zoneA_progress_robot: 3.0
     zoneA_deviation_robot: 1.0
 
-    zoneB_weight_robot: 0.5
+    zoneB_weight_robot: 5.0
     zoneB_gap_robot: 1.0
     zoneB_surftangent_robot: 1.0
     zoneB_inward_robot: 1.0
 
-    zoneC_weight_robot: 0.5
+    zoneC_weight_robot: 5.0
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
-    zoneC_overlap_robot: 1.0          # 新增：碰撞惩罚权重
+    zoneC_overlap_robot: 1.0          # NEW: Collision penalty weight
 
-    zoneD_weight_robot: 0.5
+    zoneD_weight_robot: 5.0
     zoneD_progress_robot: 1.0
     zoneD_deviation_robot: 1.0
     zoneD_inward_robot: 1.0
@@ -120,27 +121,27 @@ reward_parameters:
 
     # ===== HUMAN (Disabled in Single-Agent Mode) =====  
     # All human weights set to 0.0 for single-agent training
-    zoneA_weight_human: 0.0
-    zoneA_progress_human: 0.0
-    zoneA_deviation_human: 0.0
+    zoneA_weight_human: 5.0
+    zoneA_progress_human: 3.0
+    zoneA_deviation_human: 1.0
 
-    zoneB_weight_human: 0.0
-    zoneB_gap_human: 0.0
-    zoneB_surftangent_human: 0.0
-    zoneB_inward_human: 0.0
+    zoneB_weight_human: 5.0
+    zoneB_gap_human: 1.0
+    zoneB_surftangent_human: 1.0
+    zoneB_inward_human: 1.0
 
-    zoneC_weight_human: 0.0
-    zoneC_offpen_human: 0.0
-    zoneC_inward_human: 0.0
-    zoneC_overlap_human: 0.0 
+    zoneC_weight_human: 5.0
+    zoneC_offpen_human: 1.0
+    zoneC_inward_human: 1.0
+    zoneC_overlap_human: 1.0 
 
-    zoneD_weight_human: 0.0
-    zoneD_progress_human: 0.0
-    zoneD_deviation_human: 0.0
-    zoneD_inward_human: 0.0
+    zoneD_weight_human: 5.0
+    zoneD_progress_human: 1.0
+    zoneD_deviation_human: 1.0
+    zoneD_inward_human: 1.0
 
     zpenalty_human: 0.0
-    completion_human: 0.0
+    completion_human: 1.0
     timeeff_human: 0.0
     forceeff_human: 0.0
     robotaware_human: 0.0
@@ -150,24 +151,23 @@ reward_parameters:
 # ==============================================================================
 termination_conditions:
   z_below_zero: false                 # Disable Z termination for now
-  edge_collision: false                # Enable direct termination on obstacle entry
+  edge_collision: false               # Enable direct termination on obstacle entry
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
   
 # ==============================================================================
 # MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS
 # ==============================================================================
 maddpg_config:
-  lr_actor: 0.0005                    # Actor learning rate
+  lr_actor: 0.0007                    # Actor learning rate
   lr_critic: 0.001                    # Critic learning rate
-  gamma: 0.99                         # Discount factor
-  batch_size: 512                     # Training batch size (increased for stability)
-  hidden_units: 512                   # Hidden layer units
-  num_episodes: 600                   # Legacy parameter (kept for compatibility, not used for termination)
-  max_global_steps: 200000            # PRIMARY TERMINATION CONDITION: Stop after this many training steps
-  update_interval: 100                # Updates every N steps
-  min_buffer_size: 120000               # Minimum buffer size to start training (renamed from warmup)
-  tau: 0.002                           # Target network update rate (slower for stability)
-  max_replay_buffer_len: 480000        # Maximum replay buffer size
+  gamma: 0.99                        # Discount factor
+  batch_size: 1024                    # Training batch size (increased for stability)
+  num_episodes: 600                  # Legacy parameter (kept for compatibility, not used for termination)
+  max_global_steps: 200000           # PRIMARY TERMINATION CONDITION: Stop after this many training steps
+  update_interval: 100               # Updates every N steps
+  min_buffer_size: 3600              # Minimum buffer size to start training (renamed from warmup)
+  tau: 0.002                         # Target network update rate (slower for stability)
+  max_replay_buffer_len: 24000       # Maximum replay buffer size
 
 # ==============================================================================
 # Training Monitoring - SIMPLIFIED
@@ -175,4 +175,4 @@ maddpg_config:
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
   # Episodes are counted as sum of all environment completions
-  milestone_episodes: [300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1500, 2000, 2500, 3000]
+  milestone_episodes: [5, 10, 15, 20, 25, 30, 50, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1500, 2000, 2500, 3000]

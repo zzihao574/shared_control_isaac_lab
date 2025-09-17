@@ -53,9 +53,8 @@ class Actor(nn.Module):
     def __init__(self,
                  state_dimension: int,
                  action_dimension: int,
-                 hidden_dimension: int = 64,                       # Compatibility with old interface
                  max_action_magnitude: float = 1.0,
-                 hidden_layers: Optional[Sequence[int]] = None,    # New configurable layers
+                 hidden_layers: Sequence[int] = (256, 256),        # Default architecture
                  dropout_p: float = 0.0,                           # Dropout probability
                  orthogonal_init: bool = False,                    # Orthogonal initialization flag
                  ortho_gain_hidden: float = 1.0,                   # Hidden layer gain
@@ -63,10 +62,7 @@ class Actor(nn.Module):
                  std_scale: float = 1.0):                          # Standard deviation scaling
         super().__init__()
         self.max_action = max_action_magnitude
-        self.std_scale = float(std_scale)  # Replaces hardcoded *0.2 scaling
-        
-        if hidden_layers is None:
-            hidden_layers = [hidden_dimension, hidden_dimension]    # Backward compatibility
+        self.std_scale = float(std_scale)
         
         out_dim = action_dimension * 2  # mean + log_std
         self.net = _build_mlp(state_dimension, hidden_layers, out_dim, dropout_p=dropout_p)
@@ -96,16 +92,13 @@ class Critic(nn.Module):
     def __init__(self,
                  total_state_dimension: int,
                  total_action_dimension: int,
-                 hidden_dimension: int = 64,
-                 hidden_layers: Optional[Sequence[int]] = None,
+                 hidden_layers: Sequence[int] = (256, 256),        # Default architecture
                  dropout_p: float = 0.0,
                  orthogonal_init: bool = False,
                  ortho_gain_hidden: float = 1.0,
                  ortho_gain_output: float = 1.0):
         super().__init__()
         in_dim = total_state_dimension + total_action_dimension
-        if hidden_layers is None:
-            hidden_layers = [hidden_dimension, hidden_dimension]
         self.net = _build_mlp(in_dim, hidden_layers, 1, dropout_p=dropout_p)
         if orthogonal_init:
             _apply_orthogonal_init(self.net, gain_hidden=ortho_gain_hidden, gain_output=ortho_gain_output)
