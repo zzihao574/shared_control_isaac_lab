@@ -3,6 +3,7 @@
 """
 Surgical Robot MADDPG Shared Network Training
 Enhanced version with configurable network architecture and exponential noise decay.
+MODIFIED: Added per-env scaling functionality for automatic parameter scaling.
 
 Features:
 - Configurable network layers, dropout, and orthogonal initialization
@@ -11,6 +12,7 @@ Features:
 - TopK model management with milestone evaluation
 - WandB integration with per-agent metrics
 - Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator
+- Per-env scaling: YAML configs are per-env baselines, auto-scaled by --num_envs
 """
 
 import sys
@@ -107,6 +109,7 @@ def inject_step_tracer(env, config, num_envs):
 class MADDPGTrainer:
     """
     Streamlined MADDPG trainer for configurable networks and noise scheduling.
+    MODIFIED: Added per-env scaling functionality.
     
     Features:
     - Configuration-driven network architecture
@@ -114,12 +117,13 @@ class MADDPGTrainer:
     - Milestone evaluation with TopK model selection
     - Comprehensive WandB logging with per-agent metrics
     - Single evaluation chain (no old RewardLogger/MilestoneManager)
+    - Per-env scaling: YAML configs auto-scaled by num_envs
     """
     
     def __init__(self, args):
         self.args = args
         
-        print(f"[TRAINER] Initializing MADDPGTrainer with configurable networks...")
+        print(f"[TRAINER] Initializing MADDPGTrainer with configurable networks and per-env scaling...")
         
         # Setup phases
         self._setup_configuration()
@@ -136,7 +140,7 @@ class MADDPGTrainer:
         self._print_configuration_summary()
 
     def _setup_configuration(self):
-        """Load and setup training configuration."""
+        """Load and setup training configuration with per-env scaling."""
         print(f"[SETUP] Loading configuration from: {self.args.config}")
         self.config = TrainingConfiguration.from_yaml(self.args.config)
         
@@ -147,6 +151,45 @@ class MADDPGTrainer:
         self.config.params['seed'] = self.args.seed
         
         print(f"[SETUP] Configuration loaded, seed set to: {self.args.seed}")
+        
+        # === NEW: Apply per-env scaling ===
+        self._apply_per_env_scaling()
+
+    def _apply_per_env_scaling(self):
+        """
+        Interpret YAML numbers as 'per-env' baselines and scale them by CLI --num_envs.
+        Scales:
+          - maddpg_config.min_buffer_size
+          - maddpg_config.max_replay_buffer_len
+          - training_monitor.milestone_episodes (each entry)
+        
+        Note: max_global_steps is NOT scaled as it represents total training steps, not per-env steps.
+        """
+        num_envs = int(self.args.num_envs)
+
+        maddpg_cfg = self.config.params.get("maddpg_config", {})
+        monitor_cfg = self.config.params.get("training_monitor", {})
+
+        base_min_buffer = int(maddpg_cfg.get("min_buffer_size", 3600))
+        base_max_buffer = int(maddpg_cfg.get("max_replay_buffer_len", 24000))
+        base_milestones = list(monitor_cfg.get("milestone_episodes", []))
+
+        scaled_min_buffer = base_min_buffer * num_envs
+        scaled_max_buffer = base_max_buffer * num_envs
+        scaled_milestones = [int(m * num_envs) for m in base_milestones]
+
+        maddpg_cfg["min_buffer_size"] = int(scaled_min_buffer)
+        maddpg_cfg["max_replay_buffer_len"] = int(scaled_max_buffer)
+        self.config.params["maddpg_config"] = maddpg_cfg
+
+        monitor_cfg["milestone_episodes"] = scaled_milestones
+        self.config.params["training_monitor"] = monitor_cfg
+
+        print("[SETUP][PER-ENV SCALING]")
+        print(f"  num_envs = {num_envs}")
+        print(f"  min_buffer_size: {base_min_buffer} → {scaled_min_buffer}")
+        print(f"  max_replay_buffer_len: {base_max_buffer} → {scaled_max_buffer}")
+        print(f"  milestone_episodes: {base_milestones} → {scaled_milestones}")
 
     def _setup_environment(self):
         """Create and configure the environment."""
@@ -319,6 +362,7 @@ class MADDPGTrainer:
         print(f"  - Network layers configurable via YAML")
         print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
+        print(f"  - Per-env scaling applied: buffer sizes and milestones auto-scaled by {self.args.num_envs}x")
         
         try:
             # Initialize WandB data points
@@ -333,7 +377,7 @@ class MADDPGTrainer:
             # Reset environment
             print(f"[TRAIN] Resetting environment...")
             obs_dict, _ = self.env.reset()
-            print(f"[TRAIN] Environment reset complete, starting training loop")
+            print(f"[TRAIN] Environment reset complete")
             self.runner._current_obs = obs_dict  
             
             # Main training loop
@@ -387,14 +431,14 @@ class MADDPGTrainer:
             self.env.close()
             self.wandb_logger.finalize_run()
             print("[TRAIN] Cleanup completed")
-            print("\nConfigurable network training completed")
+            print("\nConfigurable network training with per-env scaling completed")
 
 
 def main():
     """Main entry point for MADDPG training."""
     print("="*80)
-    print("MADDPG Configurable Network Training")
-    print("Enhanced with exponential noise scheduling and network flexibility")
+    print("MADDPG Configurable Network Training with Per-Env Scaling")
+    print("Enhanced with exponential noise scheduling and automatic parameter scaling")
     print("="*80)
     
     # Parse arguments
@@ -408,6 +452,7 @@ def main():
     print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
     print(f"  WandB: {args_cli.wandb}")
     print(f"  Config: {args_cli.config}")
+    print(f"  Per-env scaling: YAML configs will be auto-scaled by {args_cli.num_envs}x")
     
     # Launch Isaac Sim
     print(f"[MAIN] Launching Isaac Sim...")

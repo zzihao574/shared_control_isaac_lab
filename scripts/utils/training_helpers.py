@@ -459,59 +459,60 @@ class WandBLogger:
         print("[WANDB] Attached to MetricsHub with async update support.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-        """Log metrics with per-agent structure, global metrics, and async update tracking."""
-        if not self.enabled or not metrics_data:
-            return
+            """Log metrics with per-agent structure, global metrics, and async update tracking."""
+            if not self.enabled or not metrics_data:
+                return
 
-        log_data = {}
+            log_data = {}
 
-        # Handle Per-Agent training metrics
-        if "loss/actor" in metrics_data and isinstance(metrics_data.get('loss/actor'), dict):
-            agent_ids = list(metrics_data['loss/actor'].keys())
+            # Handle Per-Agent training metrics
+            if "loss/actor" in metrics_data and isinstance(metrics_data.get('loss/actor'), dict):
+                agent_ids = list(metrics_data['loss/actor'].keys())
+                
+                for agent_id in agent_ids:
+                    # Loss metrics
+                    if 'loss/actor' in metrics_data and agent_id in metrics_data['loss/actor']:
+                        log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
+                    if 'loss/critic' in metrics_data and agent_id in metrics_data['loss/critic']:
+                        log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
+                    
+                    # Q-Value metrics
+                    if 'q_mean' in metrics_data and agent_id in metrics_data['q_mean']:
+                        log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
+                    if 'q_std' in metrics_data and agent_id in metrics_data['q_std']:
+                        log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
+                    
+                    # Target Q-Value metrics
+                    if 'q_target_mean' in metrics_data and agent_id in metrics_data['q_target_mean']:
+                        log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
+                    if 'q_target_std' in metrics_data and agent_id in metrics_data['q_target_std']:
+                        log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
+                    
+                    # Gradient norm metrics
+                    if 'grad_norm/actor' in metrics_data and agent_id in metrics_data['grad_norm/actor']:
+                        log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
+                    if 'grad_norm/critic' in metrics_data and agent_id in metrics_data['grad_norm/critic']:
+                        log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
+
+            # Handle global and milestone metrics
+            global_keys = {
+                "exploration/noise_scale": "exploration/noise_scale",
+                "train/episodes_done": "train/global_episodes",
+                "replay/buffer_size": "replay/buffer_size",
+                "training/critic_updates": "train/critic_updates",        # 异步更新：Critic更新计数
+                "training/actor_updates": "train/actor_updates",          # 异步更新：Actor更新计数
+                "eval/return_mean": "milestone/actor_return",
+                "milestone/topk_best_score": "milestone/topk_best_return",
+                "milestone/latest_completed": "milestone/latest_completed",
+            }
             
-            for agent_id in agent_ids:
-                # Loss metrics
-                if 'loss/actor' in metrics_data and agent_id in metrics_data['loss/actor']:
-                    log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
-                if 'loss/critic' in metrics_data and agent_id in metrics_data['loss/critic']:
-                    log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
-                
-                # Q-Value metrics
-                if 'q_mean' in metrics_data and agent_id in metrics_data['q_mean']:
-                    log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
-                if 'q_std' in metrics_data and agent_id in metrics_data['q_std']:
-                    log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
-                
-                # Target Q-Value metrics
-                if 'q_target_mean' in metrics_data and agent_id in metrics_data['q_target_mean']:
-                    log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
-                if 'q_target_std' in metrics_data and agent_id in metrics_data['q_target_std']:
-                    log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
-                
-                # Gradient norm metrics
-                if 'grad_norm/actor' in metrics_data and agent_id in metrics_data['grad_norm/actor']:
-                    log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
-                if 'grad_norm/critic' in metrics_data and agent_id in metrics_data['grad_norm/critic']:
-                    log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
+            for src_key, dest_key in global_keys.items():
+                if src_key in metrics_data and metrics_data[src_key] is not None:
+                    log_data[dest_key] = metrics_data[src_key]
 
-        # Handle global and milestone metrics
-        global_keys = {
-            "exploration/noise_scale": "exploration/noise_scale",
-            "train/episodes_done": "train/global_episodes",
-            "replay/buffer_size": "replay/buffer_size",
-            "training/critic_updates": "train/critic_updates",
-            "training/actor_updates": "train/actor_updates",
-            "eval/return_mean": "milestone/actor_return",
-            "milestone/topk_best_score": "milestone/topk_best_return",
-            "milestone/latest_completed": "milestone/latest_completed",
-        }
-        
-        for src_key, dest_key in global_keys.items():
-            if src_key in metrics_data and metrics_data[src_key] is not None:
-                log_data[dest_key] = metrics_data[src_key]
+            if log_data:
+                wandb.log(log_data, step=step)
 
-        if log_data:
-            wandb.log(log_data, step=step)
 
     def finalize_run(self) -> None:
         """Finalize WandB run."""

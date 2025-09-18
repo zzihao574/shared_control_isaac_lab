@@ -9,53 +9,52 @@ from .networks import Actor, Critic
 class DDPGAgent:
     """
     Deep Deterministic Policy Gradient agent for shared network MADDPG.
-    Modified: Removed max_action constraints at agent level.
+    Modified: 支持状态固定缩放，移除std相关参数。
     
     Features:
-    - Stochastic actor with mean and variance outputs
-    - Centralized critic for multi-agent coordination  
-    - Soft target network updates
-    - Batch processing support for shared network architecture
-    - Gradient norm statistics for training diagnostics
-    - Configurable network architecture via YAML
-    - Force constraints handled externally in MADDPG.select_actions
+    - 确定性Actor，输出归一化动作[-1,1]
+    - 集中式Critic，期望归一化动作输入
+    - 状态固定缩放注入网络内部
+    - 软更新目标网络
+    - 批处理支持共享网络架构
+    - 梯度范数统计用于训练诊断
+    - 通过YAML配置网络架构
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
                  total_state_dim: int, total_action_dim: int, params: Dict[str, Any], device: torch.device):
         """
-        Initialize DDPG agent for shared network architecture.
+        为共享网络架构初始化DDPG Agent。
         
         Args:
-            agent_id: Unique identifier for this agent
-            state_dim: Dimension of this agent's observation space
-            action_dim: Dimension of this agent's action space
-            total_state_dim: Combined observation dimension of all agents
-            total_action_dim: Combined action dimension of all agents
-            params: Configuration parameters dictionary
-            device: PyTorch device for computations
+            agent_id: 此Agent的唯一标识符
+            state_dim: 此Agent观测空间的维度
+            action_dim: 此Agent动作空间的维度
+            total_state_dim: 所有Agent观测维度之和
+            total_action_dim: 所有Agent动作维度之和
+            params: 配置参数字典
+            device: PyTorch计算设备
         """
         self.agent_id = agent_id
         self.device = device
         
-        # Load hyperparameters
+        # 加载超参数
         maddpg_cfg = params.get('maddpg_config', {})
         self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.001))
         self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.001))
-        self.tau = float(maddpg_cfg.get('tau', 0.002))  # Target network update rate
+        self.tau = float(maddpg_cfg.get('tau', 0.002))
         
-        # Load network configuration
+        # 加载网络配置
         net_cfg = params.get('networks', {})
         actor_cfg = net_cfg.get('actor', {})
         critic_cfg = net_cfg.get('critic', {})
 
-        # Network architecture - use configured layers or sensible defaults
+        # 网络架构参数
         actor_hidden_layers = actor_cfg.get('hidden_layers', [256, 256])
         actor_dropout = float(actor_cfg.get('dropout_p', 0.0))
         actor_ortho = bool(actor_cfg.get('orthogonal_init', False))
         actor_gain_h = float(actor_cfg.get('ortho_gain_hidden', 1.0))
         actor_gain_o = float(actor_cfg.get('ortho_gain_output', 0.01))
-        actor_std_scale = float(actor_cfg.get('std_scale', 1.0))
 
         critic_hidden_layers = critic_cfg.get('hidden_layers', [256, 256])
         critic_dropout = float(critic_cfg.get('dropout_p', 0.0))
@@ -63,17 +62,33 @@ class DDPGAgent:
         critic_gain_h = float(critic_cfg.get('ortho_gain_hidden', 1.0))
         critic_gain_o = float(critic_cfg.get('ortho_gain_output', 1.0))
         
+        # 读取状态缩放配置
+        obs_scaling = params.get('obs_scaling', {})
+        factors = obs_scaling.get('factors', [1.0] * state_dim)
+        
+        if len(factors) != state_dim:
+            print(f"[WARNING] {agent_id} - Factors length mismatch: got {len(factors)}, expected {state_dim}")
+            factors = [1.0] * state_dim
+        
+        # Actor使用单agent的缩放因子
+        obs_factors_actor = torch.tensor(factors, dtype=torch.float32, device=device)
+        
+        # Critic使用所有agent的缩放因子（重复单agent的因子）
+        num_agents = total_state_dim // state_dim
+        factors_critic = factors * num_agents
+        obs_factors_critic = torch.tensor(factors_critic, dtype=torch.float32, device=device)
+        
         print(f"[DDPG AGENT] {agent_id}:")
         print(f"  State dim: {state_dim}, Action dim: {action_dim}")
         print(f"  Total state dim: {total_state_dim}, Total action dim: {total_action_dim}")
         print(f"  Actor layers: {actor_hidden_layers}, dropout: {actor_dropout}")
         print(f"  Critic layers: {critic_hidden_layers}, dropout: {critic_dropout}")
         print(f"  Orthogonal init - Actor: {actor_ortho}, Critic: {critic_ortho}")
-        print(f"  Std scale: {actor_std_scale}")
+        print(f"  State scaling factors: {factors}")
         print(f"  LR - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
         print(f"  Target update rate (tau): {self.tau}")
         
-        # Initialize actor networks (no max_action_magnitude parameter)
+        # 初始化Actor网络（注入状态缩放）
         self.actor = Actor(
             state_dim, action_dim,
             hidden_layers=actor_hidden_layers,
@@ -81,7 +96,7 @@ class DDPGAgent:
             orthogonal_init=actor_ortho,
             ortho_gain_hidden=actor_gain_h,
             ortho_gain_output=actor_gain_o,
-            std_scale=actor_std_scale
+            obs_factors=obs_factors_actor,
         ).to(device)
 
         self.actor_target = Actor(
@@ -91,18 +106,19 @@ class DDPGAgent:
             orthogonal_init=actor_ortho,
             ortho_gain_hidden=actor_gain_h,
             ortho_gain_output=actor_gain_o,
-            std_scale=actor_std_scale
+            obs_factors=obs_factors_actor,
         ).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # Initialize critic networks (centralized training)
+        # 初始化Critic网络（集中式训练，注入状态缩放）
         self.critic = Critic(
             total_state_dim, total_action_dim,
             hidden_layers=critic_hidden_layers,
             dropout_p=critic_dropout,
             orthogonal_init=critic_ortho,
             ortho_gain_hidden=critic_gain_h,
-            ortho_gain_output=critic_gain_o
+            ortho_gain_output=critic_gain_o,
+            obs_factors=obs_factors_critic,
         ).to(device)
 
         self.critic_target = Critic(
@@ -111,25 +127,26 @@ class DDPGAgent:
             dropout_p=critic_dropout,
             orthogonal_init=critic_ortho,
             ortho_gain_hidden=critic_gain_h,
-            ortho_gain_output=critic_gain_o
+            ortho_gain_output=critic_gain_o,
+            obs_factors=obs_factors_critic,
         ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
-        # Initialize optimizers
+        # 初始化优化器
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
         
-        print(f"[DDPG AGENT] {agent_id} initialized successfully")
+        print(f"[DDPG AGENT] {agent_id} initialized with state normalization")
 
     def soft_update(self) -> None:
-        """Perform soft update of target networks using Polyak averaging."""
-        # Update actor target network
+        """使用Polyak平均进行目标网络软更新。"""
+        # 更新Actor目标网络
         for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
             target_param.data.copy_(
                 self.tau * param.data + (1.0 - self.tau) * target_param.data
             )
         
-        # Update critic target network
+        # 更新Critic目标网络
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(
                 self.tau * param.data + (1.0 - self.tau) * target_param.data

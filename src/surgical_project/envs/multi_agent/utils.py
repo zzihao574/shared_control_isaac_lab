@@ -22,102 +22,137 @@ from carb._carb import Float3
 class CompleteConstraintChecker:
     """
     Physics-based constraint analysis for surgical robot environment.
+    Two-state detection: Outside / Overlapping based on raycast validation.
     
     Features:
     - Batch constraint state analysis
-    - Distance and overlap detection
-    - Normal vector calculation
+    - Raycast-based overlapping detection
+    - Consistent distance reporting (raycast distance for outside, 0.0 for overlapping)
+    - Normal vector calculation pointing from stylus toward obstacle
     """
     
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
         self.device = device
         self.collision_threshold = collision_threshold        
-        # Direct initialization - let exceptions bubble up if failed
-        self.physics_attachment_interface = acquire_physx_attachment_interface()
-        self.physics_scene_query_interface = acquire_physx_scene_query_interface()
+        try:
+            self.physics_attachment_interface = acquire_physx_attachment_interface()
+            self.physics_scene_query_interface = acquire_physx_scene_query_interface()
+        except ImportError:
+            self.physics_attachment_interface = None
+            self.physics_scene_query_interface = None
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """Analyze constraint states for batch of environments."""
         num_envs = stylus_positions.shape[0]
-
+        
+        current_base_positions = self._omni_robot.data.root_link_pos_w if hasattr(self, '_omni_robot') else env_base_positions
+        
         batch_results = {
             'distances_constraint': torch.ones(num_envs, device=self.device) * 0.02,
             'closest_points': torch.zeros(num_envs, 3, device=self.device),
             'normal_vectors': torch.ones(num_envs, 3, device=self.device),
-            'is_overlapping': torch.zeros(num_envs, dtype=torch.bool, device=self.device),
+            'is_overlapping': torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         }
         
+        if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
+            return batch_results
+        
         for env_id in range(num_envs):
-            stylus_world_pos = stylus_positions[env_id] + env_base_positions[env_id]
+            stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
-            result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
-            if result is not None:
-                batch_results['distances_constraint'][env_id] = result['distance']
-                batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
-                batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
-                batch_results['is_overlapping'][env_id] = result['is_overlapping']
+            try:
+                result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
+                if result is not None:
+                    batch_results['distances_constraint'][env_id] = result['distance']
+                    batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
+                    batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
+                    batch_results['is_overlapping'][env_id] = result['is_overlapping']
+            except Exception:
+                pass
         
         return batch_results
     
-    def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str):
-        """Analyze constraint state for single environment."""
-        pos = stylus_position.cpu().numpy()
-        current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
+    def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str, verbose: bool = False):
+        """
+        Two-state constraint analysis using raycast validation.
         
-        result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
+        Logic:
+        - If raycast hits constraint with valid distance: outside (returns raycast distance)
+        - If raycast doesn't hit or distance is 0: overlapping (returns 0.0)
         
-        if not (result and 'closest_points' in result and result['closest_points']):
+        Returns result with consistent distance reporting.
+        """
+        if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
             return None
-        
-        closest_pt = result['closest_points'][0]
-        closest_pos = np.array([closest_pt.x, closest_pt.y, closest_pt.z])
-        distance = float(np.linalg.norm(pos - closest_pos))
-        
-        direction_vec = closest_pos - pos
-        direction_length = np.linalg.norm(direction_vec)
-        
-        if direction_length < 1e-8:
-            return {
-                'distance': 0.0, 'closest_point': closest_pos,
-                'normal_vector': np.array([1.0, 0.0, 0.0]),
-                'is_overlapping': True,
-            }
-        
-        direction_normalized = direction_vec / direction_length
-        direction_to_closest = Float3(
-            float(direction_normalized[0]),
-            float(direction_normalized[1]),
-            float(direction_normalized[2])
-        )
-        
-        raycast_result = self.physics_scene_query_interface.raycast_closest(
-            current_point, direction_to_closest, direction_length + 0.01
-        )
-        
-        filtered_result = None
-        if raycast_result and 'collision' in raycast_result:
-            if constraint_path in raycast_result['collision']:
-                filtered_result = raycast_result
-        
-        # --- 简化的新逻辑 ---
-        is_overlapping = (distance < self.collision_threshold) or \
-                         (not filtered_result or 'faceIndex' not in filtered_result)
 
-        if distance > 1.2:
-            is_overlapping = True
-            distance = 0.0
+        from carb._carb import Float3
+        import numpy as np
+
+        # 1) Get stylus position and closest point on constraint
+        pos = stylus_position.detach().cpu().numpy().astype(np.float64)
+        current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
+
+        result = self.physics_attachment_interface.get_closest_points([current_point], constraint_path)
+        if not (result and "closest_points" in result and result["closest_points"]):
+            return None
+
+        cp = result["closest_points"][0]
+        closest = np.array([cp.x, cp.y, cp.z], dtype=np.float64)
+        to_closest = closest - pos
+        dist = float(np.linalg.norm(to_closest))
+
+        # Handle degenerate case
+        if dist < 1e-9:
+            return {
+                "distance": 0.0,
+                "closest_point": closest,
+                "normal_vector": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+                "state": "overlapping",
+                "is_overlapping": True,
+                "raycast_result": None,
+            }
+
+        # 2) Raycast from stylus toward closest point
+        dir_norm = to_closest / dist
+        ray_dir = Float3(float(dir_norm[0]), float(dir_norm[1]), float(dir_norm[2]))
+        ray_res = self.physics_scene_query_interface.raycast_closest(current_point, ray_dir, dist + 0.01)
+
+        # Filter for hits against target constraint only
+        hit = None
+        if ray_res and "collision" in ray_res and (constraint_path in str(ray_res["collision"])):
+            hit = ray_res
+
+        # 3) Two-state decision with collision threshold
+        hit_distance = hit.get("distance", 0.0) if hit else 0.0
         
-        normal_vector = np.array([1.0, 0.0, 0.0])
-        if filtered_result and 'normal' in filtered_result:
-            normal_carb = filtered_result['normal']
-            normal_vector = np.array([normal_carb.x, normal_carb.y, normal_carb.z])
-            normal_vector = -normal_vector
-        
+        if hit is not None and hit_distance > self.collision_threshold:
+            is_overlapping = False
+            state = "outside"
+            # For outside state, use the raycast hit distance (surface distance)
+            final_distance = hit_distance
+        else:
+            is_overlapping = True 
+            state = "overlapping"
+            # For overlapping state, always return 0.0 to indicate penetration
+            final_distance = 0.0
+
+        # 4) Normal vector calculation (pointing from stylus toward obstacle)
+        if hit is not None and "normal" in hit:
+            n = hit["normal"]
+            outward = np.array([n.x, n.y, n.z], dtype=np.float64)
+            normal_vec = -outward  # negate: stylus -> obstacle interior
+        else:
+            # No hit: use stylus -> closest as direction
+            normal_vec = dir_norm  # already stylus -> obstacle direction
+
         return {
-            'distance': distance, 'closest_point': closest_pos,
-            'normal_vector': normal_vector,
-            'is_overlapping': is_overlapping,
+            "distance": final_distance,
+            "closest_point": closest,
+            "normal_vector": normal_vec,
+            "state": state,
+            "is_overlapping": is_overlapping,
+            "raycast_result": ray_res,
         }
 
 
@@ -373,26 +408,26 @@ class StepTracer:
         return float(component[env_id].item())
 
     def _print_actor_detail_info(self, env, env_id: int):
-        """Print actor network outputs and noise information with force consistency check."""
-        if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
-            return
+            """Print actor network outputs and noise information with physical force units."""
+            if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
+                return
+                
+            # Get robot forces (mean and noise) 
+            robot_mean = env.actor_mean_forces.get('robot')
+            robot_noise = env.actor_noise_forces.get('robot')
             
-        # Get robot forces (mean and noise)
-        robot_mean = env.actor_mean_forces.get('robot')
-        robot_noise = env.actor_noise_forces.get('robot')
-        
-        # Get human forces (mean and noise) 
-        human_mean = env.actor_mean_forces.get('human')
-        human_noise = env.actor_noise_forces.get('human')
-        
-        if robot_mean is not None and robot_noise is not None and robot_mean.shape[0] > env_id:
-            rm = robot_mean[env_id]
-            rn = robot_noise[env_id]
-            print(f"Forces (Robot): Fx={rm[0]:+.3f}, Fy={rm[1]:+.3f}, Fz={rm[2]:+.3f}")
-            print(f"  Noise: Nx={rn[0]:+.3f}, Ny={rn[1]:+.3f}, Nz={rn[2]:+.3f}")
-        
-        if human_mean is not None and human_noise is not None and human_mean.shape[0] > env_id:
-            hm = human_mean[env_id]
-            hn = human_noise[env_id]
-            print(f"Forces (Human): Fx={hm[0]:+.3f}, Fy={hm[1]:+.3f}, Fz={hm[2]:+.3f}")
-            print(f"  Noise: Nx={hn[0]:+.3f}, Ny={hn[1]:+.3f}, Nz={hn[2]:+.3f}")
+            # Get human forces (mean and noise) 
+            human_mean = env.actor_mean_forces.get('human')
+            human_noise = env.actor_noise_forces.get('human')
+            
+            if robot_mean is not None and robot_noise is not None and robot_mean.shape[0] > env_id:
+                rm = robot_mean[env_id]
+                rn = robot_noise[env_id]
+                print(f"Physical Forces (Robot): Fx={rm[0]:+.6f}N, Fy={rm[1]:+.6f}N, Fz={rm[2]:+.6f}N")
+                print(f"  Noise: Nx={rn[0]:+.6f}N, Ny={rn[1]:+.6f}N, Nz={rn[2]:+.6f}N")
+            
+            if human_mean is not None and human_noise is not None and human_mean.shape[0] > env_id:
+                hm = human_mean[env_id]
+                hn = human_noise[env_id]
+                print(f"Physical Forces (Human): Fx={hm[0]:+.6f}N, Fy={hm[1]:+.6f}N, Fz={hm[2]:+.6f}N")
+                print(f"  Noise: Nx={hn[0]:+.6f}N, Ny={hn[1]:+.6f}N, Nz={hn[2]:+.6f}N")

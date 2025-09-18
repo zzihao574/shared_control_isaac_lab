@@ -1,16 +1,26 @@
 """
-Neural network architectures for MADDPG with configurable layers and initialization.
+Neural network architectures for MADDPG with state normalization and unified action scaling.
 
 Features:
-- Configurable hidden layer sizes and dropout
-- Orthogonal weight initialization support
-- Stochastic actor with mean and std outputs
-- Centralized critic for multi-agent training
+- FixedScaler for state normalization without offsets
+- Deterministic actor with normalized action output [-1,1]
+- Centralized critic expecting normalized actions
+- Configurable layers and orthogonal initialization
 """
 
 import torch
 import torch.nn as nn
 from typing import Sequence, Optional, List
+
+class FixedScaler(nn.Module):
+    """轻量固定缩放器（逐维常数乘法）"""
+    def __init__(self, dim: int, factors: torch.Tensor):
+        super().__init__()
+        assert factors.numel() == dim, f"Factors size {factors.numel()} != dim {dim}"
+        self.register_buffer("factors", factors.view(1, dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.factors
 
 def _build_mlp(in_dim: int, hidden_layers: Sequence[int], out_dim: int,
                dropout_p: float = 0.0, final_activation: Optional[nn.Module] = None) -> nn.Sequential:
@@ -41,69 +51,114 @@ def _apply_orthogonal_init(module: nn.Module, gain_hidden: float = 1.0, gain_out
 
 class Actor(nn.Module):
     """
-    Stochastic actor network with configurable architecture.
+    确定性Actor网络，输出归一化动作。
     
     Features:
-    - Outputs both mean and standard deviation for actions
-    - Configurable hidden layers and dropout
-    - Optional orthogonal weight initialization
-    - Force constraint compliance via tanh activation
+    - 状态固定缩放 (FixedScaler)
+    - 仅输出动作均值（去掉std头）
+    - tanh激活确保输出 ∈ [-1,1]
+    - 可配置网络架构和正交初始化
     """
     
     def __init__(self,
-                 state_dimension: int,
-                 action_dimension: int,
-                 max_action_magnitude: float = 1.0,
-                 hidden_layers: Sequence[int] = (256, 256),        # Default architecture
-                 dropout_p: float = 0.0,                           # Dropout probability
-                 orthogonal_init: bool = False,                    # Orthogonal initialization flag
-                 ortho_gain_hidden: float = 1.0,                   # Hidden layer gain
-                 ortho_gain_output: float = 0.01,                  # Output layer gain
-                 std_scale: float = 1.0):                          # Standard deviation scaling
+                 state_dim: int,
+                 action_dim: int,
+                 hidden_layers: Sequence[int] = (128, 128, 128),
+                 dropout_p: float = 0.0,
+                 orthogonal_init: bool = True,
+                 ortho_gain_hidden: float = 1.414,
+                 ortho_gain_output: float = 0.01,
+                 obs_factors: Optional[torch.Tensor] = None):
         super().__init__()
-        self.max_action = max_action_magnitude
-        self.std_scale = float(std_scale)
         
-        out_dim = action_dimension * 2  # mean + log_std
-        self.net = _build_mlp(state_dimension, hidden_layers, out_dim, dropout_p=dropout_p)
+        # 状态缩放器（如果提供缩放因子）
+        if obs_factors is not None:
+            self.state_scale = FixedScaler(state_dim, obs_factors)
+        else:
+            self.state_scale = nn.Identity()
         
+        # 网络主体
+        layers = []
+        last = state_dim
+        for h in hidden_layers:
+            layers += [nn.Linear(last, h), nn.ReLU(inplace=True)]
+            if dropout_p > 0:
+                layers += [nn.Dropout(p=float(dropout_p))]
+            last = h
+        self.body = nn.Sequential(*layers)
+        
+        # 动作输出头（仅均值）
+        self.mean_head = nn.Linear(last, action_dim)
+        
+        # 正交初始化
         if orthogonal_init:
-            _apply_orthogonal_init(self.net, gain_hidden=ortho_gain_hidden, gain_output=ortho_gain_output)
+            for m in self.body:
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=ortho_gain_hidden)
+                    nn.init.constant_(m.bias, 0.0)
+            nn.init.orthogonal_(self.mean_head.weight, gain=ortho_gain_output)
+            nn.init.constant_(self.mean_head.bias, 0.0)
 
     def forward(self, state: torch.Tensor):
-        """Forward pass returning action mean and standard deviation."""
-        output = self.net(state)
-        action_mean, log_std = torch.chunk(output, 2, dim=-1)
-        action_mean = torch.tanh(action_mean) * self.max_action
-        action_std  = torch.exp(log_std.clamp(-20, 0)) * self.max_action * self.std_scale
-        return action_mean, action_std
+        """前向传播：输出归一化动作 ∈ [-1,1]"""
+        s = self.state_scale(state)
+        raw = self.mean_head(self.body(s))
+        return torch.tanh(raw)  # a_norm ∈ [-1,1]
 
 class Critic(nn.Module):
     """
-    Centralized critic network for multi-agent training.
+    集中式Critic网络，期望归一化动作输入。
     
     Features:
-    - Takes concatenated states and actions as input
-    - Configurable hidden layers and dropout
-    - Optional orthogonal weight initialization
-    - Outputs single Q-value
+    - 状态固定缩放 (FixedScaler)
+    - 直接接受归一化动作（不在内部做 /a_max）
+    - 可配置网络架构和正交初始化
+    - 输出单个Q值
     """
     
     def __init__(self,
                  total_state_dimension: int,
                  total_action_dimension: int,
-                 hidden_layers: Sequence[int] = (256, 256),        # Default architecture
+                 hidden_layers: Sequence[int] = (128, 128, 128),
                  dropout_p: float = 0.0,
-                 orthogonal_init: bool = False,
-                 ortho_gain_hidden: float = 1.0,
-                 ortho_gain_output: float = 1.0):
+                 orthogonal_init: bool = True,
+                 ortho_gain_hidden: float = 1.414,
+                 ortho_gain_output: float = 0.01,
+                 obs_factors: Optional[torch.Tensor] = None):
         super().__init__()
+        
+        # 状态缩放器（如果提供缩放因子）
+        if obs_factors is not None:
+            self.state_scale = FixedScaler(total_state_dimension, obs_factors)
+        else:
+            self.state_scale = nn.Identity()
+        
+        # 网络主体
         in_dim = total_state_dimension + total_action_dimension
-        self.net = _build_mlp(in_dim, hidden_layers, 1, dropout_p=dropout_p)
+        layers = []
+        last = in_dim
+        for h in hidden_layers:
+            layers += [nn.Linear(last, h), nn.ReLU(inplace=True)]
+            if dropout_p > 0:
+                layers += [nn.Dropout(p=float(dropout_p))]
+            last = h
+        self.body = nn.Sequential(*layers)
+        
+        # Q值输出头
+        self.q_head = nn.Linear(last, 1)
+        
+        # 正交初始化
         if orthogonal_init:
-            _apply_orthogonal_init(self.net, gain_hidden=ortho_gain_hidden, gain_output=ortho_gain_output)
+            for m in self.body:
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=ortho_gain_hidden)
+                    nn.init.constant_(m.bias, 0.0)
+            nn.init.orthogonal_(self.q_head.weight, gain=ortho_gain_output)
+            nn.init.constant_(self.q_head.bias, 0.0)
 
-    def forward(self, states: torch.Tensor, actions: torch.Tensor):
-        """Forward pass with concatenated states and actions."""
-        x = torch.cat([states, actions], dim=-1)
-        return self.net(x)
+    def forward(self, states: torch.Tensor, actions_norm: torch.Tensor):
+        """前向传播：期望states为物理量，actions_norm为归一化动作"""
+        s = self.state_scale(states)  # 状态缩放
+        x = torch.cat([s, actions_norm], dim=-1)  # Critic期望a_norm
+        h = self.body(x)
+        return self.q_head(h)

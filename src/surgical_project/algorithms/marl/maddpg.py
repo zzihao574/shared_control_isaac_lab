@@ -1,7 +1,7 @@
 """
 Multi-environment parallel MADDPG algorithm with shared network architecture.
 Enhanced with per-agent metrics and target Q-value statistics.
-Modified: Asynchronous update frequencies - Critic updates 2x more than Actor.
+Modified: Normalized action domain training, external noise scheduling, physical unit environment interaction.
 
 Features:
 - Single shared network per agent (not per environment)
@@ -11,8 +11,10 @@ Features:
 - Enhanced per-agent metrics with target Q-value tracking
 - Global noise scaling for exploration schedule
 - IDENTICAL NETWORK INITIALIZATION with proper optimizer separation
-- Force constraints applied only in select_actions method
+- Normalized domain noise, physical unit constraints only in select_actions
 - ASYNC UPDATES: Critic updates every interval, Actor updates every 2*interval
+- ROBUST: Dynamic agent order handling without hardcoded assumptions
+- Training start marker when min_buffer_size is reached
 """
 
 import torch
@@ -33,6 +35,8 @@ class MADDPG:
     - Training progress driven by global episode count
     - IDENTICAL INITIALIZATION: Both agents start with identical weights
     - ASYNC UPDATES: Critic:Actor = 2:1 update ratio
+    - Normalized action training: Actor output [-1,1], environment interaction times max_force
+    - ROBUST: Dynamic agent order handling, no hardcoded assumptions
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
@@ -52,10 +56,10 @@ class MADDPG:
         # Get dimensions from environment cfg
         self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
         self.action_dims = [self.actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
-        self.total_obs_dim = sum(self.obs_dims)  # Total observation dimension
-        self.total_action_dim = sum(self.action_dims)  # Total action dimension
+        self.total_obs_dim = sum(self.obs_dims)
+        self.total_action_dim = sum(self.action_dims)
 
-        print(f"[MADDPG] Shared Network Architecture:")
+        print(f"[MADDPG] Shared Network Architecture with Normalized Actions:")
         print(f"  Environments: {self.num_envs}")
         print(f"  Agent IDs: {self.agent_ids}")
         print(f"  Obs dims: {self.obs_dims} (total: {self.total_obs_dim})")
@@ -74,9 +78,12 @@ class MADDPG:
         self.update_interval = int(maddpg_cfg.get('update_interval', 100))
         self.min_buffer_size = int(maddpg_cfg.get('min_buffer_size', 4096))
         
-        self.training_steps = 0  # Total training steps
-        self.critic_update_count = 0  # Critic update count
-        self.actor_update_count = 0   # Actor update count
+        self.training_steps = 0
+        self.critic_update_count = 0
+        self.actor_update_count = 0
+        
+        # Add flag to track if training has started
+        self._training_started = False
         
         print(f"[MADDPG] Shared network initialization complete")
         print(f"  Batch size: {self.batch_size}")
@@ -104,12 +111,12 @@ class MADDPG:
         self.agents = {}
         
         # Create first agent (human) with seeded initialization
-        first_agent_id = self.agent_ids[0]  # Usually "human"
+        first_agent_id = self.agent_ids[0]
         self.agents[first_agent_id] = self._build_single_agent(0, first_agent_id)
         print(f"[SHARED] Created shared network for agent: {first_agent_id}")
         
         # Create second agent (robot) with separate optimizers
-        second_agent_id = self.agent_ids[1]  # Usually "robot" 
+        second_agent_id = self.agent_ids[1]
         second_agent = self._build_single_agent(1, second_agent_id)
         
         # Copy only the network weights, not the entire object (avoids optimizer sharing)
@@ -151,8 +158,8 @@ class MADDPG:
     
     def _build_slices(self) -> None:
         """Build slicing indices for concatenated observations and actions."""
-        self.obs_slices = []  # Observation slices for each agent
-        self.act_slices = []  # Action slices for each agent
+        self.obs_slices = []
+        self.act_slices = []
         
         obs_offset = 0
         act_offset = 0
@@ -168,8 +175,8 @@ class MADDPG:
 
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """
-        Select actions using shared networks with global noise scaling.
-        MODIFIED: Single point force constraint applied here only.
+        Use shared networks to select actions, adding noise in normalized domain.
+        Modified: Add noise in normalized domain, then map to physical units for environment.
         
         Args:
             observations: {agent_id: Tensor[num_envs, obs_dim]}
@@ -177,58 +184,67 @@ class MADDPG:
             noise_scale: Global noise scaling factor for exploration schedule
             
         Returns:
-            actions: {agent_id: Tensor[num_envs, action_dim]}
-            detail: Detail information for console display
+            actions: {agent_id: Tensor[num_envs, action_dim]} - Physical unit actions
+            detail: Debug information details
         """
         actions = {}
-        detail = {"mean_actions": {}, "noise_actions": {}}  # Debug information
+        detail = {"mean_actions": {}, "noise_actions": {}}
         
-        # Get force constraints from configuration
+        # Get force constraint configuration
         constraints = self.params.get('constraints', {})
-        max_robot_force = constraints.get('max_robot_force', 0.04)
-        max_human_force = constraints.get('max_human_force', 0.04)
+        max_robot_force = float(constraints.get('max_robot_force', 0.04))
+        max_human_force = float(constraints.get('max_human_force', 0.04))
         
         for i, agent_id in enumerate(self.agent_ids):
-            agent = self.agents[agent_id]
-            obs_i = observations[agent_id]  # [num_envs, obs_dim]
+            obs_i = observations[agent_id]
+            
+            # Actor outputs normalized actions [-1,1]
+            a_norm = self.agents[agent_id].actor(obs_i)
+            
+            # Add noise in normalized domain
+            if add_noise:
+                noise_norm = noise_scale * torch.randn_like(a_norm)
+            else:
+                noise_norm = torch.zeros_like(a_norm)
+                
+            # Normalized domain clamp
+            a_norm_with_noise = (a_norm + noise_norm).clamp_(-1.0, 1.0)
             
             # Determine force limit based on agent type
-            if 'robot' in agent_id.lower():
-                max_force = max_robot_force
-            else:
-                max_force = max_human_force
+            max_force = max_robot_force if 'robot' in agent_id.lower() else max_human_force
             
-            with torch.no_grad():
-                mean, std = agent.actor(obs_i)
-                noise = (noise_scale * std * torch.randn_like(mean)) if add_noise else torch.zeros_like(mean)
-                # SINGLE POINT FORCE CONSTRAINT: Only here
-                action = (mean + noise).clamp_(-max_force, max_force)
-            
+            # Map to physical units for environment
+            action = (a_norm_with_noise * max_force).clamp_(-max_force, max_force)
             actions[agent_id] = action
-            detail["mean_actions"][agent_id] = mean
-            detail["noise_actions"][agent_id] = noise
+            
+            # Store debug information:
+            # mean_actions: Pure Actor output physical force (no noise)
+            # noise_actions: Actual added noise (physical units)
+            detail["mean_actions"][agent_id] = (a_norm * max_force).clamp_(-max_force, max_force)  # No noise physical action
+            detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]  # Actual physical noise
         
         return actions, detail
 
     def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones):
         """
         Store transitions in joint replay buffer.
+        Note: actions are in physical units (after environment interaction)
         
         Args:
             obs: {agent_id: Tensor[num_envs, obs_dim]}
-            actions: {agent_id: Tensor[num_envs, action_dim]}
+            actions: {agent_id: Tensor[num_envs, action_dim]} - Physical units
             rewards: {agent_id: Tensor[num_envs]}
             next_obs: {agent_id: Tensor[num_envs, obs_dim]}
             dones: {agent_id: Tensor[num_envs]}
         """
         for env_id in range(self.num_envs):
-            # Concatenate observations and actions following agent_ids order
+            # Concatenate observations and actions (by agent_ids order)
             obs_all = torch.cat([obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             act_all = torch.cat([actions[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             rew_vec = torch.stack([rewards[aid][env_id].reshape(()).float() for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             nobs_all = torch.cat([next_obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             
-            # Compute done_any (logical OR over agents)
+            # Calculate done_any (logical OR across agents)
             done_any = False
             for aid in self.agent_ids:
                 if bool(dones[aid][env_id]):
@@ -247,11 +263,21 @@ class MADDPG:
 
     def update(self) -> Dict[str, Any]:
         """
-        CTDE update with asynchronous update frequencies.
-        Critic updates every interval, Actor updates every 2*interval.
+        CTDE update with async update frequency.
+        Critic updates every interval steps, Actor updates every 2*interval steps.
+        Modified: Critic takes a_norm during training; Buffer stores physical actions.
+        ROBUST: Dynamically build action limits, no hardcoded assumptions.
         """
         if len(self.replay) < self.min_buffer_size:
             return {}
+
+        # Check if this is the first time we're starting actual training
+        if not self._training_started:
+            print("=" * 80)
+            print("🚀 NEURAL NETWORK TRAINING STARTED 🚀")
+            print(f"Buffer size reached: {len(self.replay)} >= {self.min_buffer_size}")
+            print("=" * 80)
+            self._training_started = True
 
         self.training_steps += 1
         
@@ -269,6 +295,17 @@ class MADDPG:
         obs_all, act_all, rew_all, nobs_all, done_any = batch
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 
+        # ROBUST: Dynamically build per-dim action limits, no agent order assumptions
+        constraints = self.params.get('constraints', {})
+        a_max_list = []
+        for agent_id in self.agent_ids:
+            if 'human' in agent_id.lower():
+                max_force = float(constraints.get('max_human_force', 0.04))
+            else:
+                max_force = float(constraints.get('max_robot_force', 0.04))
+            a_max_list.extend([max_force] * 3)  # 3D force
+        a_max = torch.tensor(a_max_list, device=self.device).view(1, -1)
+
         # Enhanced statistics structure with per-agent metrics
         stats = {
             "loss/actor": {}, "loss/critic": {}, "q_mean": {}, "q_std": {},
@@ -276,26 +313,28 @@ class MADDPG:
             "grad_norm/actor": {}, "grad_norm/critic": {}
         }
 
-        # Compute target actions using target actors
+        # Calculate target actions (use target Actor, outputs normalized actions)
         next_action_parts = []
         for i, agent_id in enumerate(self.agent_ids):
             slice_i = self.obs_slices[i]
             with torch.no_grad():
-                next_action_i, _ = self.agents[agent_id].actor_target(nobs_all[:, slice_i])
-            next_action_parts.append(next_action_i)
-        next_act_all = torch.cat(next_action_parts, dim=-1)
+                a2_norm_i = self.agents[agent_id].actor_target(nobs_all[:, slice_i])
+            next_action_parts.append(a2_norm_i)
+        next_act_all_norm = torch.cat(next_action_parts, dim=-1)
 
-        # Update each agent with async frequencies
+        # Update each agent with async frequency
         for i, agent_id in enumerate(self.agent_ids):
             agent = self.agents[agent_id]
 
             # CRITIC UPDATE (every interval steps)
             if should_update_critic:
                 with torch.no_grad():
-                    q_next = agent.critic_target(nobs_all, next_act_all).squeeze(-1)
+                    q_next = agent.critic_target(nobs_all, next_act_all_norm).squeeze(-1)
                     y = rew_all[:, i] + (1.0 - done_any.squeeze(-1)) * gamma * q_next
 
-                q = agent.critic(obs_all, act_all).squeeze(-1)
+                # Current Q: Convert Buffer's physical actions to normalized
+                act_all_norm = act_all / a_max
+                q = agent.critic(obs_all, act_all_norm).squeeze(-1)
                 critic_loss = torch.nn.functional.smooth_l1_loss(q, y)
 
                 agent.critic_optimizer.zero_grad()
@@ -317,15 +356,14 @@ class MADDPG:
                 for j, agent_j in enumerate(self.agent_ids):
                     slice_j = self.obs_slices[j]
                     if j == i:
-                        action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
+                        a_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
                     else:
                         with torch.no_grad():
-                            action_j, _ = self.agents[agent_j].actor(obs_all[:, slice_j])
-                        action_j = action_j.detach()
-                    action_parts.append(action_j)
+                            a_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
+                    action_parts.append(a_norm_j)
                 
-                action_pred_all = torch.cat(action_parts, dim=-1)
-                actor_loss = -agent.critic(obs_all, action_pred_all).mean()
+                action_pred_all_norm = torch.cat(action_parts, dim=-1)
+                actor_loss = -agent.critic(obs_all, action_pred_all_norm).mean()
 
                 agent.actor_optimizer.zero_grad()
                 actor_loss.backward()
@@ -336,7 +374,7 @@ class MADDPG:
                 stats["loss/actor"][agent_id] = float(actor_loss.detach().cpu().item())
                 stats["grad_norm/actor"][agent_id] = float(a_grad_norm)
 
-            # Soft target network updates
+            # Soft target network update
             if should_update_critic or should_update_actor:
                 agent.soft_update()
 
@@ -357,4 +395,3 @@ class MADDPG:
             stats["training/actor_updates"] = int(self.actor_update_count)
         
         return stats
-    
