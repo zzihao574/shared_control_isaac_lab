@@ -297,46 +297,52 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     # =========================================================================
     
     def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
-        # 轨迹单位方向
+        # è½¨è¿¹å•ä½æ–¹å‘
         t = self.trajectory_manager.line_direction
-        # 当前速度
+        # å½“å‰é€Ÿåº¦
         v = self.stylus_vel_t1
         v_along = (v * t.unsqueeze(0)).sum(dim=-1)  # [N]
 
-        # 当前绝对进度 p ∈ [0,1]
+        # å½“å‰ç»å¯¹è¿›åº¦ p âˆˆ [0,1]
         p = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)  # [N]
 
-        # 奖励参数
-        MIN_REWARD = 0.1        # 起点处的最小奖励幅度
-        MAX_REWARD = 0.2        # 终点处的最大奖励幅度
-        EPS_V = 1e-4           # 速度死区阈值
+        # å¥–åŠ±å‚æ•°
+        MIN_REWARD = 0.1        # èµ·ç‚¹å¤„çš„æœ€å°å¥–åŠ±å¹…åº¦
+        MAX_REWARD = 0.2        # ç»ˆç‚¹å¤„çš„æœ€å¤§å¥–åŠ±å¹…åº¦
+        EPS_V = 1e-4           # é€Ÿåº¦æ­»åŒºé˜ˆå€¼
 
-        # 计算奖励幅度：从0.1（起点）到0.2（终点）线性插值
-        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p  # [N] ∈ [0.1, 0.2]
+        # è®¡ç®—å¥–åŠ±å¹…åº¦ï¼šä»Ž0.1ï¼ˆèµ·ç‚¹ï¼‰åˆ°0.2ï¼ˆç»ˆç‚¹ï¼‰çº¿æ€§æ’å€¼
+        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p  # [N] âˆˆ [0.1, 0.2]
 
-        # 方向判断
-        pos = (v_along >  EPS_V).float()   # 正方向
-        neg = (v_along < -EPS_V).float()   # 负方向
+        # æ–¹å‘åˆ¤æ–­
+        pos = (v_along >  EPS_V).float()   # æ­£æ–¹å‘
+        neg = (v_along < -EPS_V).float()   # è´Ÿæ–¹å‘
         
-        # 最终奖励：正方向为正，负方向为负
-        return (pos - neg) * reward_magnitude  # [N] ∈ [-0.2, 0.2]
+        # æœ€ç»ˆå¥–åŠ±ï¼šæ­£æ–¹å‘ä¸ºæ­£ï¼Œè´Ÿæ–¹å‘ä¸ºè´Ÿ
+        return (pos - neg) * reward_magnitude  # [N] âˆˆ [-0.2, 0.2]
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing with action validation and force application."""
-        # Extract actor detail info if available (passed from MADDPG)
+        # FIXED: Always extract and update actor detail info, even in eval mode
         if hasattr(self, '_detail_actor_info') and self._detail_actor_info is not None:
             for agent in self.cfg.possible_agents:
                 if agent in self._detail_actor_info['mean_actions']:
                     self.actor_mean_forces[agent] = self._detail_actor_info['mean_actions'][agent].clone()
                 if agent in self._detail_actor_info['noise_actions']:
                     self.actor_noise_forces[agent] = self._detail_actor_info['noise_actions'][agent].clone()
+        else:
+            # If no detail info available (shouldn't happen), show current actions as mean forces with zero noise
+            for agent in self.cfg.possible_agents:
+                if agent in actions:
+                    self.actor_mean_forces[agent] = actions[agent].clone()
+                    self.actor_noise_forces[agent] = torch.zeros_like(actions[agent])
         
-        # Process actions without additional force constraints (已在select_actions中限制)
+        # Process actions without additional force constraints (å·²åœ¨select_actionsä¸­é™åˆ¶)
         for agent, action in actions.items():
             assert agent in self.cfg.possible_agents, f"Unknown agent: {agent}"
             assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
             
-            # 直接使用动作，不再重复限制
+            # ç›´æŽ¥ä½¿ç”¨åŠ¨ä½œï¼Œä¸å†é‡å¤é™åˆ¶
             self.agent_actions[agent] = action
         
         # Cache forces for reward calculation
@@ -345,6 +351,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self._apply_external_forces()
         self._enforce_joint_constraints()
+
     
     def set_detail_actor_info(self, detail_info: Dict[str, Any]) -> None:
         """Set detail information from MADDPG actor outputs for console logging."""

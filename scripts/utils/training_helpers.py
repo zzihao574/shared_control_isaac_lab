@@ -229,6 +229,7 @@ class MilestoneEvaluator:
     - TopK model management
     - Milestone logging to MetricsHub
     - Normalized return calculation: total_reward / episode_steps * 1000
+    - FIXED: Proper action masking and detail info handling for correct display
     """
     
     def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -275,7 +276,7 @@ class MilestoneEvaluator:
         return {"skip_episode_once": True}
 
     def _run_single_evaluation_episode(self):
-        """Run single environment evaluation episode."""
+        """Run single environment evaluation episode with proper action masking and display."""
         active_env = 0
         target_episodes = 1
         
@@ -307,24 +308,44 @@ class MilestoneEvaluator:
                     current_obs = obs
                 
                 # Select actions deterministically (no noise during evaluation)
-                actions, _ = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
+                actions, detail_info = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
                 
-                # Only env0 executes real actions
+                # FIXED: Apply complete action masking to both actions AND detail_info
                 for aid, act in actions.items():
                     if act.ndim == 2:
-                        masked = torch.zeros_like(act)
-                        masked[active_env] = act[active_env]
-                        actions[aid] = masked
+                        # Mask actions - only env0 executes real actions, others get zero
+                        masked_actions = torch.zeros_like(act)
+                        masked_actions[active_env] = act[active_env]
+                        actions[aid] = masked_actions
+                        
+                        # FIXED: Also mask the detail info to reflect actual forces being applied
+                        # This ensures display shows correct information
+                        if aid in detail_info['mean_actions']:
+                            masked_mean = torch.zeros_like(detail_info['mean_actions'][aid])
+                            masked_mean[active_env] = detail_info['mean_actions'][aid][active_env]
+                            detail_info['mean_actions'][aid] = masked_mean
+                        
+                        if aid in detail_info['noise_actions']:
+                            # In evaluation, noise should be zero anyway, but mask for consistency
+                            masked_noise = torch.zeros_like(detail_info['noise_actions'][aid])
+                            masked_noise[active_env] = detail_info['noise_actions'][aid][active_env]  # Should be 0 anyway
+                            detail_info['noise_actions'][aid] = masked_noise
+                
+                # FIXED: Set detail info to environment AFTER masking for correct display
+                env.set_detail_actor_info(detail_info)
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 
-                # Call StepTracer every 10 eval steps if training step satisfies display condition
+                # FIXED: Call StepTracer every 10 eval steps with force_print=True to bypass step frequency check
                 if (hasattr(env, 'step_tracer') and env.step_tracer is not None and 
-                    eval_step_counter % 10 == 0 and training_global_step % 10 == 0):
+                    eval_step_counter % 10 == 0):
                     # Temporarily enable console logging
                     original_logging = env.step_tracer.enable_console_logging
                     env.step_tracer.enable_console_logging = True
-                    env.step_tracer.maybe_print_step(env, rewards, training_global_step)
+                    
+                    # Use force_print=True to bypass step frequency check during evaluation
+                    env.step_tracer.maybe_print_step(env, rewards, training_global_step, force_print=True)
+                    
                     env.step_tracer.enable_console_logging = original_logging
                 
                 # Accumulate env0 rewards and steps
@@ -381,7 +402,6 @@ class MilestoneEvaluator:
                 f'{prefix}_critic_target': agent.critic_target.state_dict()
             })
         return model_state
-
 
 class MetricsHub:
     """

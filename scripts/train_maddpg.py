@@ -5,6 +5,7 @@ Surgical Robot MADDPG Shared Network Training
 Enhanced version with configurable network architecture and exponential noise decay.
 MODIFIED: Added per-env scaling functionality for automatic parameter scaling.
 MODIFIED: Added eval mode control and exit reason tracking.
+FIXED: Proper global reproducibility setup for persistent generator strategy.
 
 Features:
 - Configurable network layers, dropout, and orthogonal initialization
@@ -16,6 +17,7 @@ Features:
 - Per-env scaling: YAML configs are per-env baselines, auto-scaled by --num_envs
 - Exit reason tracking for debugging premature termination
 - Eval mode support for clean milestone evaluation
+- FIXED: Global reproducibility setup with proper seed management
 """
 
 import sys
@@ -37,6 +39,30 @@ from utils.training_helpers import (
     WandBLogger, TrainingConfiguration, create_argument_parser, 
     MetricsHub, TopKModelManager, TrainingRunner, MilestoneEvaluator, save_final_shared_networks
 )
+
+
+def setup_global_reproducibility(seed: int, strict_determinism: bool = False):
+    """
+    Setup global reproducibility for consistent training results.
+    
+    Args:
+        seed: Base seed for all random number generators
+        strict_determinism: Enable strict determinism (may slow training)
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    if strict_determinism:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[SEED] Strict determinism enabled (may slow down training)")
+    
+    print(f"[SEED] Global reproducibility set: seed={seed}")
 
 
 def setup_environment(args, config):
@@ -114,6 +140,7 @@ class MADDPGTrainer:
     Streamlined MADDPG trainer for configurable networks and noise scheduling.
     MODIFIED: Added per-env scaling functionality.
     MODIFIED: Added eval mode control and exit reason tracking.
+    FIXED: Proper global reproducibility setup.
     
     Features:
     - Configuration-driven network architecture
@@ -124,12 +151,13 @@ class MADDPGTrainer:
     - Per-env scaling: YAML configs auto-scaled by num_envs
     - Exit reason tracking for debugging premature termination
     - Eval mode support for clean milestone evaluation
+    - Global reproducibility with persistent generators
     """
     
     def __init__(self, args):
         self.args = args
         
-        print(f"[TRAINER] Initializing MADDPGTrainer with configurable networks and per-env scaling...")
+        print(f"[TRAINER] Initializing MADDPGTrainer with persistent generators and per-env scaling...")
         
         # Setup phases
         self._setup_configuration()
@@ -150,13 +178,11 @@ class MADDPGTrainer:
         print(f"[SETUP] Loading configuration from: {self.args.config}")
         self.config = TrainingConfiguration.from_yaml(self.args.config)
         
-        # Set random seeds for reproducibility
-        torch.manual_seed(self.args.seed)
-        np.random.seed(self.args.seed)
-        random.seed(self.args.seed)
+        # FIXED: Setup global reproducibility with proper seed management
+        setup_global_reproducibility(self.args.seed, strict_determinism=False)
         self.config.params['seed'] = self.args.seed
         
-        print(f"[SETUP] Configuration loaded, seed set to: {self.args.seed}")
+        print(f"[SETUP] Configuration loaded, global reproducibility set: {self.args.seed}")
         
         # === NEW: Apply per-env scaling ===
         self._apply_per_env_scaling()
@@ -193,9 +219,9 @@ class MADDPGTrainer:
 
         print("[SETUP][PER-ENV SCALING]")
         print(f"  num_envs = {num_envs}")
-        print(f"  min_buffer_size: {base_min_buffer} → {scaled_min_buffer}")
-        print(f"  max_replay_buffer_len: {base_max_buffer} → {scaled_max_buffer}")
-        print(f"  milestone_episodes: {base_milestones} → {scaled_milestones}")
+        print(f"  min_buffer_size: {base_min_buffer} â†’ {scaled_min_buffer}")
+        print(f"  max_replay_buffer_len: {base_max_buffer} â†’ {scaled_max_buffer}")
+        print(f"  milestone_episodes: {base_milestones} â†’ {scaled_milestones}")
 
     def _setup_environment(self):
         """Create and configure the environment."""
@@ -314,15 +340,13 @@ class MADDPGTrainer:
             critic_cfg = networks_cfg.get('critic', {})
             print(f"  Actor layers: {actor_cfg.get('hidden_layers', 'default')}")
             print(f"  Critic layers: {critic_cfg.get('hidden_layers', 'default')}")
-            print(f"  Dropout: Actor {actor_cfg.get('dropout_p', 0.0)}, Critic {critic_cfg.get('dropout_p', 0.0)}")
             print(f"  Orthogonal init: {actor_cfg.get('orthogonal_init', False)}")
             print(f"  Gains: Hidden {actor_cfg.get('ortho_gain_hidden', 1.0)}, Output {actor_cfg.get('ortho_gain_output', 0.01)}")
-            print(f"  Std scale: {actor_cfg.get('std_scale', 1.0)}")
         
         exploration_cfg = self.config.params.get('exploration', {})
         if exploration_cfg:
             print(f"[CONFIG] Exploration Schedule:")
-            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
+            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} â†’ {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
     def set_eval_mode(self, is_eval: bool):
@@ -383,14 +407,16 @@ class MADDPGTrainer:
         """
         Main training loop with configurable networks and noise scheduling.
         MODIFIED: Added exit reason tracking for debugging premature termination.
+        FIXED: Uses persistent generators for reproducible yet diverse noise.
         """
-        print(f"[TRAIN] Starting training with configurable networks and noise scheduling:")
-        print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
-        print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
+        print(f"[TRAIN] Starting training with persistent generators and noise scheduling:")
+        print(f"  - TrainingRunner: rolloutâ†’replayâ†’updateâ†’logâ†’count + exponential noise decay")
+        print(f"  - MilestoneEvaluator: milestoneâ†’evalâ†’topkâ†’log")
         print(f"  - Network layers configurable via YAML")
-        print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
+        print(f"  - Noise schedule: Ïƒ_start={self.runner.sigma_start} â†’ Ïƒ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
         print(f"  - Per-env scaling applied: buffer sizes and milestones auto-scaled by {self.args.num_envs}x")
+        print(f"  - FIXED: Persistent generators for reproducible yet diverse per-(agent,env) noise")
         
         reason = "UNKNOWN"  # Track exit reason for debugging
         
@@ -481,14 +507,14 @@ class MADDPGTrainer:
             self.env.close()
             self.wandb_logger.finalize_run()
             print("[TRAIN] Cleanup completed")
-            print("\nConfigurable network training with per-env scaling completed")
+            print("\nPersistent generator training with per-env scaling completed")
 
 
 def main():
     """Main entry point for MADDPG training."""
     print("="*80)
-    print("MADDPG Configurable Network Training with Per-Env Scaling")
-    print("Enhanced with exponential noise scheduling and automatic parameter scaling")
+    print("MADDPG Persistent Generator Training with Per-Env Scaling")
+    print("Enhanced with reproducible yet diverse per-(agent,env) noise generation")
     print("="*80)
     
     # Parse arguments
@@ -503,6 +529,7 @@ def main():
     print(f"  WandB: {args_cli.wandb}")
     print(f"  Config: {args_cli.config}")
     print(f"  Per-env scaling: YAML configs will be auto-scaled by {args_cli.num_envs}x")
+    print(f"  FIXED: Persistent generators for reproducible yet diverse noise")
     
     # Launch Isaac Sim
     print(f"[MAIN] Launching Isaac Sim...")

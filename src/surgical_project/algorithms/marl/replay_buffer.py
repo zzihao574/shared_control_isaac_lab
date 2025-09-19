@@ -7,6 +7,7 @@ Features:
 - Efficient numpy-based storage with torch tensor sampling
 - Circular buffer implementation for memory efficiency
 - Per-agent reward tracking with logical OR done signals
+- FIXED: Support for dedicated generator to avoid global RNG interference
 """
 import numpy as np
 import torch
@@ -58,12 +59,26 @@ class JointReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Sample random batch from joint buffer."""
+    def sample(self, batch_size: int, generator: Optional[torch.Generator] = None) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Sample random batch from joint buffer using dedicated generator.
+        
+        Args:
+            batch_size: Number of transitions to sample
+            generator: Optional torch.Generator for reproducible sampling
+            
+        Returns:
+            Tuple of (obs, actions, rewards, next_obs, dones) tensors or None if insufficient data
+        """
         if self.size < batch_size:
             return None
-            
-        idx = np.random.choice(self.size, batch_size, replace=False)
+        
+        if generator is not None:
+            # Use provided generator for reproducible sampling
+            idx = torch.randint(high=self.size, size=(batch_size,), generator=generator).cpu().numpy()
+        else:
+            # Fallback to numpy random (for backward compatibility)
+            idx = np.random.choice(self.size, batch_size, replace=True)
         
         obs = torch.from_numpy(self.obs[idx]).to(self.device)      # [B, total_obs_dim]
         act = torch.from_numpy(self.act[idx]).to(self.device)      # [B, total_action_dim]

@@ -212,13 +212,7 @@ class TrajectoryManager:
 class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
-    Provides detailed per-environment console output for debugging and analysis.
-    
-    Features:
-    - Four-zone reward system monitoring
-    - Per-environment state visualization
-    - Actor network output tracking
-    - Unified global_step integration
+    Simplified version - removed unnecessary debug checks, let it crash if there are issues.
     """
     
     def __init__(self, num_envs: int, device: torch.device,
@@ -227,25 +221,21 @@ class StepTracer:
                  max_envs_to_print: int = 2):
         self.num_envs = num_envs
         self.device = device
-        self.enable_console_logging = enable_console_logging  # Console logging flag
-        self.print_every_steps = print_every_steps  # Print frequency
-        self.max_envs_to_print = max_envs_to_print  # Max environments to show
+        self.enable_console_logging = enable_console_logging
+        self.print_every_steps = print_every_steps
+        self.max_envs_to_print = max_envs_to_print
 
-    def maybe_print_step(self, env, rewards: Dict, global_step: int):
-        """
-        Complete zone-based console printing using unified global_step.
-        Console print (zero storage) - only when enabled and throttled by step frequency.
-        MODIFIED: Allow printing during evaluation mode but keep original [TRAIN] format.
-        """
+    def maybe_print_step(self, env, rewards: Dict, global_step: int, force_print: bool = False):
+        """Console printing with force_print bypass for evaluation."""
         if not self.enable_console_logging:
             return
             
-        if global_step % self.print_every_steps != 0:
+        # Skip step frequency check if force_print is True (evaluation mode)
+        if not force_print and global_step % self.print_every_steps != 0:
             return
 
         to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
 
-        # Keep original format - no [EVAL] prefix
         print("=" * 80)
         print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D) - Shared Network")
         print("=" * 80)
@@ -254,33 +244,20 @@ class StepTracer:
         for env_id in to_show:
             self._print_env_snapshot(env, env_id)
 
-        # --- 新的 [TOTALS] 逻辑: 显示每个环境的单独奖励 ---
         print("\n[REWARDS FOR THIS STEP]")
         for env_id in to_show:
-            robot_total = rewards.get("robot", torch.zeros(self.num_envs, device=self.device))[env_id].item()
-            human_total = rewards.get("human", torch.zeros(self.num_envs, device=self.device))[env_id].item()
+            robot_total = rewards["robot"][env_id].item()
+            human_total = rewards["human"][env_id].item()
             combined_total = robot_total + human_total
             print(f"  Env {env_id}: Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
 
-
     def _print_env_snapshot(self, env, env_id: int):
-        """Print complete four-zone reward breakdown for a single environment."""
-        if not hasattr(env, 'reward_components') or not env.reward_components:
-            print(f"[DEBUG] Environment {env_id}: Reward components not yet calculated")
-            return
-            
-        if not hasattr(env, 'stylus_pos_t1') or env.stylus_pos_t1 is None:
-            print(f"[DEBUG] Environment {env_id}: Stylus position not available")
-            return
-        
-        if env.stylus_pos_t1.shape[0] <= env_id:
-            print(f"[DEBUG] Environment {env_id}: Index out of range for stylus position")
-            return
-            
+        """Print environment snapshot."""
         stylus = env.stylus_pos_t1[env_id]
         safety = float(env.safety_distances_t1[env_id].item())
         normal = env.normal_t1[env_id]
         
+        # Safe access to reward components
         dev = self._safe_get_reward_component(env, 'deviation', env_id, 0.0)
         prog = self._safe_get_reward_component(env, 'progress_ratio', env_id, 0.0)
         dist = self._safe_get_reward_component(env, 'distance_to_final', env_id, 0.0)
@@ -289,113 +266,113 @@ class StepTracer:
         print(f"Stylus: [{stylus[0]:.4f}, {stylus[1]:.4f}, {stylus[2]:.4f}] | Safety: {safety:.4f}m")
         print(f"Normal: [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
 
-        self._print_actor_detail_info(env, env_id)
+        self._print_actor_forces(env, env_id)
 
         print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
+        # Determine active zone
         D, O = 0.0075, 0.015
         is_colliding = env.is_violating_t1[env_id].item()
 
-        # --- 新的 Active Zone 逻辑: 显示区间 ---
         if safety >= O:
             active_zone = "A (Track)"
         elif safety <= D:
-            if is_colliding:
-                active_zone = "C (Danger - Overlapping)"
-            else:
-                active_zone = "C (Danger - Outside)"
+            active_zone = "C (Danger - Overlapping)" if is_colliding else "C (Danger - Outside)"
         else:
-            if hasattr(env, 'rejoin_streak') and env.rejoin_streak.shape[0] > env_id and env.rejoin_streak[env_id] >= 10:
-                active_zone = "D (Rejoin)"
-            else:
-                active_zone = "B (Surface)"
+            active_zone = "D (Rejoin)" if env.rejoin_streak[env_id] >= 10 else "B (Surface)"
         print(f"Active Zone: {active_zone}")
 
-        self._print_agent_zones_with_globals_flat(env, env_id, "ROBOT")
-        self._print_agent_zones_with_globals_flat(env, env_id, "HUMAN")
+        self._print_agent_rewards(env, env_id, "ROBOT")
+        self._print_agent_rewards(env, env_id, "HUMAN")
 
-
-    def _print_agent_zones_with_globals_flat(self, env, env_id: int, agent_label: str):
-        """Print complete zone breakdown and global rewards for a single agent using flat keys."""
+    def _print_agent_rewards(self, env, env_id: int, agent_label: str):
+        """Print zone rewards for agent - simplified."""
         agent_key = agent_label.lower()
-        print(f"\n[{agent_label}] ZONE REWARDS:")
-
+        RC = env.reward_components
         is_colliding = env.is_violating_t1[env_id].item()
+        
+        print(f"\n[{agent_label}] ZONE REWARDS:")
 
         def _val(x):
             if torch.is_tensor(x):
-                if x.ndim > 0 and x.shape[0] > env_id:
-                    return float(x[env_id].item())
-                elif x.ndim == 0:
-                    return float(x.item())
-                else:
-                    return 0.0
-            return float(x) if isinstance(x, (int, float)) else 0.0
+                return float(x[env_id].item()) if x.ndim > 0 else float(x.item())
+            return float(x)
 
         for Z in ['A', 'B', 'C', 'D']:
+            zone_w = _val(RC[f'zone{Z}_weight_{agent_key}'])
+            zone_total = _val(RC[f'zone{Z}_total_{agent_key}'])
+            
             if Z == 'C':
-                zw_key = f'zoneC_weight_{agent_key}'
-                zt_key = f'zoneC_total_{agent_key}'
-                zone_w = env.reward_components.get(zw_key, 0.0)
-                zone_total = env.reward_components.get(zt_key, 0.0)
+                mode = "Overlapping" if is_colliding else "Outside"
+                print(f"  C Danger-{mode} (zone_w={zone_w:.2f}): {zone_total:+.3f}")
                 
                 if is_colliding:
-                    print(f"  C Danger-Overlapping (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
-                    base = f"zoneC_overlap_{agent_key}"
-                    raw = env.reward_components.get(f"{base}_raw", 0.0)
-                    weight = env.reward_components.get(f"{base}_weight", 0.0)
-                    contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-                    print(f"    {'Overlap_Pen':<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+                    raw = _val(RC[f'zoneC_overlap_{agent_key}_raw'])
+                    weight = _val(RC[f'zoneC_overlap_{agent_key}_weight'])
+                    contrib = _val(RC[f'zoneC_overlap_{agent_key}_contrib'])
+                    print(f"    {'Overlap_Pen':<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
                 else:
-                    print(f"  C Danger-Outside   (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
                     for comp_key, comp_label in [('offpen', 'Off_Penalty'), ('inward', 'Inward_Pen')]:
-                        base = f"zoneC_{comp_key}_{agent_key}"
-                        raw = env.reward_components.get(f"{base}_raw", 0.0)
-                        weight = env.reward_components.get(f"{base}_weight", 0.0)
-                        contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-                        print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+                        raw = _val(RC[f'zoneC_{comp_key}_{agent_key}_raw'])
+                        weight = _val(RC[f'zoneC_{comp_key}_{agent_key}_weight'])
+                        contrib = _val(RC[f'zoneC_{comp_key}_{agent_key}_contrib'])
+                        print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
                 continue
             
-            zone_title = {'A':'A Track   ', 'B':'B Surface ', 'D':'D Rejoin  '}
-            mapping = {
-                'A': [('progress','Progress'), ('deviation','Deviation')],
-                'B': [('gap','Gap'), ('surftangent','Surf_Tangent'), ('inward','Inward_Pen')],
-                'D': [('progress','Progress'), ('deviation','Deviation'), ('inward','Inward_Pen')],
+            zone_names = {'A': 'A Track   ', 'B': 'B Surface ', 'D': 'D Rejoin  '}
+            components = {
+                'A': [('progress', 'Progress'), ('deviation', 'Deviation')],
+                'B': [('gap', 'Gap'), ('surftangent', 'Surf_Tangent'), ('inward', 'Inward_Pen')],
+                'D': [('progress', 'Progress'), ('deviation', 'Deviation'), ('inward', 'Inward_Pen')],
             }
-            zw_key = f'zone{Z}_weight_{agent_key}'
-            zt_key = f'zone{Z}_total_{agent_key}'
-            zone_w = env.reward_components.get(zw_key, 0.0)
-            zone_total = env.reward_components.get(zt_key, 0.0)
-            print(f"  {zone_title[Z]} (zone_w={_val(zone_w):.2f}): {_val(zone_total):+.3f}")
+            
+            print(f"  {zone_names[Z]} (zone_w={zone_w:.2f}): {zone_total:+.3f}")
+            
+            for comp_key, comp_label in components[Z]:
+                raw = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_raw'])
+                weight = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_weight'])
+                contrib = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_contrib'])
+                print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
-            for comp_key, comp_label in mapping[Z]:
-                base = f"zone{Z}_{comp_key}_{agent_key}"
-                raw     = env.reward_components.get(f"{base}_raw", 0.0)
-                weight  = env.reward_components.get(f"{base}_weight", 0.0)
-                contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-                print(f"    {comp_label:<12} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
-
+        # Global rewards
         print("  Global Rewards:")
-        for gk, glabel in [('zpenalty','Z Penalty      '),
-                           ('completion','Completion     '),
-                           ('timeeff','Time Efficiency')]:
-            base = f"global_{gk}_{agent_key}"
-            raw     = env.reward_components.get(f"{base}_raw", 0.0)
-            weight  = env.reward_components.get(f"{base}_weight", 0.0)
-            contrib = env.reward_components.get(f"{base}_contrib", 0.0)
-            print(f"    {glabel:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+        globals_list = [
+            ('zpenalty', 'Z Penalty      '),
+            ('completion', 'Completion     '),
+            ('timeeff', 'Time Efficiency')
+        ]
+        
+        for gk, glabel in globals_list:
+            raw = _val(RC[f'global_{gk}_{agent_key}_raw'])
+            weight = _val(RC[f'global_{gk}_{agent_key}_weight'])
+            contrib = _val(RC[f'global_{gk}_{agent_key}_contrib'])
+            print(f"    {glabel:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
-        raw     = env.reward_components.get(f"{agent_key}force_raw", 0.0)
-        weight  = env.reward_components.get(f"{agent_key}force_weight", 0.0)
-        contrib = env.reward_components.get(f"{agent_key}force_contrib", 0.0)
-        print(f"    {agent_label} Force   {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+        # Agent force
+        raw = _val(RC[f'{agent_key}force_raw'])
+        weight = _val(RC[f'{agent_key}force_weight'])
+        contrib = _val(RC[f'{agent_key}force_contrib'])
+        print(f"    {agent_label} Force   {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
+        # Cross-agent awareness
         aware_key = 'humanaware' if agent_key == 'robot' else 'robotaware'
-        raw     = env.reward_components.get(f"{aware_key}_raw", 0.0)
-        weight  = env.reward_components.get(f"{aware_key}_weight", 0.0)
-        contrib = env.reward_components.get(f"{aware_key}_contrib", 0.0)
+        raw = _val(RC[f'{aware_key}_raw'])
+        weight = _val(RC[f'{aware_key}_weight'])
+        contrib = _val(RC[f'{aware_key}_contrib'])
         label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
-        print(f"    {label:<15} {_val(raw):.3f} * {_val(weight):>.2f} = {_val(contrib):+.3f}")
+        print(f"    {label:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
+
+    def _print_actor_forces(self, env, env_id: int):
+        """Print actor forces - simplified."""
+        robot_mean = env.actor_mean_forces['robot'][env_id]
+        robot_noise = env.actor_noise_forces['robot'][env_id]
+        human_mean = env.actor_mean_forces['human'][env_id]
+        human_noise = env.actor_noise_forces['human'][env_id]
+        
+        print(f"Physical Forces (Robot): Fx={robot_mean[0]:+.6f}N, Fy={robot_mean[1]:+.6f}N, Fz={robot_mean[2]:+.6f}N")
+        print(f"  Noise: Nx={robot_noise[0]:+.6f}N, Ny={robot_noise[1]:+.6f}N, Nz={robot_noise[2]:+.6f}N")
+        print(f"Physical Forces (Human): Fx={human_mean[0]:+.6f}N, Fy={human_mean[1]:+.6f}N, Fz={human_mean[2]:+.6f}N")
+        print(f"  Noise: Nx={human_noise[0]:+.6f}N, Ny={human_noise[1]:+.6f}N, Nz={human_noise[2]:+.6f}N")
 
     def _safe_get_reward_component(self, env, key: str, env_id: int, default: float) -> float:
         """Safely get reward component value with explicit checks."""
@@ -410,28 +387,3 @@ class StepTracer:
             return default
             
         return float(component[env_id].item())
-
-    def _print_actor_detail_info(self, env, env_id: int):
-            """Print actor network outputs and noise information with physical force units."""
-            if not (hasattr(env, 'actor_mean_forces') and hasattr(env, 'actor_noise_forces')):
-                return
-                
-            # Get robot forces (mean and noise) 
-            robot_mean = env.actor_mean_forces.get('robot')
-            robot_noise = env.actor_noise_forces.get('robot')
-            
-            # Get human forces (mean and noise) 
-            human_mean = env.actor_mean_forces.get('human')
-            human_noise = env.actor_noise_forces.get('human')
-            
-            if robot_mean is not None and robot_noise is not None and robot_mean.shape[0] > env_id:
-                rm = robot_mean[env_id]
-                rn = robot_noise[env_id]
-                print(f"Physical Forces (Robot): Fx={rm[0]:+.6f}N, Fy={rm[1]:+.6f}N, Fz={rm[2]:+.6f}N")
-                print(f"  Noise: Nx={rn[0]:+.6f}N, Ny={rn[1]:+.6f}N, Nz={rn[2]:+.6f}N")
-            
-            if human_mean is not None and human_noise is not None and human_mean.shape[0] > env_id:
-                hm = human_mean[env_id]
-                hn = human_noise[env_id]
-                print(f"Physical Forces (Human): Fx={hm[0]:+.6f}N, Fy={hm[1]:+.6f}N, Fz={hm[2]:+.6f}N")
-                print(f"  Noise: Nx={hn[0]:+.6f}N, Ny={hn[1]:+.6f}N, Nz={hn[2]:+.6f}N")

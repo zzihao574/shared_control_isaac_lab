@@ -3,20 +3,7 @@ Multi-environment parallel MADDPG algorithm with shared network architecture.
 Enhanced with per-agent metrics and target Q-value statistics.
 Modified: Normalized action domain training, external noise scheduling, physical unit environment interaction.
 MODIFIED: Added eval mode support to disable buffer updates, network updates, and noise during evaluation.
-
-Features:
-- Single shared network per agent (not per environment)
-- Joint replay buffer with concatenated observations/actions
-- CTDE: Centralized training with decentralized execution
-- Gradient norm monitoring for training stability
-- Enhanced per-agent metrics with target Q-value tracking
-- Global noise scaling for exploration schedule
-- IDENTICAL NETWORK INITIALIZATION with proper optimizer separation
-- Normalized domain noise, physical unit constraints only in select_actions
-- ASYNC UPDATES: Critic updates every interval, Actor updates every 2*interval
-- ROBUST: Dynamic agent order handling without hardcoded assumptions
-- Training start marker when min_buffer_size is reached
-- EVAL MODE: Disables buffer updates, network updates, and noise during evaluation
+FIXED: Strategy D - Persistent per-(agent,env) generators for reproducible yet diverse noise.
 """
 
 import torch
@@ -29,17 +16,6 @@ from .replay_buffer import JointReplayBuffer
 class MADDPG:
     """
     Multi-Agent Deep Deterministic Policy Gradient with shared network architecture.
-    
-    Architecture:
-    - self.agents[agent_id] = One shared network per agent type
-    - 512 parallel environments share these networks
-    - Joint replay buffer stores (obs_all, act_all, rewards_vec, next_obs_all, done_any)
-    - Training progress driven by global episode count
-    - IDENTICAL INITIALIZATION: Both agents start with identical weights
-    - ASYNC UPDATES: Critic:Actor = 2:1 update ratio
-    - Normalized action training: Actor output [-1,1], environment interaction times max_force
-    - ROBUST: Dynamic agent order handling, no hardcoded assumptions
-    - EVAL MODE: Controlled evaluation behavior for clean milestone assessment
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
@@ -52,8 +28,11 @@ class MADDPG:
         # NEW: Eval mode control
         self._is_eval_mode = False
         
-        # Set global seeds FIRST for identical initialization
-        self._set_global_seeds()
+        # Get base seed for reproducible generator initialization
+        self.base_seed = int(self.params.get("seed", 42))
+        
+        # Phase 1: Set deterministic seeds for network initialization
+        self._set_network_seeds()
         
         # Get environment configuration
         self.agent_ids = list(self.actual_env.cfg.possible_agents)
@@ -65,7 +44,7 @@ class MADDPG:
         self.total_obs_dim = sum(self.obs_dims)
         self.total_action_dim = sum(self.action_dims)
 
-        print(f"[MADDPG] Shared Network Architecture with Normalized Actions:")
+        print(f"[MADDPG] Shared Network Architecture with Persistent Generator Strategy:")
         print(f"  Environments: {self.num_envs}")
         print(f"  Agent IDs: {self.agent_ids}")
         print(f"  Obs dims: {self.obs_dims} (total: {self.total_obs_dim})")
@@ -76,6 +55,9 @@ class MADDPG:
         self._initialize_agents_with_identical_init()
         self._initialize_replay_buffers()
         self._build_slices()
+        
+        # Phase 2: Initialize persistent noise generators for reproducible yet diverse noise
+        self._init_noise_generators()
         
         # Load training hyperparameters
         maddpg_cfg = self.params.get('maddpg_config', {})
@@ -91,7 +73,7 @@ class MADDPG:
         # Add flag to track if training has started
         self._training_started = False
         
-        print(f"[MADDPG] Shared network initialization complete")
+        print(f"[MADDPG] Shared network initialization complete with persistent generators")
         print(f"  Batch size: {self.batch_size}")
         print(f"  Critic update interval: {self.update_interval}")
         print(f"  Actor update interval: {self.update_interval * 2}")
@@ -107,16 +89,36 @@ class MADDPG:
         self._is_eval_mode = bool(is_eval)
         print(f"[MADDPG] Eval mode: {'ENABLED' if self._is_eval_mode else 'DISABLED'}")
     
-    def _set_global_seeds(self) -> None:
-        """Set all random seeds for reproducible initialization."""
-        seed = int(self.params.get("seed", 42))
+    def _set_network_seeds(self) -> None:
+        """Phase 1: Set deterministic seeds for network initialization."""
         import random
-        random.seed(seed)
-        np.random.seed(seed)  
-        torch.manual_seed(seed)
+        random.seed(self.base_seed)
+        np.random.seed(self.base_seed)  
+        torch.manual_seed(self.base_seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        print(f"[SEED] Global seeds set to {seed}")
+            torch.cuda.manual_seed_all(self.base_seed)
+        print(f"[SEED] Phase 1 - Network initialization seed: {self.base_seed}")
+    
+    def _init_noise_generators(self) -> None:
+        """Initialize persistent noise generators for each (agent, env) pair."""
+        self.noise_generators = {}  # {agent_id: [gen_env0, gen_env1, ...]}
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        for i, agent_id in enumerate(self.agent_ids):
+            gens = []
+            for env_id in range(self.num_envs):
+                gen = torch.Generator(device=device)
+                # Reproducible but unique seed for each (agent, env) pair
+                seed_ae = (self.base_seed + 1234567 + i * 10007 + env_id * 97) % (2**32)
+                gen.manual_seed(seed_ae)
+                gens.append(gen)
+            self.noise_generators[agent_id] = gens
+        
+        # Dedicated generator for replay buffer sampling
+        self.replay_generator = torch.Generator(device='cpu')
+        self.replay_generator.manual_seed((self.base_seed + 424242) % (2**32))
+        
+        print(f"[GENERATORS] Initialized {self.num_agents * self.num_envs} noise generators + 1 replay generator")
     
     def _unwrap_environment(self, env):
         """Get actual environment object."""
@@ -191,23 +193,13 @@ class MADDPG:
 
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """
-        Use shared networks to select actions, adding noise in normalized domain.
-        Modified: Add noise in normalized domain, then map to physical units for environment.
-        MODIFIED: Disable noise during evaluation mode.
-        
-        Args:
-            observations: {agent_id: Tensor[num_envs, obs_dim]}
-            add_noise: Whether to add exploration noise
-            noise_scale: Global noise scaling factor for exploration schedule
-            
-        Returns:
-            actions: {agent_id: Tensor[num_envs, action_dim]} - Physical unit actions
-            detail: Debug information details
+        FIXED: Generate diverse noise using persistent per-(agent,env) generators.
+        No more global manual_seed() calls - each (agent,env) has its own generator.
         """
         actions = {}
         detail = {"mean_actions": {}, "noise_actions": {}}
         
-        # NEW: Force disable noise during evaluation
+        # Force disable noise during evaluation
         effective_add_noise = add_noise and (not self._is_eval_mode)
         
         # Get force constraint configuration
@@ -221,9 +213,15 @@ class MADDPG:
             # Actor outputs normalized actions [-1,1]
             a_norm = self.agents[agent_id].actor(obs_i)
             
-            # Add noise in normalized domain (disabled during eval)
+            # Generate noise using persistent generators (no global seed changes)
             if effective_add_noise:
-                noise_norm = noise_scale * torch.randn_like(a_norm)
+                noise_norm = torch.zeros_like(a_norm)  # [num_envs, action_dim]
+                
+                # Each environment uses its dedicated generator
+                for env_id in range(self.num_envs):
+                    gen = self.noise_generators[agent_id][env_id]
+                    noise_norm[env_id] = noise_scale * torch.randn(a_norm.shape[1], device=a_norm.device, generator=gen)
+                    
             else:
                 noise_norm = torch.zeros_like(a_norm)
                 
@@ -237,11 +235,9 @@ class MADDPG:
             action = (a_norm_with_noise * max_force).clamp_(-max_force, max_force)
             actions[agent_id] = action
             
-            # Store debug information:
-            # mean_actions: Pure Actor output physical force (no noise)
-            # noise_actions: Actual added noise (physical units)
-            detail["mean_actions"][agent_id] = (a_norm * max_force).clamp_(-max_force, max_force)  # No noise physical action
-            detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]  # Actual physical noise
+            # Store debug information
+            detail["mean_actions"][agent_id] = (a_norm * max_force).clamp_(-max_force, max_force)
+            detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]
         
         return actions, detail
 
@@ -258,7 +254,7 @@ class MADDPG:
             next_obs: {agent_id: Tensor[num_envs, obs_dim]}
             dones: {agent_id: Tensor[num_envs]}
         """
-        # NEW: Skip buffer updates during evaluation
+        # Skip buffer updates during evaluation
         if self._is_eval_mode:
             return
             
@@ -293,8 +289,9 @@ class MADDPG:
         Modified: Critic takes a_norm during training; Buffer stores physical actions.
         ROBUST: Dynamically build action limits, no hardcoded assumptions.
         MODIFIED: Skip all updates during evaluation mode.
+        FIXED: Uses dedicated replay_generator for reproducible batch sampling.
         """
-        # NEW: Skip all updates during evaluation
+        # Skip all updates during evaluation
         if self._is_eval_mode:
             return {"actor_updates": 0, "critic_updates": 0}
             
@@ -304,7 +301,7 @@ class MADDPG:
         # Check if this is the first time we're starting actual training
         if not self._training_started:
             print("=" * 80)
-            print("🚀 NEURAL NETWORK TRAINING STARTED 🚀")
+            print("ðŸš€ NEURAL NETWORK TRAINING STARTED ðŸš€")
             print(f"Buffer size reached: {len(self.replay)} >= {self.min_buffer_size}")
             print("=" * 80)
             self._training_started = True
@@ -318,7 +315,8 @@ class MADDPG:
         if not (should_update_critic or should_update_actor):
             return {}
 
-        batch = self.replay.sample(self.batch_size)
+        # Use dedicated generator for reproducible replay sampling
+        batch = self.replay.sample(self.batch_size, generator=self.replay_generator)
         if batch is None:
             return {}
 
