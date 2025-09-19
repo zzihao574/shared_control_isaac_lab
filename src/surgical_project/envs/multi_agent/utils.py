@@ -6,6 +6,7 @@ Features:
 - CompleteConstraintChecker: Physics-based constraint analysis
 - TrajectoryManager: Trajectory management for path following
 - StepTracer: Console debugging with four-zone reward system monitoring
+- MODIFIED: Added eval mode support to disable printing during evaluation
 """
 
 import torch
@@ -234,14 +235,17 @@ class StepTracer:
         """
         Complete zone-based console printing using unified global_step.
         Console print (zero storage) - only when enabled and throttled by step frequency.
+        MODIFIED: Allow printing during evaluation mode but keep original [TRAIN] format.
         """
         if not self.enable_console_logging:
             return
+            
         if global_step % self.print_every_steps != 0:
             return
 
         to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
 
+        # Keep original format - no [EVAL] prefix
         print("=" * 80)
         print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D) - Shared Network")
         print("=" * 80)

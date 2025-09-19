@@ -2,13 +2,13 @@
 
 """
 Training helper utilities for MADDPG multi-environment parallel training.
-Enhanced version with configurable network architecture and exponential noise decay support.
+OPTIMIZED: Simplified WandBLogger metric mapping, removed unused MetricsHub methods.
 
 Features:
 - TrainingRunner: Unified training loop execution with noise scheduling
-- MilestoneEvaluator: Milestone evaluation and TopK model management  
-- MetricsHub: Unified data pipeline for logging
-- Configurable network support and intelligent noise scheduling
+- MilestoneEvaluator: Milestone evaluation and TopK model management with normalized return tracking  
+- MetricsHub: Simplified data pipeline for logging
+- WandBLogger: Optimized metric mapping with consolidated dictionaries
 """
 
 import argparse
@@ -156,6 +156,10 @@ class TrainingRunner:
             
             self.metrics.push_update(self.global_step, payload)
 
+        # NEW: Push force statistics every 10 steps
+        if self.global_step % 10 == 0:
+            self._push_current_step_force_statistics(detail)
+
         # Step counting and environment synchronization
         self.global_step += 1
         actual_env = getattr(self.env, "unwrapped", self.env)
@@ -170,6 +174,43 @@ class TrainingRunner:
     def mark_skip_episode_once(self):
         """Mark to skip episode counting once for milestone evaluation."""
         self._skip_episode_once = True
+
+    def _push_current_step_force_statistics(self, detail):
+        """
+        Push current step's force statistics to WandB.
+        Calculate mean force across all environments for each agent in each direction.
+        
+        Args:
+            detail: Dictionary containing mean_actions from MADDPG.select_actions()
+        """
+        if "mean_actions" not in detail:
+            return
+        
+        force_payload = {}
+        
+        # Robot forces - current step all environments average
+        if "robot" in detail["mean_actions"]:
+            robot_forces = detail["mean_actions"]["robot"]  # [num_envs, 3]
+            robot_mean = robot_forces.mean(dim=0)  # [3] - current step cross-environment mean
+            force_payload.update({
+                "forces/robot_fx_mean": float(robot_mean[0].item()),
+                "forces/robot_fy_mean": float(robot_mean[1].item()),
+                "forces/robot_fz_mean": float(robot_mean[2].item()),
+            })
+        
+        # Human forces - current step all environments average  
+        if "human" in detail["mean_actions"]:
+            human_forces = detail["mean_actions"]["human"]  # [num_envs, 3]
+            human_mean = human_forces.mean(dim=0)  # [3] - current step cross-environment mean
+            force_payload.update({
+                "forces/human_fx_mean": float(human_mean[0].item()),
+                "forces/human_fy_mean": float(human_mean[1].item()),
+                "forces/human_fz_mean": float(human_mean[2].item()),
+            })
+        
+        # Push to MetricsHub for WandB logging
+        if force_payload:
+            self.metrics.push_update(self.global_step, force_payload)
 
     def run_until(self, max_global_steps: int):
         """Run training until reaching maximum steps."""
@@ -187,6 +228,7 @@ class MilestoneEvaluator:
     - Single environment evaluation for efficiency
     - TopK model management
     - Milestone logging to MetricsHub
+    - Normalized return calculation: total_reward / episode_steps * 1000
     """
     
     def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -199,27 +241,36 @@ class MilestoneEvaluator:
 
     def run_evaluation(self, milestone: int, global_step: int) -> dict:
         """Handle milestone evaluation and model saving."""
-        # In-place evaluation
-        avg_return, num_eps = self._run_single_evaluation_episode()
+        # In-place evaluation with return normalization
+        return_norm, num_eps = self._run_single_evaluation_episode()
+        
+        # Scale return_norm by 1000 for milestone tracking
+        milestone_return = return_norm * 1000
+        
+        print(f"[EVAL] Milestone {milestone}: return_norm={return_norm:.4f}, scaled={milestone_return:.2f}")
 
         # Extract model weights
         model_state = self._extract_model_state()
 
-        # Update TopK and save
-        self.topk.update(avg_return, model_state, milestone)
+        # Update TopK and save (using scaled return)
+        self.topk.update(milestone_return, model_state, milestone)
         ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
         self.topk.save_checkpoint(ckpt_path, self.agent_ids)
 
-        # Push milestone logs
+        # Push milestone logs with return_norm*1000 to replace previous return metrics
         payload = {
-            "eval/return_mean": float(avg_return),
+            "eval/return_mean": float(milestone_return),  # This maps to milestone/actor_return
             "eval/num_episodes": int(num_eps),
-            "milestone/topk_best_score": float(avg_return),
-            "milestone/topk_avg_score": float(avg_return),
+            "milestone/topk_best_score": float(milestone_return),  # This maps to milestone/topk_best_return
+            "milestone/topk_avg_score": float(milestone_return),
             "milestone/topk_count": 1,
             "milestone/latest_completed": int(milestone),
+            # Additional debug info
+            "eval/return_norm": float(return_norm),  # Original normalized return for reference
         }
         self.metrics.push_milestone(global_step, milestone, payload)
+        
+        print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
 
         return {"skip_episode_once": True}
 
@@ -236,10 +287,17 @@ class MilestoneEvaluator:
         
         num_envs = len(obs[self.agent_ids[0]])
         ep_returns = torch.zeros(num_envs, device='cuda' if torch.cuda.is_available() else 'cpu')
-        completed_returns = []
+        ep_steps = torch.zeros(num_envs, dtype=torch.int64, device='cuda' if torch.cuda.is_available() else 'cpu')
+        completed_return_norms = []
+        
+        # Get current global step for StepTracer (use training step, don't increment)
+        training_global_step = getattr(env, '_trainer_global_step', 0)
+        eval_step_counter = 0  # Local step counter for evaluation
         
         with torch.no_grad():
-            while len(completed_returns) < target_episodes:
+            while len(completed_return_norms) < target_episodes:
+                eval_step_counter += 1
+                
                 # Get current observations
                 if hasattr(env, '_get_observations'):
                     current_obs = env._get_observations()
@@ -248,7 +306,7 @@ class MilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # Select actions deterministically
+                # Select actions deterministically (no noise during evaluation)
                 actions, _ = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
                 
                 # Only env0 executes real actions
@@ -260,10 +318,20 @@ class MilestoneEvaluator:
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 
-                # Accumulate env0 rewards only
+                # Call StepTracer every 10 eval steps if training step satisfies display condition
+                if (hasattr(env, 'step_tracer') and env.step_tracer is not None and 
+                    eval_step_counter % 10 == 0 and training_global_step % 10 == 0):
+                    # Temporarily enable console logging
+                    original_logging = env.step_tracer.enable_console_logging
+                    env.step_tracer.enable_console_logging = True
+                    env.step_tracer.maybe_print_step(env, rewards, training_global_step)
+                    env.step_tracer.enable_console_logging = original_logging
+                
+                # Accumulate env0 rewards and steps
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
                 avg_step_rewards = step_rewards.mean(dim=0)
                 ep_returns[active_env] += avg_step_rewards[active_env]
+                ep_steps[active_env] += 1
                 
                 # Check if env0 is complete
                 done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
@@ -273,23 +341,32 @@ class MilestoneEvaluator:
                     done_any = d if done_any is None else (done_any | d)
                 
                 if done_any[active_env]:
-                    ret0 = float(ep_returns[active_env].item())
-                    completed_returns.append(ret0)
-                    ep_returns[active_env] = 0.0
+                    total_reward = float(ep_returns[active_env].item())
+                    total_steps = int(ep_steps[active_env].item())
                     
-                    if len(completed_returns) >= target_episodes:
+                    # Calculate return_norm = total_reward / total_steps
+                    return_norm = total_reward / max(1, total_steps)
+                    completed_return_norms.append(return_norm)
+                    
+                    print(f"[EVAL] Episode completed: steps={total_steps}, total_reward={total_reward:.3f}, return_norm={return_norm:.4f}")
+                    
+                    # Reset counters for next episode (though we only do 1)
+                    ep_returns[active_env] = 0.0
+                    ep_steps[active_env] = 0
+                    
+                    if len(completed_return_norms) >= target_episodes:
                         break
         
-        final_returns = completed_returns[:target_episodes]
-        avg_return = sum(final_returns) / max(1, len(final_returns))
+        final_return_norms = completed_return_norms[:target_episodes]
+        avg_return_norm = sum(final_return_norms) / max(1, len(final_return_norms))
         
-        print(f"[EVAL] Completed: {len(final_returns)} episodes, Average return: {avg_return:.3f}")
+        print(f"[EVAL] Completed: {len(final_return_norms)} episodes, Average return_norm: {avg_return_norm:.4f}")
         
         # Reset environment back to training state
         _, _ = env.reset()
         print(f"[EVAL] Environment reset back to training mode")
         
-        return avg_return, len(final_returns)
+        return avg_return_norm, len(final_return_norms)
 
     def _extract_model_state(self):
         """Extract model state for checkpoint saving."""
@@ -308,18 +385,17 @@ class MilestoneEvaluator:
 
 class MetricsHub:
     """
-    Single-exit metrics bus for unified data pipeline.
+    SIMPLIFIED: Single-exit metrics bus for unified data pipeline.
+    Removed unused methods to reduce complexity.
     
     Features:
-    - Event-based subscription system
-    - Ring buffer for update history
-    - Support for step, episode, milestone, and buffer status events
+    - Event-based subscription system for active methods only
+    - Ring buffer for update history  
+    - Support for update and milestone events (removed unused step/episode methods)
     """
     
     def __init__(self, ring: int = 100):
         self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)  # Event subscribers
-        self.episode_state: dict[int, dict] = {}  # Episode state cache
-        self.milestone_scores: DefaultDict[int, dict] = defaultdict(dict)  # Milestone score cache
         self.update_ring: Deque[dict] = deque(maxlen=ring)  # Update history ring buffer
 
     def subscribe(self, event: str, handler: Callable[[dict], None]) -> None:
@@ -331,15 +407,6 @@ class MetricsHub:
         for h in self.subs.get(event, []):
             h(payload)
 
-    def push_step(self, step: int, env_ids: list[int], payload: dict) -> None:
-        """Push step-level data."""
-        self._emit("step", {"step": step, "env_ids": env_ids, **payload})
-
-    def push_episode(self, step: int, env_id: int, summary: dict) -> None:
-        """Push episode completion data."""
-        self.episode_state[env_id] = summary
-        self._emit("episode", {"step": step, "env_id": env_id, **summary})
-
     def push_update(self, step: int, stats: dict) -> None:
         """Push training update statistics."""
         if not stats:
@@ -350,36 +417,51 @@ class MetricsHub:
 
     def push_milestone(self, step: int, milestone: int, summary: dict) -> None:
         """Push milestone completion summary."""
-        scores = summary.get("scores", {})
-        for eid, sc in scores.items():
-            self.milestone_scores[milestone][eid] = sc
         self._emit("milestone_summary", {"step": step, "milestone": milestone, **summary})
-
-    def push_buffer_status(self, step: int, status: dict) -> None:
-        """Push buffer status information."""
-        self._emit("buffer_status", {"step": step, **status})
-
-    def get_episode_state(self, env_id: int) -> dict:
-        """Get the latest episode state for an environment."""
-        return self.episode_state.get(env_id, {})
-
-    def get_milestone_scores(self) -> dict:
-        """Get all milestone scores."""
-        return self.milestone_scores
 
 
 class WandBLogger:
     """
-    Enhanced WandB logger with per-agent metrics and configurable networks support.
-    Updated: Support for asynchronous update statistics.
+    OPTIMIZED: WandB logger with consolidated metric mapping dictionaries.
+    Removed repetitive mapping code for cleaner implementation.
     
     Features:
-    - Per-agent training metrics
+    - Consolidated per-agent and global metrics mapping
     - Network configuration logging
-    - Exploration metrics tracking
+    - Exploration metrics tracking  
     - Milestone and evaluation logging
     - Separate tracking of critic and actor updates
     """
+    
+    # Class-level mapping dictionaries for cleaner code
+    AGENT_METRICS_MAP = {
+        'loss/actor': 'train/{}/actor_loss',
+        'loss/critic': 'train/{}/critic_loss', 
+        'q_mean': 'model/{}/q_mean',
+        'q_std': 'model/{}/q_std',
+        'q_target_mean': 'model/{}/q_target_mean',
+        'q_target_std': 'model/{}/q_target_std',
+        'grad_norm/actor': 'model/{}/grad_norm_actor',
+        'grad_norm/critic': 'model/{}/grad_norm_critic',
+    }
+    
+    GLOBAL_METRICS_MAP = {
+        "exploration/noise_scale": "exploration/noise_scale",
+        "train/episodes_done": "train/global_episodes", 
+        "replay/buffer_size": "replay/buffer_size",
+        "training/critic_updates": "train/critic_updates",
+        "training/actor_updates": "train/actor_updates",
+        "eval/return_mean": "milestone/actor_return",
+        "milestone/topk_best_score": "milestone/topk_best_return",
+        "milestone/latest_completed": "milestone/latest_completed",
+        # Force statistics
+        "forces/robot_fx_mean": "forces/robot_fx_mean",
+        "forces/robot_fy_mean": "forces/robot_fy_mean",
+        "forces/robot_fz_mean": "forces/robot_fz_mean",
+        "forces/human_fx_mean": "forces/human_fx_mean",
+        "forces/human_fy_mean": "forces/human_fy_mean", 
+        "forces/human_fz_mean": "forces/human_fz_mean",
+    }
     
     def __init__(self, project_name: str = "surgical_robot_maddpg", enabled: bool = True):
         self.enabled = enabled and WANDB_AVAILABLE  # WandB availability flag
@@ -399,8 +481,8 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["maddpg", "multi-agent", "surgical-robot", "configurable-networks", "async-updates"],
-            notes="Multi-environment parallel MADDPG training with configurable networks, noise scheduling, and async critic-actor updates",
+            tags=["maddpg", "multi-agent", "surgical-robot", "residual-networks", "async-updates"],
+            notes="Multi-environment parallel MADDPG training with residual networks, noise scheduling, and async critic-actor updates",
             settings=wandb.Settings(start_method="thread")
         )
         
@@ -421,10 +503,9 @@ class WandBLogger:
             # Network configuration
             "actor_layers": networks_cfg.get("actor", {}).get("hidden_layers", []),
             "critic_layers": networks_cfg.get("critic", {}).get("hidden_layers", []),
-            "actor_dropout": networks_cfg.get("actor", {}).get("dropout_p", 0.0),
-            "critic_dropout": networks_cfg.get("critic", {}).get("dropout_p", 0.0),
+            "actor_bypass_layers": networks_cfg.get("actor", {}).get("input_bypass_layers", []),
+            "critic_bypass_layers": networks_cfg.get("critic", {}).get("input_bypass_layers", []),
             "orthogonal_init": networks_cfg.get("actor", {}).get("orthogonal_init", False),
-            "std_scale": networks_cfg.get("actor", {}).get("std_scale", 1.0),
             # Exploration configuration
             "noise_sigma_start": exploration_cfg.get("sigma_start", 0.7),
             "noise_sigma_end": exploration_cfg.get("sigma_end", 0.1),
@@ -456,63 +537,41 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with async update support.")
+        print("[WANDB] Attached to MetricsHub with optimized metric mapping.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-            """Log metrics with per-agent structure, global metrics, and async update tracking."""
-            if not self.enabled or not metrics_data:
-                return
+        """OPTIMIZED: Log metrics with consolidated mapping dictionaries."""
+        if not self.enabled or not metrics_data:
+            return
 
-            log_data = {}
+        log_data = {}
 
-            # Handle Per-Agent training metrics
-            if "loss/actor" in metrics_data and isinstance(metrics_data.get('loss/actor'), dict):
-                agent_ids = list(metrics_data['loss/actor'].keys())
-                
-                for agent_id in agent_ids:
-                    # Loss metrics
-                    if 'loss/actor' in metrics_data and agent_id in metrics_data['loss/actor']:
-                        log_data[f'train/{agent_id}/actor_loss'] = metrics_data['loss/actor'][agent_id]
-                    if 'loss/critic' in metrics_data and agent_id in metrics_data['loss/critic']:
-                        log_data[f'train/{agent_id}/critic_loss'] = metrics_data['loss/critic'][agent_id]
-                    
-                    # Q-Value metrics
-                    if 'q_mean' in metrics_data and agent_id in metrics_data['q_mean']:
-                        log_data[f'model/{agent_id}/q_mean'] = metrics_data['q_mean'][agent_id]
-                    if 'q_std' in metrics_data and agent_id in metrics_data['q_std']:
-                        log_data[f'model/{agent_id}/q_std'] = metrics_data['q_std'][agent_id]
-                    
-                    # Target Q-Value metrics
-                    if 'q_target_mean' in metrics_data and agent_id in metrics_data['q_target_mean']:
-                        log_data[f'model/{agent_id}/q_target_mean'] = metrics_data['q_target_mean'][agent_id]
-                    if 'q_target_std' in metrics_data and agent_id in metrics_data['q_target_std']:
-                        log_data[f'model/{agent_id}/q_target_std'] = metrics_data['q_target_std'][agent_id]
-                    
-                    # Gradient norm metrics
-                    if 'grad_norm/actor' in metrics_data and agent_id in metrics_data['grad_norm/actor']:
-                        log_data[f'model/{agent_id}/grad_norm_actor'] = metrics_data['grad_norm/actor'][agent_id]
-                    if 'grad_norm/critic' in metrics_data and agent_id in metrics_data['grad_norm/critic']:
-                        log_data[f'model/{agent_id}/grad_norm_critic'] = metrics_data['grad_norm/critic'][agent_id]
-
-            # Handle global and milestone metrics
-            global_keys = {
-                "exploration/noise_scale": "exploration/noise_scale",
-                "train/episodes_done": "train/global_episodes",
-                "replay/buffer_size": "replay/buffer_size",
-                "training/critic_updates": "train/critic_updates",        # 异步更新：Critic更新计数
-                "training/actor_updates": "train/actor_updates",          # 异步更新：Actor更新计数
-                "eval/return_mean": "milestone/actor_return",
-                "milestone/topk_best_score": "milestone/topk_best_return",
-                "milestone/latest_completed": "milestone/latest_completed",
-            }
+        # Handle Per-Agent training metrics using consolidated mapping
+        if any(key in metrics_data and isinstance(metrics_data.get(key), dict) 
+               for key in self.AGENT_METRICS_MAP.keys()):
             
-            for src_key, dest_key in global_keys.items():
-                if src_key in metrics_data and metrics_data[src_key] is not None:
-                    log_data[dest_key] = metrics_data[src_key]
+            # Get agent IDs from first available per-agent metric
+            agent_ids = None
+            for source_key in self.AGENT_METRICS_MAP.keys():
+                if source_key in metrics_data and isinstance(metrics_data.get(source_key), dict):
+                    agent_ids = list(metrics_data[source_key].keys())
+                    break
+            
+            if agent_ids:
+                # Apply consolidated per-agent mapping
+                for source_key, target_pattern in self.AGENT_METRICS_MAP.items():
+                    if source_key in metrics_data and isinstance(metrics_data[source_key], dict):
+                        for agent_id in agent_ids:
+                            if agent_id in metrics_data[source_key]:
+                                log_data[target_pattern.format(agent_id)] = metrics_data[source_key][agent_id]
 
-            if log_data:
-                wandb.log(log_data, step=step)
+        # Handle global metrics using consolidated mapping
+        for src_key, dest_key in self.GLOBAL_METRICS_MAP.items():
+            if src_key in metrics_data and metrics_data[src_key] is not None:
+                log_data[dest_key] = metrics_data[src_key]
 
+        if log_data:
+            wandb.log(log_data, step=step)
 
     def finalize_run(self) -> None:
         """Finalize WandB run."""
@@ -520,6 +579,7 @@ class WandBLogger:
             wandb.finish()
             print("[WANDB] Run finished")
             
+
 class TrainingConfiguration:
     """Training configuration loader and parameter manager."""
     
@@ -625,13 +685,13 @@ def save_final_shared_networks(log_directory: str, maddpg, global_step: int, glo
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
-    """Create command line argument parser with configurable networks support."""
+    """Create command line argument parser with residual networks support."""
     if config_path is None:
         # Adjust path based on actual file location
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
 
-    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with configurable networks")
+    parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with residual networks")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration

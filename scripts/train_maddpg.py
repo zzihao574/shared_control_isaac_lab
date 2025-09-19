@@ -4,6 +4,7 @@
 Surgical Robot MADDPG Shared Network Training
 Enhanced version with configurable network architecture and exponential noise decay.
 MODIFIED: Added per-env scaling functionality for automatic parameter scaling.
+MODIFIED: Added eval mode control and exit reason tracking.
 
 Features:
 - Configurable network layers, dropout, and orthogonal initialization
@@ -13,6 +14,8 @@ Features:
 - WandB integration with per-agent metrics
 - Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator
 - Per-env scaling: YAML configs are per-env baselines, auto-scaled by --num_envs
+- Exit reason tracking for debugging premature termination
+- Eval mode support for clean milestone evaluation
 """
 
 import sys
@@ -110,6 +113,7 @@ class MADDPGTrainer:
     """
     Streamlined MADDPG trainer for configurable networks and noise scheduling.
     MODIFIED: Added per-env scaling functionality.
+    MODIFIED: Added eval mode control and exit reason tracking.
     
     Features:
     - Configuration-driven network architecture
@@ -118,6 +122,8 @@ class MADDPGTrainer:
     - Comprehensive WandB logging with per-agent metrics
     - Single evaluation chain (no old RewardLogger/MilestoneManager)
     - Per-env scaling: YAML configs auto-scaled by num_envs
+    - Exit reason tracking for debugging premature termination
+    - Eval mode support for clean milestone evaluation
     """
     
     def __init__(self, args):
@@ -319,6 +325,18 @@ class MADDPGTrainer:
             print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
+    def set_eval_mode(self, is_eval: bool):
+        """
+        Set evaluation mode for MADDPG.
+        During evaluation: disable buffer updates and parameter updates.
+        
+        Args:
+            is_eval: True for evaluation mode, False for training mode
+        """
+        self.maddpg.set_eval_mode(is_eval)
+        mode_str = "EVALUATION" if is_eval else "TRAINING"
+        print(f"[TRAINER] Mode set to: {mode_str}")
+
     def evaluate_milestone_if_due(self):
         """Check and trigger milestone evaluation if threshold crossed."""
         if not self.milestone_episodes:
@@ -337,10 +355,17 @@ class MADDPGTrainer:
             print(f"[MILESTONE] Crossed threshold: episodes {self.runner.global_episodes} >= milestone {candidate}")
             print(f"[MILESTONE] Triggering evaluation (previous max: {self.max_milestone_triggered})")
             
-            # Direct call to evaluator
-            result = self.evaluator.run_evaluation(candidate, self.runner.global_step)
-            if result.get("skip_episode_once", False):
-                self.runner.mark_skip_episode_once()
+            # Set eval mode before evaluation
+            self.set_eval_mode(True)
+            
+            try:
+                # Direct call to evaluator
+                result = self.evaluator.run_evaluation(candidate, self.runner.global_step)
+                if result.get("skip_episode_once", False):
+                    self.runner.mark_skip_episode_once()
+            finally:
+                # Always restore training mode
+                self.set_eval_mode(False)
             
             # Refresh current observations after evaluation
             env = getattr(self.env, "unwrapped", self.env)
@@ -355,7 +380,10 @@ class MADDPGTrainer:
             print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
 
     def train(self) -> None:
-        """Main training loop with configurable networks and noise scheduling."""
+        """
+        Main training loop with configurable networks and noise scheduling.
+        MODIFIED: Added exit reason tracking for debugging premature termination.
+        """
         print(f"[TRAIN] Starting training with configurable networks and noise scheduling:")
         print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
         print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
@@ -363,6 +391,8 @@ class MADDPGTrainer:
         print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
         print(f"  - Per-env scaling applied: buffer sizes and milestones auto-scaled by {self.args.num_envs}x")
+        
+        reason = "UNKNOWN"  # Track exit reason for debugging
         
         try:
             # Initialize WandB data points
@@ -395,10 +425,17 @@ class MADDPGTrainer:
                         scores = [m[0] for m in self.top_k_manager.top_models]
                         print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}")
                 
+                # Periodic sanity check
+                if (self.runner.global_step % 1000) == 0:
+                    assert self.runner.global_step <= self.max_global_steps, \
+                        f"Step overflow: {self.runner.global_step} > {self.max_global_steps}"
+                
                 # Check termination condition
                 if self.runner.global_step >= self.max_global_steps:
                     print(f"\n[TRAINING LIMIT] Reached max_global_steps={self.max_global_steps}")
                     break
+            
+            reason = "REACHED_MAX_STEPS"  # Normal completion
             
             # Training complete
             print(f"\n[TRAINING COMPLETE]")
@@ -425,8 +462,21 @@ class MADDPGTrainer:
             print(f"[TRAIN] Final results saved successfully")
         
         except KeyboardInterrupt:
+            reason = "KEYBOARD_INTERRUPT"
             print(f"\nTraining interrupted by user")
+            raise  # Re-raise for proper handling
+        except Exception as e:
+            reason = f"EXCEPTION:{type(e).__name__}:{str(e)[:50]}"
+            print(f"\nTraining failed with exception: {e}")
+            raise  # Re-raise for proper handling
         finally:
+            # ALWAYS print exit information for debugging
+            print(f"\n[TRAINING EXIT]")
+            print(f"  Reason: {reason}")
+            print(f"  Global step: {self.runner.global_step} / {self.max_global_steps}")
+            print(f"  Global episodes: {self.runner.global_episodes}")
+            print(f"  Max milestone: {self.max_milestone_triggered}")
+            
             # Cleanup resources
             self.env.close()
             self.wandb_logger.finalize_run()

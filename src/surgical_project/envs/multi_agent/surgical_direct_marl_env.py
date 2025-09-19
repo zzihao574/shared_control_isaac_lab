@@ -910,32 +910,3 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             return torch.zeros(self.num_envs, 3, device=self.device)
         
         return self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
-    
-    def get_constraint_state(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """Get constraint state information for specified environments."""
-        if self.constraint_results_t1 is None:
-            return {}
-        
-        if env_ids is None:
-            return self.constraint_results_t1
-        
-        return {
-            'distances_constraint': self.constraint_results_t1['distances_constraint'][env_ids],
-            'closest_points': self.constraint_results_t1['closest_points'][env_ids],
-            'normal_vectors': self.constraint_results_t1['normal_vectors'][env_ids],
-            'is_overlapping': self.constraint_results_t1['is_overlapping'][env_ids],
-            'is_inside': self.constraint_results_t1['is_inside'][env_ids]
-        }
-    
-    def get_reward_details(self, env_ids: Optional[List[int]] = None) -> Dict:
-        """Get detailed reward component information for analysis."""
-        if not self.reward_components:
-            return {}
-        
-        if env_ids is None:
-            return self.reward_components
-        
-        return {
-            key: value[env_ids] if torch.is_tensor(value) else value
-            for key, value in self.reward_components.items()
-        }

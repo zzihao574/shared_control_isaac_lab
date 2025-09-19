@@ -1,9 +1,7 @@
-# Training parameters configuration - 归一化架构版本
-# SIMPLIFIED: Removed per-environment complexity, optimized for shared network architecture
+# Training parameters configuration - OPTIMIZED with residual connections
+# OPTIMIZED: Added residual connection support, removed dropout parameters
 # MODIFIED: Added max_global_steps as primary termination condition
-# MODIFIED: Added networks and exploration configuration sections
-# CLEANED: Removed redundant hidden_units parameter
-# NEW: Added obs_scaling for state normalization - 支持统一尺度训练
+# CLEANED: Removed dropout_p parameters for simplified architecture
 
 # ==============================================================================
 # Global Settings
@@ -11,34 +9,34 @@
 seed: 42
 
 # ==============================================================================
-# Network Architecture Configuration
+# Network Architecture Configuration - OPTIMIZED WITH RESIDUAL CONNECTIONS
 # ==============================================================================
 networks:
   actor:
-    hidden_layers: [128, 128, 128]
-    dropout_p: 0.0
+    hidden_layers: [128, 128, 128, 128]
+    input_bypass_layers: [1, 2]  # Enable residual connections at layers 1 and 2
     orthogonal_init: true
     ortho_gain_hidden: 1.414
-    ortho_gain_output: 0.1    
+    ortho_gain_output: 0.01    
   critic:
-    hidden_layers: [128, 128, 128]
-    dropout_p: 0.0
+    hidden_layers: [256, 256, 128, 128]
+    input_bypass_layers: [0, 2]  # Enable residual connections at layers 0 and 2
     orthogonal_init: true
     ortho_gain_hidden: 1.414
-    ortho_gain_output: 0.1
+    ortho_gain_output: 0.01
 
 # ==============================================================================
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
   # 固定缩放因子（按obs拼接顺序：pos[3] + vel[3] + dist[1] = 7维）
-  factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
+  factors: [10.0, 10.0, 30.0, 50.0, 50.0, 50.0, 10.0]
 
 # ==============================================================================
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.7   # Initial noise = 0.7 × max_action
+  sigma_start: 0.8   # Initial noise = 0.8 × max_action
   sigma_end: 0.1     # Final noise = 0.1 × max_action
   decay_k: 3.0       # Decay rate (optional, default value provided in code)
 
@@ -46,7 +44,7 @@ exploration:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: false  # Enable detailed console logging for debugging
+  enable_console_logging: true  # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -101,54 +99,53 @@ reward_parameters:
   
   weights:
     # ===== ROBOT (Active Agent) =====
-    zoneA_weight_robot: 1.0
+    zoneA_weight_robot: 0.1
     zoneA_progress_robot: 3.0
-    zoneA_deviation_robot: 1.0
+    zoneA_deviation_robot: 2.0
 
-    zoneB_weight_robot: 1.0
+    zoneB_weight_robot: 0.1
     zoneB_gap_robot: 1.0
     zoneB_surftangent_robot: 1.0
     zoneB_inward_robot: 1.0
 
-    zoneC_weight_robot: 3.0
+    zoneC_weight_robot: 0.2
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
-    zoneC_overlap_robot: 1.0          # NEW: Collision penalty weight
+    zoneC_overlap_robot: 1.0          # Collision penalty weight
 
-    zoneD_weight_robot: 1.0
+    zoneD_weight_robot: 0.1
     zoneD_progress_robot: 1.0
     zoneD_deviation_robot: 1.0
     zoneD_inward_robot: 1.0
 
     zpenalty_robot: 0.0
-    completion_robot: 1.0
+    completion_robot: 0.1
     timeeff_robot: 0.0
     forceeff_robot: 0.0
     humanaware_robot: 0.0
 
     # ===== HUMAN (Disabled in Single-Agent Mode) =====  
-    # All human weights set to 0.0 for single-agent training
-    zoneA_weight_human: 1.0
+    zoneA_weight_human: 0.1
     zoneA_progress_human: 3.0
-    zoneA_deviation_human: 1.0
+    zoneA_deviation_human: 2.0
 
-    zoneB_weight_human: 1.0
+    zoneB_weight_human: 0.1
     zoneB_gap_human: 1.0
     zoneB_surftangent_human: 1.0
     zoneB_inward_human: 1.0
 
-    zoneC_weight_human: 1.0
+    zoneC_weight_human: 0.2
     zoneC_offpen_human: 1.0
     zoneC_inward_human: 1.0
     zoneC_overlap_human: 1.0 
 
-    zoneD_weight_human: 1.0
+    zoneD_weight_human: 0.1
     zoneD_progress_human: 1.0
     zoneD_deviation_human: 1.0
     zoneD_inward_human: 1.0
 
     zpenalty_human: 0.0
-    completion_human: 1.0
+    completion_human: 0.1
     timeeff_human: 0.0
     forceeff_human: 0.0
     robotaware_human: 0.0
@@ -162,7 +159,7 @@ termination_conditions:
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
   
 # ==============================================================================
-# MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS
+# MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS WITH RESIDUALS
 # ==============================================================================
 maddpg_config:
   lr_actor: 0.0007                    # Actor learning rate
@@ -182,4 +179,4 @@ maddpg_config:
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
   # Episodes are counted as sum of all environment completions
-  milestone_episodes: [5, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]
+  milestone_episodes: [2, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]

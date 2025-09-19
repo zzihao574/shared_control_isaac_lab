@@ -2,6 +2,7 @@
 Multi-environment parallel MADDPG algorithm with shared network architecture.
 Enhanced with per-agent metrics and target Q-value statistics.
 Modified: Normalized action domain training, external noise scheduling, physical unit environment interaction.
+MODIFIED: Added eval mode support to disable buffer updates, network updates, and noise during evaluation.
 
 Features:
 - Single shared network per agent (not per environment)
@@ -15,6 +16,7 @@ Features:
 - ASYNC UPDATES: Critic updates every interval, Actor updates every 2*interval
 - ROBUST: Dynamic agent order handling without hardcoded assumptions
 - Training start marker when min_buffer_size is reached
+- EVAL MODE: Disables buffer updates, network updates, and noise during evaluation
 """
 
 import torch
@@ -37,6 +39,7 @@ class MADDPG:
     - ASYNC UPDATES: Critic:Actor = 2:1 update ratio
     - Normalized action training: Actor output [-1,1], environment interaction times max_force
     - ROBUST: Dynamic agent order handling, no hardcoded assumptions
+    - EVAL MODE: Controlled evaluation behavior for clean milestone assessment
     """
     
     def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
@@ -45,6 +48,9 @@ class MADDPG:
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
+        
+        # NEW: Eval mode control
+        self._is_eval_mode = False
         
         # Set global seeds FIRST for identical initialization
         self._set_global_seeds()
@@ -90,6 +96,16 @@ class MADDPG:
         print(f"  Critic update interval: {self.update_interval}")
         print(f"  Actor update interval: {self.update_interval * 2}")
         print(f"  Min buffer size: {self.min_buffer_size}")
+
+    def set_eval_mode(self, is_eval: bool):
+        """
+        Set evaluation mode - disables buffer updates, network updates, and noise during evaluation.
+        
+        Args:
+            is_eval: True for evaluation mode, False for training mode
+        """
+        self._is_eval_mode = bool(is_eval)
+        print(f"[MADDPG] Eval mode: {'ENABLED' if self._is_eval_mode else 'DISABLED'}")
     
     def _set_global_seeds(self) -> None:
         """Set all random seeds for reproducible initialization."""
@@ -177,6 +193,7 @@ class MADDPG:
         """
         Use shared networks to select actions, adding noise in normalized domain.
         Modified: Add noise in normalized domain, then map to physical units for environment.
+        MODIFIED: Disable noise during evaluation mode.
         
         Args:
             observations: {agent_id: Tensor[num_envs, obs_dim]}
@@ -190,6 +207,9 @@ class MADDPG:
         actions = {}
         detail = {"mean_actions": {}, "noise_actions": {}}
         
+        # NEW: Force disable noise during evaluation
+        effective_add_noise = add_noise and (not self._is_eval_mode)
+        
         # Get force constraint configuration
         constraints = self.params.get('constraints', {})
         max_robot_force = float(constraints.get('max_robot_force', 0.04))
@@ -201,8 +221,8 @@ class MADDPG:
             # Actor outputs normalized actions [-1,1]
             a_norm = self.agents[agent_id].actor(obs_i)
             
-            # Add noise in normalized domain
-            if add_noise:
+            # Add noise in normalized domain (disabled during eval)
+            if effective_add_noise:
                 noise_norm = noise_scale * torch.randn_like(a_norm)
             else:
                 noise_norm = torch.zeros_like(a_norm)
@@ -229,6 +249,7 @@ class MADDPG:
         """
         Store transitions in joint replay buffer.
         Note: actions are in physical units (after environment interaction)
+        MODIFIED: Skip buffer updates during evaluation mode.
         
         Args:
             obs: {agent_id: Tensor[num_envs, obs_dim]}
@@ -237,6 +258,10 @@ class MADDPG:
             next_obs: {agent_id: Tensor[num_envs, obs_dim]}
             dones: {agent_id: Tensor[num_envs]}
         """
+        # NEW: Skip buffer updates during evaluation
+        if self._is_eval_mode:
+            return
+            
         for env_id in range(self.num_envs):
             # Concatenate observations and actions (by agent_ids order)
             obs_all = torch.cat([obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
@@ -267,7 +292,12 @@ class MADDPG:
         Critic updates every interval steps, Actor updates every 2*interval steps.
         Modified: Critic takes a_norm during training; Buffer stores physical actions.
         ROBUST: Dynamically build action limits, no hardcoded assumptions.
+        MODIFIED: Skip all updates during evaluation mode.
         """
+        # NEW: Skip all updates during evaluation
+        if self._is_eval_mode:
+            return {"actor_updates": 0, "critic_updates": 0}
+            
         if len(self.replay) < self.min_buffer_size:
             return {}
 

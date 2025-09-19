@@ -9,7 +9,7 @@ from .networks import Actor, Critic
 class DDPGAgent:
     """
     Deep Deterministic Policy Gradient agent for shared network MADDPG.
-    Modified: 支持状态固定缩放，移除std相关参数。
+    OPTIMIZED: Removed dropout parameters, added residual connections support.
     
     Features:
     - 确定性Actor，输出归一化动作[-1,1]
@@ -19,6 +19,7 @@ class DDPGAgent:
     - 批处理支持共享网络架构
     - 梯度范数统计用于训练诊断
     - 通过YAML配置网络架构
+    - 残差连接支持改善梯度流动
     """
     
     def __init__(self, agent_id: str, state_dim: int, action_dim: int, 
@@ -49,15 +50,15 @@ class DDPGAgent:
         actor_cfg = net_cfg.get('actor', {})
         critic_cfg = net_cfg.get('critic', {})
 
-        # 网络架构参数
+        # 网络架构参数 - OPTIMIZED: 移除dropout，添加residual连接支持
         actor_hidden_layers = actor_cfg.get('hidden_layers', [256, 256])
-        actor_dropout = float(actor_cfg.get('dropout_p', 0.0))
+        actor_bypass_layers = actor_cfg.get('input_bypass_layers', [])  # NEW: Residual connections
         actor_ortho = bool(actor_cfg.get('orthogonal_init', False))
         actor_gain_h = float(actor_cfg.get('ortho_gain_hidden', 1.0))
         actor_gain_o = float(actor_cfg.get('ortho_gain_output', 0.01))
 
         critic_hidden_layers = critic_cfg.get('hidden_layers', [256, 256])
-        critic_dropout = float(critic_cfg.get('dropout_p', 0.0))
+        critic_bypass_layers = critic_cfg.get('input_bypass_layers', [])  # NEW: Residual connections
         critic_ortho = bool(critic_cfg.get('orthogonal_init', False))
         critic_gain_h = float(critic_cfg.get('ortho_gain_hidden', 1.0))
         critic_gain_o = float(critic_cfg.get('ortho_gain_output', 1.0))
@@ -81,18 +82,18 @@ class DDPGAgent:
         print(f"[DDPG AGENT] {agent_id}:")
         print(f"  State dim: {state_dim}, Action dim: {action_dim}")
         print(f"  Total state dim: {total_state_dim}, Total action dim: {total_action_dim}")
-        print(f"  Actor layers: {actor_hidden_layers}, dropout: {actor_dropout}")
-        print(f"  Critic layers: {critic_hidden_layers}, dropout: {critic_dropout}")
+        print(f"  Actor layers: {actor_hidden_layers}, bypass: {actor_bypass_layers}")
+        print(f"  Critic layers: {critic_hidden_layers}, bypass: {critic_bypass_layers}")
         print(f"  Orthogonal init - Actor: {actor_ortho}, Critic: {critic_ortho}")
         print(f"  State scaling factors: {factors}")
         print(f"  LR - Actor: {self.lr_actor}, Critic: {self.lr_critic}")
         print(f"  Target update rate (tau): {self.tau}")
         
-        # 初始化Actor网络（注入状态缩放）
+        # 初始化Actor网络（注入状态缩放和残差连接）
         self.actor = Actor(
             state_dim, action_dim,
             hidden_layers=actor_hidden_layers,
-            dropout_p=actor_dropout,
+            input_bypass_layers=actor_bypass_layers,  # NEW: Residual connections
             orthogonal_init=actor_ortho,
             ortho_gain_hidden=actor_gain_h,
             ortho_gain_output=actor_gain_o,
@@ -102,7 +103,7 @@ class DDPGAgent:
         self.actor_target = Actor(
             state_dim, action_dim,
             hidden_layers=actor_hidden_layers,
-            dropout_p=actor_dropout,
+            input_bypass_layers=actor_bypass_layers,  # NEW: Residual connections
             orthogonal_init=actor_ortho,
             ortho_gain_hidden=actor_gain_h,
             ortho_gain_output=actor_gain_o,
@@ -110,11 +111,11 @@ class DDPGAgent:
         ).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # 初始化Critic网络（集中式训练，注入状态缩放）
+        # 初始化Critic网络（集中式训练，注入状态缩放和残差连接）
         self.critic = Critic(
             total_state_dim, total_action_dim,
             hidden_layers=critic_hidden_layers,
-            dropout_p=critic_dropout,
+            input_bypass_layers=critic_bypass_layers,  # NEW: Residual connections
             orthogonal_init=critic_ortho,
             ortho_gain_hidden=critic_gain_h,
             ortho_gain_output=critic_gain_o,
@@ -124,7 +125,7 @@ class DDPGAgent:
         self.critic_target = Critic(
             total_state_dim, total_action_dim,
             hidden_layers=critic_hidden_layers,
-            dropout_p=critic_dropout,
+            input_bypass_layers=critic_bypass_layers,  # NEW: Residual connections
             orthogonal_init=critic_ortho,
             ortho_gain_hidden=critic_gain_h,
             ortho_gain_output=critic_gain_o,
@@ -136,7 +137,7 @@ class DDPGAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
         
-        print(f"[DDPG AGENT] {agent_id} initialized with state normalization")
+        print(f"[DDPG AGENT] {agent_id} initialized with residual connections and state normalization")
 
     def soft_update(self) -> None:
         """使用Polyak平均进行目标网络软更新。"""
