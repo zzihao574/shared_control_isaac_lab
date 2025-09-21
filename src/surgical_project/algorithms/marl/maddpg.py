@@ -238,7 +238,12 @@ class MADDPG:
             # Store debug information
             detail["mean_actions"][agent_id] = (a_norm * max_force).clamp_(-max_force, max_force)
             detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]
-        
+
+        for agent_id in actions.keys():
+            actions[agent_id] = actions[agent_id].detach()
+            detail["mean_actions"][agent_id] = detail["mean_actions"][agent_id].detach()
+            detail["noise_actions"][agent_id] = detail["noise_actions"][agent_id].detach()
+                
         return actions, detail
 
     def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones):

@@ -790,8 +790,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     def _calculate_force_penalties(self) -> Dict[str, torch.Tensor]:
         """Calculate force efficiency penalties for both agents."""
         return {
-            'robot': -50.0 * torch.norm(self.robot_forces_t, dim=-1),
-            'human': -50.0 * torch.norm(self.human_forces_t, dim=-1)
+            'robot': -1.0 * torch.norm(self.robot_forces_t, dim=-1),
+            'human': -1.0 * torch.norm(self.human_forces_t, dim=-1)
         }
 
     def _calculate_z_penalty(self) -> torch.Tensor:
