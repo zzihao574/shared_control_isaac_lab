@@ -116,15 +116,15 @@ reward_parameters:
 
     zoneD_weight_robot: 2.4
     zoneD_progress_robot: 1.0
-    zoneD_deviation_robot: 1.0
+    zoneD_deviation_robot: 1.5
     zoneD_inward_robot: 1.0
 
     zpenalty_robot: 0.0
     completion_robot: 4.0
     timeeff_robot: 0.0
-    potential_robot: 0.5              # NEW: Potential reward weight for robot
-    forceeff_robot: 0.7
-    humanaware_robot: 0.7
+    potential_robot: 0.4              # NEW: Potential reward weight for robot
+    forceeff_robot: 0.6
+    humanaware_robot: 0.6
 
     # ===== HUMAN (Disabled in Single-Agent Mode) =====  
     zoneA_weight_human: 2.4
@@ -136,22 +136,22 @@ reward_parameters:
     zoneB_surftangent_human: 1.0
     zoneB_inward_human: 1.0
 
-    zoneC_weight_human: 5.0
+    zoneC_weight_human: 4.0
     zoneC_offpen_human: 1.0
     zoneC_inward_human: 1.0
     zoneC_overlap_human: 1.0 
 
     zoneD_weight_human: 2.4
     zoneD_progress_human: 1.0
-    zoneD_deviation_human: 1.0
+    zoneD_deviation_human: 1.5
     zoneD_inward_human: 1.0
 
     zpenalty_human: 0.0
     completion_human: 4.0
     timeeff_human: 0.0
-    potential_human: 0.5              # NEW: Potential reward weight for human
-    forceeff_human: 0.7
-    robotaware_human: 0.7
+    potential_human: 0.4              # NEW: Potential reward weight for human
+    forceeff_human: 0.6
+    robotaware_human: 0.6
 
 # ==============================================================================
 # Termination Conditions - SIMPLIFIED

@@ -1,13 +1,13 @@
 """
 Environment utilities for shared network MADDPG training.
-Essential environment components for physics-based constraint analysis and console debugging.
+
+This module provides essential components for physics-based constraint analysis 
+and console debugging in surgical robot environments.
 
 Features:
-- CompleteConstraintChecker: Physics-based constraint analysis
-- TrajectoryManager: Trajectory management for path following
+- CompleteConstraintChecker: Physics-based constraint analysis with coordinate transformation
+- TrajectoryManager: Trajectory management for path following tasks
 - StepTracer: Console debugging with four-zone reward system monitoring
-- MODIFIED: Added eval mode support to disable printing during evaluation
-- ADDED: Support for potential reward display in console logging
 """
 
 import torch
@@ -24,18 +24,29 @@ from carb._carb import Float3
 class CompleteConstraintChecker:
     """
     Physics-based constraint analysis for surgical robot environment.
-    Two-state detection: Outside / Overlapping based on raycast validation.
+    
+    Provides two-state detection (Outside/Overlapping) based on raycast validation
+    with automatic coordinate transformation from world to local coordinates.
     
     Features:
-    - Batch constraint state analysis
-    - Raycast-based overlapping detection
+    - Batch constraint state analysis across multiple environments
+    - Raycast-based overlapping detection for accurate collision states
     - Consistent distance reporting (raycast distance for outside, 0.0 for overlapping)
     - Normal vector calculation pointing from stylus toward obstacle
+    - Automatic coordinate transformation to local robot frame
     """
     
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
+        """
+        Initialize constraint checker with physics interfaces.
+        
+        Args:
+            device: PyTorch device for tensor operations
+            collision_threshold: Minimum distance threshold for collision detection
+        """
         self.device = device
-        self.collision_threshold = collision_threshold        
+        self.collision_threshold = collision_threshold
+        
         try:
             self.physics_attachment_interface = acquire_physx_attachment_interface()
             self.physics_scene_query_interface = acquire_physx_scene_query_interface()
@@ -44,7 +55,23 @@ class CompleteConstraintChecker:
             self.physics_scene_query_interface = None
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
-        """Analyze constraint states for batch of environments."""
+        """
+        Analyze constraint states for batch of environments.
+        
+        Performs physics queries in world coordinates but returns results transformed
+        to local robot coordinates for consistent reward calculations.
+        
+        Args:
+            stylus_positions: Stylus positions in local coordinates [num_envs, 3]
+            env_base_positions: Environment base positions for coordinate transformation
+            
+        Returns:
+            Dictionary containing constraint analysis results in local coordinates:
+            - distances_constraint: Distance to constraint surface [num_envs]
+            - closest_points: Closest points on constraint in local coords [num_envs, 3]
+            - normal_vectors: Normal vectors in local coordinates [num_envs, 3]
+            - is_overlapping: Boolean overlap flags [num_envs]
+        """
         num_envs = stylus_positions.shape[0]
         
         current_base_positions = self._omni_robot.data.root_link_pos_w if hasattr(self, '_omni_robot') else env_base_positions
@@ -59,17 +86,39 @@ class CompleteConstraintChecker:
         if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
             return batch_results
         
+        # Get robot base orientations for coordinate transformation
+        if hasattr(self, '_omni_robot') and self._omni_robot is not None:
+            base_quats = self._omni_robot.data.root_link_quat_w.float()
+        else:
+            # Default to no rotation (identity quaternions)
+            base_quats = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device, dtype=torch.float32).repeat(num_envs, 1)
+        
         for env_id in range(num_envs):
+            # Convert to world coordinates for physics query (required by Isaac Sim)
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
             constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
                 if result is not None:
+                    # Distance is scalar - no coordinate transformation needed
                     batch_results['distances_constraint'][env_id] = result['distance']
-                    batch_results['closest_points'][env_id] = torch.tensor(result['closest_point'], device=self.device)
-                    batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device)
                     batch_results['is_overlapping'][env_id] = result['is_overlapping']
+                    
+                    # Transform closest_point from world to local coordinates
+                    closest_world = torch.tensor(result['closest_point'], device=self.device, dtype=torch.float32)
+                    closest_local = closest_world - current_base_positions[env_id]
+                    batch_results['closest_points'][env_id] = closest_local
+                    
+                    # Transform normal_vector from world to local coordinates
+                    try:
+                        from isaaclab.utils.math import quat_rotate_inverse
+                        normal_world = torch.tensor(result['normal_vector'], device=self.device, dtype=torch.float32)
+                        normal_local = quat_rotate_inverse(base_quats[env_id:env_id+1], normal_world.unsqueeze(0))
+                        batch_results['normal_vectors'][env_id] = normal_local.squeeze(0)
+                    except Exception:
+                        # Fallback to original normal vector
+                        batch_results['normal_vectors'][env_id] = torch.tensor(result['normal_vector'], device=self.device, dtype=torch.float32)
             except Exception:
                 pass
         
@@ -80,10 +129,16 @@ class CompleteConstraintChecker:
         Two-state constraint analysis using raycast validation.
         
         Logic:
-        - If raycast hits constraint with valid distance: outside (returns raycast distance)
-        - If raycast doesn't hit or distance is 0: overlapping (returns 0.0)
+        - If raycast hits constraint with valid distance: outside state (returns raycast distance)
+        - If raycast doesn't hit or distance is 0: overlapping state (returns 0.0)
         
-        Returns result with consistent distance reporting.
+        Args:
+            stylus_position: Stylus position in world coordinates
+            constraint_path: USD path to constraint object
+            verbose: Enable detailed logging
+            
+        Returns:
+            Dictionary with constraint analysis results or None if analysis failed
         """
         if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
             return None
@@ -91,7 +146,7 @@ class CompleteConstraintChecker:
         from carb._carb import Float3
         import numpy as np
 
-        # 1) Get stylus position and closest point on constraint
+        # Get stylus position and closest point on constraint
         pos = stylus_position.detach().cpu().numpy().astype(np.float64)
         current_point = Float3(float(pos[0]), float(pos[1]), float(pos[2]))
 
@@ -104,7 +159,7 @@ class CompleteConstraintChecker:
         to_closest = closest - pos
         dist = float(np.linalg.norm(to_closest))
 
-        # Handle degenerate case
+        # Handle degenerate case where stylus is at closest point
         if dist < 1e-9:
             return {
                 "distance": 0.0,
@@ -115,7 +170,7 @@ class CompleteConstraintChecker:
                 "raycast_result": None,
             }
 
-        # 2) Raycast from stylus toward closest point
+        # Raycast from stylus toward closest point
         dir_norm = to_closest / dist
         ray_dir = Float3(float(dir_norm[0]), float(dir_norm[1]), float(dir_norm[2]))
         ray_res = self.physics_scene_query_interface.raycast_closest(current_point, ray_dir, dist + 0.01)
@@ -125,28 +180,26 @@ class CompleteConstraintChecker:
         if ray_res and "collision" in ray_res and (constraint_path in str(ray_res["collision"])):
             hit = ray_res
 
-        # 3) Two-state decision with collision threshold
+        # Two-state decision with collision threshold
         hit_distance = hit.get("distance", 0.0) if hit else 0.0
         
         if hit is not None and hit_distance > self.collision_threshold:
             is_overlapping = False
             state = "outside"
-            # For outside state, use the raycast hit distance (surface distance)
             final_distance = hit_distance
         else:
             is_overlapping = True 
             state = "overlapping"
-            # For overlapping state, always return 0.0 to indicate penetration
             final_distance = 0.0
 
-        # 4) Normal vector calculation (pointing from stylus toward obstacle)
+        # Normal vector calculation (pointing from stylus toward obstacle)
         if hit is not None and "normal" in hit:
             n = hit["normal"]
             outward = np.array([n.x, n.y, n.z], dtype=np.float64)
-            normal_vec = -outward  # negate: stylus -> obstacle interior
+            normal_vec = -outward  # Negate to point from stylus toward obstacle
         else:
-            # No hit: use stylus -> closest as direction
-            normal_vec = dir_norm  # already stylus -> obstacle direction
+            # No hit: use stylus to closest point direction
+            normal_vec = dir_norm
 
         return {
             "distance": final_distance,
@@ -162,17 +215,30 @@ class TrajectoryManager:
     """
     Trajectory management for surgical robot path following.
     
+    Provides trajectory state calculation, progress tracking, and completion
+    detection for linear path following tasks in local robot coordinates.
+    
     Features:
-    - Progress calculation along trajectory
-    - Deviation measurement from ideal path
-    - Task completion detection
+    - Progress calculation along linear trajectory (0 to 1)
+    - Perpendicular deviation measurement from ideal path
+    - Task completion detection with configurable threshold
     """
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
+        """
+        Initialize trajectory manager with path parameters.
+        
+        Args:
+            device: PyTorch device for tensor operations
+            params: Configuration parameters containing trajectory definition
+            num_envs: Number of parallel environments
+            env_base_positions: Base positions for coordinate transformations
+        """
         self.device = device
         self.num_envs = num_envs
         self.env_base_positions = env_base_positions
         
+        # Load trajectory definition from parameters
         traj = params['trajectory']
         self.start_pos_local = torch.tensor(traj['start_point'], device=device, dtype=torch.float32)
         self.end_pos_local = torch.tensor(traj['end_point'], device=device, dtype=torch.float32)
@@ -180,21 +246,37 @@ class TrajectoryManager:
         
         self.line_direction = (self.end_pos_local - self.start_pos_local) / self.total_distance
         
-        # Unified completion threshold
+        # Load completion threshold from reward parameters
         reward_params = params.get('reward_parameters', {})
         self.completion_threshold = reward_params.get('completion_threshold', 0.01)
         
         print(f"[INFO] Trajectory completion threshold: {self.completion_threshold}m")
     
     def get_progress(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """Calculate progress along trajectory (0 to 1)."""
+        """
+        Calculate progress along trajectory (0 to 1).
+        
+        Args:
+            current_pos_local: Current positions in local coordinates [num_envs, 3]
+            
+        Returns:
+            Progress ratios [num_envs] where 0=start, 1=end
+        """
         vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
         progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
         progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
         return progress_distance / self.total_distance
     
     def get_deviation(self, current_pos_local: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Calculate perpendicular distance to trajectory."""
+        """
+        Calculate perpendicular distance to trajectory line.
+        
+        Args:
+            current_pos_local: Current positions in local coordinates [num_envs, 3]
+            
+        Returns:
+            Tuple of (deviations [num_envs], closest_points [num_envs, 3])
+        """
         vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
         progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
         progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
@@ -205,7 +287,15 @@ class TrajectoryManager:
         return deviations, closest_points
     
     def is_final_setpoint_reached(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """Check if final setpoint is reached."""
+        """
+        Check if final setpoint is reached within completion threshold.
+        
+        Args:
+            current_pos_local: Current positions in local coordinates [num_envs, 3]
+            
+        Returns:
+            Boolean flags indicating completion [num_envs]
+        """
         distances_to_final = torch.norm(current_pos_local - self.end_pos_local.unsqueeze(0), dim=-1)
         return distances_to_final < self.completion_threshold
 
@@ -213,14 +303,31 @@ class TrajectoryManager:
 class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
-    Simplified version - removed unnecessary debug checks, let it crash if there are issues.
-    ADDED: Support for potential reward display in global rewards section.
+    
+    Provides detailed console output for debugging reward calculations,
+    environment states, and agent behaviors during training.
+    
+    Features:
+    - Configurable step frequency and environment count for output
+    - Four-zone reward system breakdown display
+    - Environment state snapshot logging
+    - Force and action display for both agents
     """
     
     def __init__(self, num_envs: int, device: torch.device,
                  enable_console_logging: bool = False,
                  print_every_steps: int = 10,
                  max_envs_to_print: int = 2):
+        """
+        Initialize step tracer with logging configuration.
+        
+        Args:
+            num_envs: Total number of parallel environments
+            device: PyTorch device for tensor operations
+            enable_console_logging: Enable/disable console output
+            print_every_steps: Frequency of step logging
+            max_envs_to_print: Maximum number of environments to display
+        """
         self.num_envs = num_envs
         self.device = device
         self.enable_console_logging = enable_console_logging
@@ -228,7 +335,15 @@ class StepTracer:
         self.max_envs_to_print = max_envs_to_print
 
     def maybe_print_step(self, env, rewards: Dict, global_step: int, force_print: bool = False):
-        """Console printing with force_print bypass for evaluation."""
+        """
+        Print step information if conditions are met.
+        
+        Args:
+            env: Environment instance containing state and reward data
+            rewards: Dictionary of agent rewards for current step
+            global_step: Current global training step
+            force_print: Override step frequency check (for evaluation)
+        """
         if not self.enable_console_logging:
             return
             
@@ -254,7 +369,7 @@ class StepTracer:
             print(f"  Env {env_id}: Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
 
     def _print_env_snapshot(self, env, env_id: int):
-        """Print environment snapshot."""
+        """Print detailed environment state snapshot."""
         stylus = env.stylus_pos_t1[env_id]
         safety = float(env.safety_distances_t1[env_id].item())
         normal = env.normal_t1[env_id]
@@ -288,7 +403,7 @@ class StepTracer:
         self._print_agent_rewards(env, env_id, "HUMAN")
 
     def _print_agent_rewards(self, env, env_id: int, agent_label: str):
-        """Print zone rewards for agent - simplified."""
+        """Print detailed reward breakdown for specified agent."""
         agent_key = agent_label.lower()
         RC = env.reward_components
         is_colliding = env.is_violating_t1[env_id].item()
@@ -300,6 +415,7 @@ class StepTracer:
                 return float(x[env_id].item()) if x.ndim > 0 else float(x.item())
             return float(x)
 
+        # Zone-specific reward breakdown
         for Z in ['A', 'B', 'C', 'D']:
             zone_w = _val(RC[f'zone{Z}_weight_{agent_key}'])
             zone_total = _val(RC[f'zone{Z}_total_{agent_key}'])
@@ -336,13 +452,13 @@ class StepTracer:
                 contrib = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_contrib'])
                 print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
-        # Global rewards with potential reward included
+        # Global rewards including potential reward
         print("  Global Rewards:")
         globals_list = [
             ('zpenalty', 'Z Penalty      '),
             ('completion', 'Completion     '),
             ('timeeff', 'Time Efficiency'),
-            ('potential', 'Potential      '),   # 新增势能项
+            ('potential', 'Potential      '),
         ]
         
         for gk, glabel in globals_list:
@@ -351,7 +467,7 @@ class StepTracer:
             contrib = _val(RC[f'global_{gk}_{agent_key}_contrib'])
             print(f"    {glabel:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
-        # Agent force
+        # Agent force efficiency
         raw = _val(RC[f'{agent_key}force_raw'])
         weight = _val(RC[f'{agent_key}force_weight'])
         contrib = _val(RC[f'{agent_key}force_contrib'])
@@ -366,7 +482,7 @@ class StepTracer:
         print(f"    {label:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
     def _print_actor_forces(self, env, env_id: int):
-        """Print actor forces - simplified."""
+        """Print current actor force outputs for both agents."""
         robot_mean = env.actor_mean_forces['robot'][env_id]
         robot_noise = env.actor_noise_forces['robot'][env_id]
         human_mean = env.actor_mean_forces['human'][env_id]
@@ -378,7 +494,18 @@ class StepTracer:
         print(f"  Noise: Nx={human_noise[0]:+.6f}N, Ny={human_noise[1]:+.6f}N, Nz={human_noise[2]:+.6f}N")
 
     def _safe_get_reward_component(self, env, key: str, env_id: int, default: float) -> float:
-        """Safely get reward component value with explicit checks."""
+        """
+        Safely extract reward component value with fallback handling.
+        
+        Args:
+            env: Environment instance
+            key: Component key to extract
+            env_id: Environment index
+            default: Default value if extraction fails
+            
+        Returns:
+            Component value or default
+        """
         if not hasattr(env, 'reward_components') or key not in env.reward_components:
             return default
         
