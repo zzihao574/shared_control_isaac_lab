@@ -123,8 +123,8 @@ reward_parameters:
     completion_robot: 4.0
     timeeff_robot: 0.0
     potential_robot: 0.2              # NEW: Potential reward weight for robot
-    forceeff_robot: 0.6
-    humanaware_robot: 0.6
+    forceeff_robot: 0.7
+    humanaware_robot: 0.7
 
     # ===== HUMAN (Disabled in Single-Agent Mode) =====  
     zoneA_weight_human: 2.4
@@ -150,8 +150,8 @@ reward_parameters:
     completion_human: 4.0
     timeeff_human: 0.0
     potential_human: 0.2              # NEW: Potential reward weight for human
-    forceeff_human: 0.6
-    robotaware_human: 0.6
+    forceeff_human: 0.7
+    robotaware_human: 0.7
 
 # ==============================================================================
 # Termination Conditions - SIMPLIFIED

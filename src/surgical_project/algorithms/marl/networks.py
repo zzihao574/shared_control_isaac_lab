@@ -25,18 +25,6 @@ class FixedScaler(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * self.factors
 
-def _apply_orthogonal_init(module: nn.Module, gain_hidden: float = 1.0, gain_output: float = 1.0):
-    """Apply orthogonal initialization to linear layers."""
-    for m in module.modules():
-        if isinstance(m, nn.Linear):
-            nn.init.orthogonal_(m.weight, gain=gain_hidden)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-    if isinstance(module, nn.Sequential) and isinstance(module[-1], nn.Linear):
-        nn.init.orthogonal_(module[-1].weight, gain=gain_output)
-        if module[-1].bias is not None:
-            nn.init.zeros_(module[-1].bias)
-
 class Actor(nn.Module):
     """
     Actor网络，动态检测输入维度并在指定层实现残差连接。
