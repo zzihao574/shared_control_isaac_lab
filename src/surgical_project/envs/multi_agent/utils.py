@@ -7,6 +7,7 @@ Features:
 - TrajectoryManager: Trajectory management for path following
 - StepTracer: Console debugging with four-zone reward system monitoring
 - MODIFIED: Added eval mode support to disable printing during evaluation
+- ADDED: Support for potential reward display in console logging
 """
 
 import torch
@@ -213,6 +214,7 @@ class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
     Simplified version - removed unnecessary debug checks, let it crash if there are issues.
+    ADDED: Support for potential reward display in global rewards section.
     """
     
     def __init__(self, num_envs: int, device: torch.device,
@@ -334,12 +336,13 @@ class StepTracer:
                 contrib = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_contrib'])
                 print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
 
-        # Global rewards
+        # Global rewards with potential reward included
         print("  Global Rewards:")
         globals_list = [
             ('zpenalty', 'Z Penalty      '),
             ('completion', 'Completion     '),
-            ('timeeff', 'Time Efficiency')
+            ('timeeff', 'Time Efficiency'),
+            ('potential', 'Potential      '),   # 新增势能项
         ]
         
         for gk, glabel in globals_list:

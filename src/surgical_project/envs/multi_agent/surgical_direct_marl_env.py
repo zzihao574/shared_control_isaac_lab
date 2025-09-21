@@ -9,6 +9,7 @@ Features:
 - Unified global_step integration with trainer
 - Optional console logging via injected StepTracer
 - Configuration from YAML file via trainer injection
+- ADDED: Potential reward system for both robot and human agents
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Unified global_step integration with trainer
     - Optional console logging via injected StepTracer
     - Configuration from YAML file via trainer injection
+    - ADDED: Potential reward system for smooth trajectory guidance
     """
     
     cfg: SurgicalDirectMARLEnvCfg
@@ -297,29 +299,29 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     # =========================================================================
     
     def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
-        # è½¨è¿¹å•ä½æ–¹å‘
+        # 轨迹方向
         t = self.trajectory_manager.line_direction
-        # å½“å‰é€Ÿåº¦
+        # 当前速度
         v = self.stylus_vel_t1
         v_along = (v * t.unsqueeze(0)).sum(dim=-1)  # [N]
 
-        # å½“å‰ç»å¯¹è¿›åº¦ p âˆˆ [0,1]
+        # 当前绝对进度 p ∈ [0,1]
         p = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)  # [N]
 
-        # å¥–åŠ±å‚æ•°
-        MIN_REWARD = 0.1        # èµ·ç‚¹å¤„çš„æœ€å°å¥–åŠ±å¹…åº¦
-        MAX_REWARD = 0.2        # ç»ˆç‚¹å¤„çš„æœ€å¤§å¥–åŠ±å¹…åº¦
-        EPS_V = 1e-4           # é€Ÿåº¦æ­»åŒºé˜ˆå€¼
+        # 奖励参数
+        MIN_REWARD = 0.1        # 起点处的最小奖励幅度
+        MAX_REWARD = 0.2        # 终点处的最大奖励幅度
+        EPS_V = 1e-4           # 速度死区阈值
 
-        # è®¡ç®—å¥–åŠ±å¹…åº¦ï¼šä»Ž0.1ï¼ˆèµ·ç‚¹ï¼‰åˆ°0.2ï¼ˆç»ˆç‚¹ï¼‰çº¿æ€§æ’å€¼
-        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p  # [N] âˆˆ [0.1, 0.2]
+        # 计算奖励幅度，从0.1（起点）到0.2（终点）线性变化
+        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p  # [N] ∈ [0.1, 0.2]
 
-        # æ–¹å‘åˆ¤æ–­
-        pos = (v_along >  EPS_V).float()   # æ­£æ–¹å‘
-        neg = (v_along < -EPS_V).float()   # è´Ÿæ–¹å‘
+        # 方向判断
+        pos = (v_along >  EPS_V).float()   # 正方向
+        neg = (v_along < -EPS_V).float()   # 负方向
         
-        # æœ€ç»ˆå¥–åŠ±ï¼šæ­£æ–¹å‘ä¸ºæ­£ï¼Œè´Ÿæ–¹å‘ä¸ºè´Ÿ
-        return (pos - neg) * reward_magnitude  # [N] âˆˆ [-0.2, 0.2]
+        # 最终奖励，正方向为正，负方向为负
+        return (pos - neg) * reward_magnitude  # [N] ∈ [-0.2, 0.2]
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing with action validation and force application."""
@@ -337,12 +339,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                     self.actor_mean_forces[agent] = actions[agent].clone()
                     self.actor_noise_forces[agent] = torch.zeros_like(actions[agent])
         
-        # Process actions without additional force constraints (å·²åœ¨select_actionsä¸­é™åˆ¶)
+        # Process actions without additional force constraints (已在select_actions中限制)
         for agent, action in actions.items():
             assert agent in self.cfg.possible_agents, f"Unknown agent: {agent}"
             assert action.shape == (self.num_envs, 3), f"Action shape mismatch for {agent}: expected ({self.num_envs}, 3), got {action.shape}"
             
-            # ç›´æŽ¥ä½¿ç”¨åŠ¨ä½œï¼Œä¸å†é‡å¤é™åˆ¶
+            # 直接使用动作，不再额外限制
             self.agent_actions[agent] = action
         
         # Cache forces for reward calculation
@@ -701,6 +703,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         RC[f'global_timeeff_{agent}_weight'] = torch.tensor(tw, device=dev)
         RC[f'global_timeeff_{agent}_contrib'] = t_raw * tw
 
+        # Potential (distance-to-goal shaped reward)
+        p_raw = self._calculate_potential_reward()
+        pw = self._get_weight(f'potential_{agent}', 0.0)
+        RC[f'global_potential_{agent}_raw'] = p_raw
+        RC[f'global_potential_{agent}_weight'] = torch.tensor(pw, device=dev)
+        RC[f'global_potential_{agent}_contrib'] = p_raw * pw
+
         # Own force efficiency penalty
         f_raw = self._calculate_force_penalties()[agent]
         fw = self._get_weight(f'forceeff_{agent}', 0.0)
@@ -747,6 +756,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 RC[f'global_zpenalty_{agent}_contrib'] +
                 RC[f'global_completion_{agent}_contrib'] +
                 RC[f'global_timeeff_{agent}_contrib'] +
+                RC[f'global_potential_{agent}_contrib'] +   # 新增势能项
                 RC[f'{agent}force_contrib'] +
                 (RC['humanaware_contrib'] if agent=='robot' else RC['robotaware_contrib'])
             )
@@ -786,6 +796,25 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     # =========================================================================
     # Global reward calculation functions
     # =========================================================================
+
+    def _calculate_potential_reward(self) -> torch.Tensor:
+        """
+        Concave increasing potential based on distance to final setpoint:
+        R = 1 - sqrt(clamp(d/d0, 0, 1))
+        - 0 at start (d=d0), 1 at goal (d=0)
+        
+        NOTE: For parallel environments, we use local coordinates (stylus_pos_t1 is already relative to robot base)
+        and trajectory_manager.end_pos_local is in local coordinates, so no additional offset needed.
+        """
+        # 当前到终点的距离 (都在局部坐标系中)
+        d = torch.norm(
+            self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0),
+            dim=-1
+        )
+        # 起点到终点的基准距离（避免除零）
+        d0 = max(float(self.trajectory_manager.total_distance), 1e-8)
+        u = torch.clamp(d / d0, min=0.0, max=1.0)
+        return 1.0 - torch.sqrt(u)
 
     def _calculate_force_penalties(self) -> Dict[str, torch.Tensor]:
         """Calculate force efficiency penalties for both agents."""
