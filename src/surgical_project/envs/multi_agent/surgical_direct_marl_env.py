@@ -692,7 +692,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
         d0 = max(float(self.trajectory_manager.total_distance), 1e-8)
         u = torch.clamp(d / d0, min=0.0, max=1.0)
-        return 1.0 - torch.sqrt(u)
+        return torch.sqrt(1 - u)
 
     def _calculate_force_penalties(self) -> Dict[str, torch.Tensor]:
         """Calculate force efficiency penalties for both agents."""

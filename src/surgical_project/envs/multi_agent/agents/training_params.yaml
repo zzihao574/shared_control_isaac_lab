@@ -122,7 +122,7 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 4.0
     timeeff_robot: 0.0
-    potential_robot: 0.4              # NEW: Potential reward weight for robot
+    potential_robot: 0.2              # NEW: Potential reward weight for robot
     forceeff_robot: 0.6
     humanaware_robot: 0.6
 
@@ -149,7 +149,7 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 4.0
     timeeff_human: 0.0
-    potential_human: 0.4              # NEW: Potential reward weight for human
+    potential_human: 0.2              # NEW: Potential reward weight for human
     forceeff_human: 0.6
     robotaware_human: 0.6
 
