@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Surgical Robot MADDPG Shared Network Training
-Enhanced version with configurable network architecture and exponential noise decay.
-MODIFIED: Added per-env scaling functionality for automatic parameter scaling.
-MODIFIED: Added eval mode control and exit reason tracking.
-FIXED: Proper global reproducibility setup for persistent generator strategy.
-
-Features:
-- Configurable network layers, dropout, and orthogonal initialization
-- Exponential noise scheduling: fast early decay, slow later convergence
-- Unified global step tracking for consistent logging
-- TopK model management with milestone evaluation
-- WandB integration with per-agent metrics
-- Single evaluation chain: MADDPGTrainer -> MilestoneEvaluator
-- Per-env scaling: YAML configs are per-env baselines, auto-scaled by --num_envs
-- Exit reason tracking for debugging premature termination
-- Eval mode support for clean milestone evaluation
-- FIXED: Global reproducibility setup with proper seed management
+MADDPG training for surgical robot with shared networks and per-env scaling.
+Features configurable architectures, noise scheduling, and milestone evaluation.
 """
 
 import sys
@@ -42,13 +27,7 @@ from utils.training_helpers import (
 
 
 def setup_global_reproducibility(seed: int, strict_determinism: bool = False):
-    """
-    Setup global reproducibility for consistent training results.
-    
-    Args:
-        seed: Base seed for all random number generators
-        strict_determinism: Enable strict determinism (may slow training)
-    """
+    """Setup global reproducibility for consistent training results."""
     import random
     random.seed(seed)
     np.random.seed(seed)
@@ -75,19 +54,7 @@ def setup_environment(args, config):
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
     
-    print(f"[INFO] Environment configuration:")
-    print(f"  Number of environments: {env_cfg.scene.num_envs}")
-    print(f"  Episode length: {env_cfg.episode_length_s}s")
-    print(f"  Decimation: {env_cfg.decimation}")
-    print(f"  Possible agents: {env_cfg.possible_agents}")
-    print(f"  Action spaces: {env_cfg.action_spaces}")
-    print(f"  Observation spaces: {env_cfg.observation_spaces}")
-    
     env = gym.make(args.task, cfg=env_cfg)
-    
-    if hasattr(env, 'max_episode_length'):
-        print(f"[INFO] Environment max_episode_length: {env.max_episode_length}")
-    
     return env, env_cfg
 
 
@@ -111,11 +78,6 @@ def initialize_maddpg_algorithm(env, config, args):
         device=device
     )
     
-    print(f"[INFO] MADDPG algorithm initialized:")
-    print(f"  Device: {device}")
-    print(f"  Agent IDs: {maddpg.agent_ids}")
-    print(f"  Environments: {num_envs}")
-    
     return maddpg
 
 
@@ -137,21 +99,8 @@ def inject_step_tracer(env, config, num_envs):
 
 class MADDPGTrainer:
     """
-    Streamlined MADDPG trainer for configurable networks and noise scheduling.
-    MODIFIED: Added per-env scaling functionality.
-    MODIFIED: Added eval mode control and exit reason tracking.
-    FIXED: Proper global reproducibility setup.
-    
-    Features:
-    - Configuration-driven network architecture
-    - Exponential noise decay scheduling
-    - Milestone evaluation with TopK model selection
-    - Comprehensive WandB logging with per-agent metrics
-    - Single evaluation chain (no old RewardLogger/MilestoneManager)
-    - Per-env scaling: YAML configs auto-scaled by num_envs
-    - Exit reason tracking for debugging premature termination
-    - Eval mode support for clean milestone evaluation
-    - Global reproducibility with persistent generators
+    MADDPG trainer with shared networks, per-env scaling, and milestone evaluation.
+    Supports configurable architectures, noise scheduling, and eval mode control.
     """
     
     def __init__(self, args):
@@ -178,24 +127,19 @@ class MADDPGTrainer:
         print(f"[SETUP] Loading configuration from: {self.args.config}")
         self.config = TrainingConfiguration.from_yaml(self.args.config)
         
-        # FIXED: Setup global reproducibility with proper seed management
+        # Setup global reproducibility
         setup_global_reproducibility(self.args.seed, strict_determinism=False)
         self.config.params['seed'] = self.args.seed
         
         print(f"[SETUP] Configuration loaded, global reproducibility set: {self.args.seed}")
         
-        # === NEW: Apply per-env scaling ===
+        # Apply per-env scaling
         self._apply_per_env_scaling()
 
     def _apply_per_env_scaling(self):
         """
-        Interpret YAML numbers as 'per-env' baselines and scale them by CLI --num_envs.
-        Scales:
-          - maddpg_config.min_buffer_size
-          - maddpg_config.max_replay_buffer_len
-          - training_monitor.milestone_episodes (each entry)
-        
-        Note: max_global_steps is NOT scaled as it represents total training steps, not per-env steps.
+        Scale YAML parameters by number of environments.
+        Scales: min_buffer_size, max_replay_buffer_len, milestone_episodes
         """
         num_envs = int(self.args.num_envs)
 
@@ -219,9 +163,9 @@ class MADDPGTrainer:
 
         print("[SETUP][PER-ENV SCALING]")
         print(f"  num_envs = {num_envs}")
-        print(f"  min_buffer_size: {base_min_buffer} â†’ {scaled_min_buffer}")
-        print(f"  max_replay_buffer_len: {base_max_buffer} â†’ {scaled_max_buffer}")
-        print(f"  milestone_episodes: {base_milestones} â†’ {scaled_milestones}")
+        print(f"  min_buffer_size: {base_min_buffer} → {scaled_min_buffer}")
+        print(f"  max_replay_buffer_len: {base_max_buffer} → {scaled_max_buffer}")
+        print(f"  milestone_episodes: {base_milestones} → {scaled_milestones}")
 
     def _setup_environment(self):
         """Create and configure the environment."""
@@ -257,7 +201,7 @@ class MADDPGTrainer:
             print(f"[SETUP] WandB disabled")
 
     def _setup_training_components(self):
-        """Initialize training components and metrics hub with unified max_global_steps logic."""
+        """Initialize training components and metrics hub."""
         print(f"[SETUP] Setting up training components...")
         
         # Create MetricsHub
@@ -274,7 +218,7 @@ class MADDPGTrainer:
         # Create TopK manager
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
-        # UNIFIED max_global_steps logic: CLI takes priority over YAML
+        # Unified max_global_steps logic: CLI takes priority over YAML
         maddpg_cfg = self.config.params.get('maddpg_config', {})
         yaml_max_steps = int(maddpg_cfg.get('max_global_steps', 200000))
         
@@ -346,17 +290,11 @@ class MADDPGTrainer:
         exploration_cfg = self.config.params.get('exploration', {})
         if exploration_cfg:
             print(f"[CONFIG] Exploration Schedule:")
-            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} â†’ {exploration_cfg.get('sigma_end', 0.1)}")
+            print(f"  Noise range: {exploration_cfg.get('sigma_start', 0.7)} → {exploration_cfg.get('sigma_end', 0.1)}")
             print(f"  Decay rate: {exploration_cfg.get('decay_k', 6.0)}")
 
     def set_eval_mode(self, is_eval: bool):
-        """
-        Set evaluation mode for MADDPG.
-        During evaluation: disable buffer updates and parameter updates.
-        
-        Args:
-            is_eval: True for evaluation mode, False for training mode
-        """
+        """Set evaluation mode for MADDPG (disables buffer/parameter updates)."""
         self.maddpg.set_eval_mode(is_eval)
         mode_str = "EVALUATION" if is_eval else "TRAINING"
         print(f"[TRAINER] Mode set to: {mode_str}")
@@ -404,19 +342,15 @@ class MADDPGTrainer:
             print(f"[MILESTONE] Updated max_milestone_triggered to {self.max_milestone_triggered}")
 
     def train(self) -> None:
-        """
-        Main training loop with configurable networks and noise scheduling.
-        MODIFIED: Added exit reason tracking for debugging premature termination.
-        FIXED: Uses persistent generators for reproducible yet diverse noise.
-        """
+        """Main training loop with milestone evaluation and exit tracking."""
         print(f"[TRAIN] Starting training with persistent generators and noise scheduling:")
-        print(f"  - TrainingRunner: rolloutâ†’replayâ†’updateâ†’logâ†’count + exponential noise decay")
-        print(f"  - MilestoneEvaluator: milestoneâ†’evalâ†’topkâ†’log")
+        print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
+        print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
         print(f"  - Network layers configurable via YAML")
-        print(f"  - Noise schedule: Ïƒ_start={self.runner.sigma_start} â†’ Ïƒ_end={self.runner.sigma_end}")
+        print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
         print(f"  - Per-env scaling applied: buffer sizes and milestones auto-scaled by {self.args.num_envs}x")
-        print(f"  - FIXED: Persistent generators for reproducible yet diverse per-(agent,env) noise")
+        print(f"  - Persistent generators for reproducible yet diverse per-(agent,env) noise")
         
         reason = "UNKNOWN"  # Track exit reason for debugging
         
@@ -529,7 +463,6 @@ def main():
     print(f"  WandB: {args_cli.wandb}")
     print(f"  Config: {args_cli.config}")
     print(f"  Per-env scaling: YAML configs will be auto-scaled by {args_cli.num_envs}x")
-    print(f"  FIXED: Persistent generators for reproducible yet diverse noise")
     
     # Launch Isaac Sim
     print(f"[MAIN] Launching Isaac Sim...")

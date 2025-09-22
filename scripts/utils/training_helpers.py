@@ -2,13 +2,7 @@
 
 """
 Training helper utilities for MADDPG multi-environment parallel training.
-OPTIMIZED: Simplified WandBLogger metric mapping, removed unused MetricsHub methods.
-
-Features:
-- TrainingRunner: Unified training loop execution with noise scheduling
-- MilestoneEvaluator: Milestone evaluation and TopK model management with normalized return tracking  
-- MetricsHub: Simplified data pipeline for logging
-- WandBLogger: Optimized metric mapping with consolidated dictionaries
+Features unified training execution, milestone evaluation, and optimized WandB logging.
 """
 
 import argparse
@@ -35,12 +29,7 @@ except ImportError:
 class TrainingRunner:
     """
     Unified training loop executor with noise scheduling and metrics collection.
-    
-    Features:
-    - Exponential noise decay scheduling (fast early, slow later)
-    - Unified global step tracking
-    - Episode counting with skip mechanism for milestone evaluation
-    - Metrics collection and WandB logging
+    Features exponential noise decay and unified global step tracking.
     """
     
     def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids, max_global_steps=None):
@@ -156,7 +145,7 @@ class TrainingRunner:
             
             self.metrics.push_update(self.global_step, payload)
 
-        # NEW: Push force statistics every 10 steps
+        # Push force statistics every 10 steps
         if self.global_step % 10 == 0:
             self._push_current_step_force_statistics(detail)
 
@@ -176,13 +165,7 @@ class TrainingRunner:
         self._skip_episode_once = True
 
     def _push_current_step_force_statistics(self, detail):
-        """
-        Push current step's force statistics to WandB.
-        Calculate mean force across all environments for each agent in each direction.
-        
-        Args:
-            detail: Dictionary containing mean_actions from MADDPG.select_actions()
-        """
+        """Push current step's force statistics to WandB."""
         if "mean_actions" not in detail:
             return
         
@@ -223,13 +206,7 @@ class TrainingRunner:
 class MilestoneEvaluator:
     """
     Milestone evaluator with single environment evaluation and TopK model management.
-    
-    Features:
-    - Single environment evaluation for efficiency
-    - TopK model management
-    - Milestone logging to MetricsHub
-    - Normalized return calculation: total_reward / episode_steps * 1000
-    - FIXED: Proper action masking and detail info handling for correct display
+    Features normalized return calculation and proper action masking.
     """
     
     def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -310,7 +287,7 @@ class MilestoneEvaluator:
                 # Select actions deterministically (no noise during evaluation)
                 actions, detail_info = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
                 
-                # FIXED: Apply complete action masking to both actions AND detail_info
+                # Apply complete action masking to both actions AND detail_info
                 for aid, act in actions.items():
                     if act.ndim == 2:
                         # Mask actions - only env0 executes real actions, others get zero
@@ -318,8 +295,7 @@ class MilestoneEvaluator:
                         masked_actions[active_env] = act[active_env]
                         actions[aid] = masked_actions
                         
-                        # FIXED: Also mask the detail info to reflect actual forces being applied
-                        # This ensures display shows correct information
+                        # Also mask the detail info to reflect actual forces being applied
                         if aid in detail_info['mean_actions']:
                             masked_mean = torch.zeros_like(detail_info['mean_actions'][aid])
                             masked_mean[active_env] = detail_info['mean_actions'][aid][active_env]
@@ -331,12 +307,12 @@ class MilestoneEvaluator:
                             masked_noise[active_env] = detail_info['noise_actions'][aid][active_env]  # Should be 0 anyway
                             detail_info['noise_actions'][aid] = masked_noise
                 
-                # FIXED: Set detail info to environment AFTER masking for correct display
+                # Set detail info to environment AFTER masking for correct display
                 env.set_detail_actor_info(detail_info)
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 
-                # FIXED: Call StepTracer every 10 eval steps with force_print=True to bypass step frequency check
+                # Call StepTracer every 10 eval steps with force_print=True to bypass step frequency check
                 if (hasattr(env, 'step_tracer') and env.step_tracer is not None and 
                     eval_step_counter % 10 == 0):
                     # Temporarily enable console logging
@@ -405,13 +381,8 @@ class MilestoneEvaluator:
 
 class MetricsHub:
     """
-    SIMPLIFIED: Single-exit metrics bus for unified data pipeline.
-    Removed unused methods to reduce complexity.
-    
-    Features:
-    - Event-based subscription system for active methods only
-    - Ring buffer for update history  
-    - Support for update and milestone events (removed unused step/episode methods)
+    Simplified single-exit metrics bus for unified data pipeline.
+    Features event-based subscription system and ring buffer for update history.
     """
     
     def __init__(self, ring: int = 100):
@@ -442,15 +413,8 @@ class MetricsHub:
 
 class WandBLogger:
     """
-    OPTIMIZED: WandB logger with consolidated metric mapping dictionaries.
-    Removed repetitive mapping code for cleaner implementation.
-    
-    Features:
-    - Consolidated per-agent and global metrics mapping
-    - Network configuration logging
-    - Exploration metrics tracking  
-    - Milestone and evaluation logging
-    - Separate tracking of critic and actor updates
+    Optimized WandB logger with consolidated metric mapping dictionaries.
+    Features network configuration logging and milestone tracking.
     """
     
     # Class-level mapping dictionaries for cleaner code
@@ -560,7 +524,7 @@ class WandBLogger:
         print("[WANDB] Attached to MetricsHub with optimized metric mapping.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-        """OPTIMIZED: Log metrics with consolidated mapping dictionaries."""
+        """Log metrics with consolidated mapping dictionaries."""
         if not self.enabled or not metrics_data:
             return
 
@@ -622,11 +586,7 @@ class TrainingConfiguration:
 class TopKModelManager:
     """
     Manages top-K model collection and checkpoint saving.
-    
-    Features:
-    - Raw performance tracking (no clipping)
-    - Automatic sorting by performance
-    - Checkpoint saving with model metadata
+    Features raw performance tracking and automatic sorting by performance.
     """
     
     def __init__(self, k: int = 10, mode: str = "max"):

@@ -1,13 +1,6 @@
 """
 Environment utilities for shared network MADDPG training.
-
-This module provides essential components for physics-based constraint analysis 
-and console debugging in surgical robot environments.
-
-Features:
-- CompleteConstraintChecker: Physics-based constraint analysis with coordinate transformation
-- TrajectoryManager: Trajectory management for path following tasks
-- StepTracer: Console debugging with four-zone reward system monitoring
+Provides physics-based constraint analysis and console debugging components.
 """
 
 import torch
@@ -27,23 +20,10 @@ class CompleteConstraintChecker:
     
     Provides two-state detection (Outside/Overlapping) based on raycast validation
     with automatic coordinate transformation from world to local coordinates.
-    
-    Features:
-    - Batch constraint state analysis across multiple environments
-    - Raycast-based overlapping detection for accurate collision states
-    - Consistent distance reporting (raycast distance for outside, 0.0 for overlapping)
-    - Normal vector calculation pointing from stylus toward obstacle
-    - Automatic coordinate transformation to local robot frame
     """
     
     def __init__(self, device: torch.device, collision_threshold: float = 0.001):
-        """
-        Initialize constraint checker with physics interfaces.
-        
-        Args:
-            device: PyTorch device for tensor operations
-            collision_threshold: Minimum distance threshold for collision detection
-        """
+        """Initialize constraint checker with physics interfaces."""
         self.device = device
         self.collision_threshold = collision_threshold
         
@@ -57,20 +37,7 @@ class CompleteConstraintChecker:
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """
         Analyze constraint states for batch of environments.
-        
-        Performs physics queries in world coordinates but returns results transformed
-        to local robot coordinates for consistent reward calculations.
-        
-        Args:
-            stylus_positions: Stylus positions in local coordinates [num_envs, 3]
-            env_base_positions: Environment base positions for coordinate transformation
-            
-        Returns:
-            Dictionary containing constraint analysis results in local coordinates:
-            - distances_constraint: Distance to constraint surface [num_envs]
-            - closest_points: Closest points on constraint in local coords [num_envs, 3]
-            - normal_vectors: Normal vectors in local coordinates [num_envs, 3]
-            - is_overlapping: Boolean overlap flags [num_envs]
+        Performs physics queries in world coordinates but returns results in local coordinates.
         """
         num_envs = stylus_positions.shape[0]
         
@@ -125,21 +92,7 @@ class CompleteConstraintChecker:
         return batch_results
     
     def _analyze_single_constraint(self, stylus_position: torch.Tensor, constraint_path: str, verbose: bool = False):
-        """
-        Two-state constraint analysis using raycast validation.
-        
-        Logic:
-        - If raycast hits constraint with valid distance: outside state (returns raycast distance)
-        - If raycast doesn't hit or distance is 0: overlapping state (returns 0.0)
-        
-        Args:
-            stylus_position: Stylus position in world coordinates
-            constraint_path: USD path to constraint object
-            verbose: Enable detailed logging
-            
-        Returns:
-            Dictionary with constraint analysis results or None if analysis failed
-        """
+        """Two-state constraint analysis using raycast validation."""
         if self.physics_attachment_interface is None or self.physics_scene_query_interface is None:
             return None
 
@@ -214,26 +167,11 @@ class CompleteConstraintChecker:
 class TrajectoryManager:
     """
     Trajectory management for surgical robot path following.
-    
-    Provides trajectory state calculation, progress tracking, and completion
-    detection for linear path following tasks in local robot coordinates.
-    
-    Features:
-    - Progress calculation along linear trajectory (0 to 1)
-    - Perpendicular deviation measurement from ideal path
-    - Task completion detection with configurable threshold
+    Provides trajectory state calculation, progress tracking, and completion detection.
     """
     
     def __init__(self, device: torch.device, params: dict, num_envs: int, env_base_positions: torch.Tensor):
-        """
-        Initialize trajectory manager with path parameters.
-        
-        Args:
-            device: PyTorch device for tensor operations
-            params: Configuration parameters containing trajectory definition
-            num_envs: Number of parallel environments
-            env_base_positions: Base positions for coordinate transformations
-        """
+        """Initialize trajectory manager with path parameters."""
         self.device = device
         self.num_envs = num_envs
         self.env_base_positions = env_base_positions
@@ -253,30 +191,14 @@ class TrajectoryManager:
         print(f"[INFO] Trajectory completion threshold: {self.completion_threshold}m")
     
     def get_progress(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate progress along trajectory (0 to 1).
-        
-        Args:
-            current_pos_local: Current positions in local coordinates [num_envs, 3]
-            
-        Returns:
-            Progress ratios [num_envs] where 0=start, 1=end
-        """
+        """Calculate progress along trajectory (0 to 1)."""
         vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
         progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
         progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
         return progress_distance / self.total_distance
     
     def get_deviation(self, current_pos_local: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate perpendicular distance to trajectory line.
-        
-        Args:
-            current_pos_local: Current positions in local coordinates [num_envs, 3]
-            
-        Returns:
-            Tuple of (deviations [num_envs], closest_points [num_envs, 3])
-        """
+        """Calculate perpendicular distance to trajectory line."""
         vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
         progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
         progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
@@ -287,15 +209,7 @@ class TrajectoryManager:
         return deviations, closest_points
     
     def is_final_setpoint_reached(self, current_pos_local: torch.Tensor) -> torch.Tensor:
-        """
-        Check if final setpoint is reached within completion threshold.
-        
-        Args:
-            current_pos_local: Current positions in local coordinates [num_envs, 3]
-            
-        Returns:
-            Boolean flags indicating completion [num_envs]
-        """
+        """Check if final setpoint is reached within completion threshold."""
         distances_to_final = torch.norm(current_pos_local - self.end_pos_local.unsqueeze(0), dim=-1)
         return distances_to_final < self.completion_threshold
 
@@ -303,31 +217,14 @@ class TrajectoryManager:
 class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
-    
-    Provides detailed console output for debugging reward calculations,
-    environment states, and agent behaviors during training.
-    
-    Features:
-    - Configurable step frequency and environment count for output
-    - Four-zone reward system breakdown display
-    - Environment state snapshot logging
-    - Force and action display for both agents
+    Provides detailed console output for debugging reward calculations and agent behaviors.
     """
     
     def __init__(self, num_envs: int, device: torch.device,
                  enable_console_logging: bool = False,
                  print_every_steps: int = 10,
                  max_envs_to_print: int = 2):
-        """
-        Initialize step tracer with logging configuration.
-        
-        Args:
-            num_envs: Total number of parallel environments
-            device: PyTorch device for tensor operations
-            enable_console_logging: Enable/disable console output
-            print_every_steps: Frequency of step logging
-            max_envs_to_print: Maximum number of environments to display
-        """
+        """Initialize step tracer with logging configuration."""
         self.num_envs = num_envs
         self.device = device
         self.enable_console_logging = enable_console_logging
@@ -335,15 +232,7 @@ class StepTracer:
         self.max_envs_to_print = max_envs_to_print
 
     def maybe_print_step(self, env, rewards: Dict, global_step: int, force_print: bool = False):
-        """
-        Print step information if conditions are met.
-        
-        Args:
-            env: Environment instance containing state and reward data
-            rewards: Dictionary of agent rewards for current step
-            global_step: Current global training step
-            force_print: Override step frequency check (for evaluation)
-        """
+        """Print step information if conditions are met."""
         if not self.enable_console_logging:
             return
             
@@ -494,18 +383,7 @@ class StepTracer:
         print(f"  Noise: Nx={human_noise[0]:+.6f}N, Ny={human_noise[1]:+.6f}N, Nz={human_noise[2]:+.6f}N")
 
     def _safe_get_reward_component(self, env, key: str, env_id: int, default: float) -> float:
-        """
-        Safely extract reward component value with fallback handling.
-        
-        Args:
-            env: Environment instance
-            key: Component key to extract
-            env_id: Environment index
-            default: Default value if extraction fails
-            
-        Returns:
-            Component value or default
-        """
+        """Safely extract reward component value with fallback handling."""
         if not hasattr(env, 'reward_components') or key not in env.reward_components:
             return default
         

@@ -1,8 +1,5 @@
-# Training parameters configuration - OPTIMIZED with residual connections
-# OPTIMIZED: Added residual connection support, removed dropout parameters
-# MODIFIED: Added max_global_steps as primary termination condition
-# CLEANED: Removed dropout_p parameters for simplified architecture
-# ADDED: Potential reward weights for robot and human agents
+# Training parameters configuration with residual connections
+# Features configurable network layers, exponential noise scheduling, and per-env scaling
 
 # ==============================================================================
 # Global Settings
@@ -10,7 +7,7 @@
 seed: 42
 
 # ==============================================================================
-# Network Architecture Configuration - OPTIMIZED WITH RESIDUAL CONNECTIONS
+# Network Architecture Configuration with Residual Connections
 # ==============================================================================
 networks:
   actor:
@@ -30,7 +27,7 @@ networks:
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
-  # 固定缩放因子（按obs拼接顺序：pos[3] + vel[3] + dist[1] = 7维）
+  # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
   factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
 
 # ==============================================================================
@@ -39,7 +36,7 @@ obs_scaling:
 exploration:
   sigma_start: 0.6   # Initial noise = 0.6 × max_action
   sigma_end: 0.1     # Final noise = 0.1 × max_action
-  decay_k: 3.0       # Decay rate (optional, default value provided in code)
+  decay_k: 3.0       # Decay rate for exponential schedule
 
 # ==============================================================================
 # Logging Configuration
@@ -92,10 +89,10 @@ constraint_geometry:
   y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
 
 # ==============================================================================
-# Reward Parameters - SIMPLIFIED FOUR-ZONE SYSTEM (FLAT STRUCTURE)
+# Reward Parameters - Four-Zone System (Flat Structure)
 # ==============================================================================
 reward_parameters:
-  # UNIFIED COMPLETION THRESHOLD
+  # Unified completion threshold
   completion_threshold: 0.01          # Distance threshold for task completion (meters)
   
   weights:
@@ -122,7 +119,7 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 4.0
     timeeff_robot: 0.0
-    potential_robot: 0.2              # NEW: Potential reward weight for robot
+    potential_robot: 0.4              # Potential reward weight for robot
     forceeff_robot: 0.7
     humanaware_robot: 0.7
 
@@ -149,12 +146,12 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 4.0
     timeeff_human: 0.0
-    potential_human: 0.2              # NEW: Potential reward weight for human
+    potential_human: 0.4              # Potential reward weight for human
     forceeff_human: 0.7
     robotaware_human: 0.7
 
 # ==============================================================================
-# Termination Conditions - SIMPLIFIED
+# Termination Conditions
 # ==============================================================================
 termination_conditions:
   z_below_zero: false                 # Disable Z termination for now
@@ -162,24 +159,24 @@ termination_conditions:
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
   
 # ==============================================================================
-# MADDPG Algorithm Configuration - OPTIMIZED FOR SHARED NETWORKS WITH RESIDUALS
+# MADDPG Algorithm Configuration - Optimized for Shared Networks with Residuals
 # ==============================================================================
 maddpg_config:
   lr_actor: 0.0007                    # Actor learning rate
   lr_critic: 0.001                    # Critic learning rate
   gamma: 0.99                        # Discount factor
   batch_size: 1024                    # Training batch size (increased for stability)
-  num_episodes: 600                  # Legacy parameter (kept for compatibility, not used for termination)
-  max_global_steps: 200000           # PRIMARY TERMINATION CONDITION: Stop after this many training steps
+  max_global_steps: 200000           # Primary termination condition: stop after this many training steps
   update_interval: 10                 # Updates every N steps
-  min_buffer_size: 6000              # Minimum buffer size to start training (renamed from warmup)
+  min_buffer_size: 6000              # Minimum buffer size to start training (per-env baseline)
   tau: 0.002                         # Target network update rate (slower for stability)
-  max_replay_buffer_len: 7200       # Maximum replay buffer size
+  max_replay_buffer_len: 7200       # Maximum replay buffer size (per-env baseline)
 
 # ==============================================================================
-# Training Monitoring - SIMPLIFIED
+# Training Monitoring
 # ==============================================================================
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
   # Episodes are counted as sum of all environment completions
+  # These are per-env baselines and will be auto-scaled by --num_envs
   milestone_episodes: [10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]

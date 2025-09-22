@@ -1,14 +1,6 @@
 """
 Neural network architectures for MADDPG with state normalization and residual connections.
-OPTIMIZED: Removed dropout, added residual bypass connections, removed _build_mlp.
-
-Features:
-- FixedScaler for state normalization without offsets
-- Deterministic actor with normalized action output [-1,1]  
-- Centralized critic expecting normalized actions
-- Residual bypass connections for improved gradient flow
-- Configurable layers and orthogonal initialization
-- No dropout (removed for simplification)
+Features fixed state scaling, deterministic actor, centralized critic, and configurable bypasses.
 """
 
 import torch
@@ -16,7 +8,7 @@ import torch.nn as nn
 from typing import Sequence, Optional
 
 class FixedScaler(nn.Module):
-    """轻量固定缩放器（逐维常数乘法）"""
+    """Lightweight fixed scaler with per-dimension constant multiplication."""
     def __init__(self, dim: int, factors: torch.Tensor):
         super().__init__()
         assert factors.numel() == dim, f"Factors size {factors.numel()} != dim {dim}"
@@ -27,15 +19,8 @@ class FixedScaler(nn.Module):
 
 class Actor(nn.Module):
     """
-    Actor网络，动态检测输入维度并在指定层实现残差连接。
-    OPTIMIZED: 移除dropout，添加可配置的残差bypass连接
-    
-    Features:
-    - 状态固定缩放 (FixedScaler)
-    - 仅输出动作均值（去掉std头）
-    - tanh激活确保输出 ∈ [-1,1]
-    - 可配置的残差bypass连接层
-    - 移除dropout以简化架构
+    Actor network with dynamic input dimension detection and residual bypass connections.
+    Features fixed state scaling, tanh activation ensuring output ∈ [-1,1], and configurable bypasses.
     """
     
     def __init__(self,
@@ -49,7 +34,7 @@ class Actor(nn.Module):
                  obs_factors: Optional[torch.Tensor] = None):
         super().__init__()
         
-        # 状态缩放器
+        # State scaler
         if obs_factors is not None:
             self.state_scale = FixedScaler(state_dim, obs_factors)
         else:
@@ -59,22 +44,22 @@ class Actor(nn.Module):
         self.hidden_layers = hidden_layers
         self.input_bypass_layers = set(input_bypass_layers) if input_bypass_layers else set()
         
-        # 构建网络层
+        # Build network layers
         self.layers = nn.ModuleList()
-        self.bypass_configs = {}  # 存储每层的bypass配置
+        self.bypass_configs = {}  # Store bypass configuration for each layer
         
         last_dim = self.input_dim
         for i, hidden_dim in enumerate(hidden_layers):
             if i in self.input_bypass_layers:
-                # 计算这一层的连接配置
-                fc_dim = hidden_dim - self.input_dim  # 全连接部分的输出维度
+                # Calculate connection configuration for this layer
+                fc_dim = hidden_dim - self.input_dim  # FC part output dimension
                 
                 if fc_dim <= 0:
-                    # 隐藏层太小，无法做bypass，回退到正常全连接
+                    # Hidden layer too small for bypass, fallback to normal FC
                     print(f"  [WARNING] Layer {i}: hidden_dim({hidden_dim}) <= input_dim({self.input_dim}), using normal FC")
                     layer = nn.Linear(last_dim, hidden_dim)
                 else:
-                    # 创建部分连接层
+                    # Create partial connection layer
                     layer = nn.Linear(last_dim, fc_dim)
                     self.bypass_configs[i] = {
                         'fc_dim': fc_dim,
@@ -83,25 +68,25 @@ class Actor(nn.Module):
                     }
                     print(f"  Layer {i}: {last_dim} -> {fc_dim} (FC) + {self.input_dim} (bypass) = {hidden_dim}")
             else:
-                # 正常的全连接层
+                # Normal fully connected layer
                 layer = nn.Linear(last_dim, hidden_dim)
                 print(f"  Layer {i}: {last_dim} -> {hidden_dim} (normal FC)")
             
             self.layers.append(layer)
             last_dim = hidden_dim
             
-            # 正交初始化
+            # Orthogonal initialization
             if orthogonal_init:
                 nn.init.orthogonal_(layer.weight, gain=ortho_gain_hidden)
                 nn.init.constant_(layer.bias, 0.0)
         
-        # 输出头
+        # Output head
         self.mean_head = nn.Linear(last_dim, action_dim)
         if orthogonal_init:
             nn.init.orthogonal_(self.mean_head.weight, gain=ortho_gain_output)
             nn.init.constant_(self.mean_head.bias, 0.0)
         
-        # 打印架构摘要
+        # Print architecture summary
         self._print_architecture_summary()
     
     def _print_architecture_summary(self):
@@ -115,43 +100,36 @@ class Actor(nn.Module):
                 print(f"    Layer {layer_idx}: {config['fc_dim']} (FC) + {config['bypass_dim']} (bypass)")
 
     def forward(self, state: torch.Tensor):
-        """前向传播，动态处理输入直通"""
-        # 缩放并保存原始输入
+        """Forward pass with dynamic input bypass handling."""
+        # Scale and save original input
         original_input = self.state_scale(state)
         x = original_input
         
-        # 通过每一层
+        # Pass through each layer
         for i, layer in enumerate(self.layers):
             if i in self.bypass_configs:
-                # 部分连接层：全连接输出 + 输入直通
+                # Partial connection layer: FC output + input bypass
                 config = self.bypass_configs[i]
                 
-                # 全连接部分
+                # FC part
                 fc_output = layer(x)  # [batch, fc_dim]
                 
-                # 拼接全连接输出和原始输入
+                # Concatenate FC output and original input
                 x = torch.cat([fc_output, original_input], dim=-1)  # [batch, hidden_dim]
                 
-                # 应用激活函数
+                # Apply activation
                 x = torch.relu(x)
             else:
-                # 正常全连接层
+                # Normal fully connected layer
                 x = torch.relu(layer(x))
         
-        # 输出归一化动作
+        # Output normalized actions
         return torch.tanh(self.mean_head(x))
 
 class Critic(nn.Module):
     """
-    Critic网络，动态处理状态+动作的联合输入，支持残差连接。
-    OPTIMIZED: 移除dropout，添加可配置的残差bypass连接
-    
-    Features:
-    - 状态固定缩放 (FixedScaler)
-    - 直接接受归一化动作（不在内部做 /a_max）
-    - 可配置的残差bypass连接层
-    - 移除dropout以简化架构
-    - 输出单个Q值
+    Critic network with dynamic state+action joint input processing and residual bypasses.
+    Features fixed state scaling, direct normalized action acceptance, and configurable bypasses.
     """
     
     def __init__(self,
@@ -165,20 +143,20 @@ class Critic(nn.Module):
                  obs_factors: Optional[torch.Tensor] = None):
         super().__init__()
         
-        # 状态缩放器
+        # State scaler
         if obs_factors is not None:
             self.state_scale = FixedScaler(total_state_dimension, obs_factors)
         else:
             self.state_scale = nn.Identity()
         
-        # Critic的输入是状态+动作
+        # Critic input is state + action
         self.input_dim = total_state_dimension + total_action_dimension
         self.state_dim = total_state_dimension
         self.action_dim = total_action_dimension
         self.hidden_layers = hidden_layers
         self.input_bypass_layers = set(input_bypass_layers) if input_bypass_layers else set()
         
-        # 构建网络层
+        # Build network layers
         self.layers = nn.ModuleList()
         self.bypass_configs = {}
         
@@ -209,7 +187,7 @@ class Critic(nn.Module):
                 nn.init.orthogonal_(layer.weight, gain=ortho_gain_hidden)
                 nn.init.constant_(layer.bias, 0.0)
         
-        # Q值输出头
+        # Q-value output head
         self.q_head = nn.Linear(last_dim, 1)
         if orthogonal_init:
             nn.init.orthogonal_(self.q_head.weight, gain=ortho_gain_output)
@@ -228,7 +206,7 @@ class Critic(nn.Module):
                 print(f"    Layer {layer_idx}: {config['fc_dim']} (FC) + {config['bypass_dim']} (bypass)")
 
     def forward(self, states: torch.Tensor, actions_norm: torch.Tensor):
-        """前向传播"""
+        """Forward pass with joint state-action input processing."""
         s = self.state_scale(states)
         original_input = torch.cat([s, actions_norm], dim=-1)
         x = original_input

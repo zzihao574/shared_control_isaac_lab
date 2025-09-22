@@ -1,8 +1,6 @@
 """
 Human-robot collaborative surgical MARL environment for shared networks.
-
-This module implements a multi-agent reinforcement learning environment for surgical robotics,
-featuring physics-based constraint checking, four-zone reward systems, and potential field guidance.
+Features physics-based constraints, four-zone rewards, and potential field guidance.
 """
 
 from __future__ import annotations
@@ -338,12 +336,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._omni_robot.write_data_to_sim()
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """
-        Compute observations for all agents and update state cache.
-        
-        Returns:
-            Dictionary mapping agent_id to observation tensor [num_envs, obs_dim]
-        """
+        """Compute observations for all agents and update state cache."""
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
         
@@ -682,10 +675,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return rewards
 
     def _calculate_potential_reward(self) -> torch.Tensor:
-        """
-        Concave increasing potential based on distance to final setpoint.
-        R = 1 - sqrt(clamp(d/d0, 0, 1)) where d is current distance and d0 is initial distance.
-        """
+        """Concave increasing potential based on distance to final setpoint."""
         d = torch.norm(
             self.stylus_pos_t1 - self.trajectory_manager.end_pos_local.unsqueeze(0),
             dim=-1
