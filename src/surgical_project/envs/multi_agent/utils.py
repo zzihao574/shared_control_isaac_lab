@@ -1,5 +1,5 @@
 """
-Environment utilities for shared network MADDPG training.
+Environment utilities for shared network MADDPG/RMAPPO training.
 Provides physics-based constraint analysis and console debugging components.
 """
 
@@ -243,7 +243,7 @@ class StepTracer:
         to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
 
         print("=" * 80)
-        print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D) - Shared Network")
+        print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D)")
         print("=" * 80)
         print(f"Showing first {len(to_show)} of {self.num_envs} environments")
 
