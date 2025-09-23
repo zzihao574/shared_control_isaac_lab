@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
-from utils.training_helpers import (
+from scripts.utils.training_helpers_maddpg import (
     WandBLogger, TrainingConfiguration, create_argument_parser, 
     MetricsHub, TopKModelManager, TrainingRunner, MilestoneEvaluator, save_final_shared_networks
 )

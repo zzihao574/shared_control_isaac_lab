@@ -669,7 +669,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     if config_path is None:
         # Adjust path based on actual file location
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params.yaml')
+        config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_maddpg.yaml')
 
     parser = argparse.ArgumentParser(description="MADDPG multi-environment parallel training with residual networks")
     parser.add_argument("--config", type=str, default=config_path)

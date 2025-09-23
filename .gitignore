@@ -11,9 +11,11 @@
 /scripts/*
 !/scripts/train_surgical.py
 !/scripts/train_maddpg.py
+!/scripts/train_rmappo.py
 !/scripts/utils/
 /scripts/utils/*
-!/scripts/utils/training_helpers.py
+!/scripts/utils/training_helpers_maddpg.py
+!/scripts/utils/training_helpers_rmappo.py
 !/src/
 
 # 忽略缓存
