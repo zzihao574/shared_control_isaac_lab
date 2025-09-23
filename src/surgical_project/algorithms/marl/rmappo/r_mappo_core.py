@@ -6,7 +6,7 @@ Simplified naming: RMAPPOPolicy (policy) + RMAPPOTrainer (algorithm).
 import numpy as np
 import torch
 import torch.nn as nn
-from .utils import init, check, get_shape_from_obs_space, ACTLayer, PopArt
+from .mappo_utils import init, check, get_shape_from_obs_space, ACTLayer, PopArt
 from .rnn import RNNLayer
 
 
@@ -25,7 +25,6 @@ class R_Actor(nn.Module):
         
         self._gain = args.get('gain', 0.01)
         self._use_orthogonal = args.get('use_orthogonal', True)
-        self._use_policy_active_masks = args.get('use_policy_active_masks', True)
         self._recurrent_N = args.get('recurrent_N', 1)
         self.tpdv = dict(dtype=torch.float32, device=device)
 
@@ -46,37 +45,30 @@ class R_Actor(nn.Module):
 
         self.to(device)
 
-    def forward(self, obs, rnn_states, masks, available_actions=None, deterministic=False):
+    def forward(self, obs, rnn_states, masks, deterministic=False):
         """Compute actions from the given inputs."""
         obs = check(obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
-        if available_actions is not None:
-            available_actions = check(available_actions).to(**self.tpdv)
 
         actor_features = self.base(obs)
         actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
-        actions, action_log_probs = self.act(actor_features, available_actions, deterministic)
+        actions, action_log_probs = self.act(actor_features, available_actions=None, deterministic=deterministic)
 
         return actions, action_log_probs, rnn_states
 
-    def evaluate_actions(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
+    def evaluate_actions(self, obs, rnn_states, action, masks):
         """Compute log probability and entropy of given actions."""
         obs = check(obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
         action = check(action).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
-        if available_actions is not None:
-            available_actions = check(available_actions).to(**self.tpdv)
-        if active_masks is not None:
-            active_masks = check(active_masks).to(**self.tpdv)
 
         actor_features = self.base(obs)
         actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
 
         action_log_probs, dist_entropy = self.act.evaluate_actions(
-            actor_features, action, available_actions,
-            active_masks=active_masks if self._use_policy_active_masks else None
+            actor_features, action, available_actions=None, active_masks=None
         )
 
         return action_log_probs, dist_entropy
@@ -133,7 +125,7 @@ class R_Critic(nn.Module):
 
 
 # =============================================================================
-# POLICY WRAPPER - 重命名为更清晰的名称
+# POLICY WRAPPER
 # =============================================================================
 
 class RMAPPOPolicy:
@@ -197,11 +189,10 @@ class RMAPPOPolicy:
         update_linear_schedule(self.actor_optimizer, episode, episodes, self.actor_lr)
         update_linear_schedule(self.critic_optimizer, episode, episodes, self.critic_lr)
 
-    def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, 
-                    available_actions=None, deterministic=False):
+    def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, deterministic=False):
         """Compute actions and value function predictions."""
         actions, action_log_probs, rnn_states_actor = self.actor(
-            obs, rnn_states_actor, masks, available_actions, deterministic
+            obs, rnn_states_actor, masks, deterministic
         )
 
         values, rnn_states_critic = self.critic(cent_obs, rnn_states_critic, masks)
@@ -213,27 +204,26 @@ class RMAPPOPolicy:
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values
 
-    def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, 
-                        masks, available_actions=None, active_masks=None):
+    def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks):
         """Get action logprobs / entropy and value function predictions for update."""
         action_log_probs, dist_entropy = self.actor.evaluate_actions(
-            obs, rnn_states_actor, action, masks, available_actions, active_masks
+            obs, rnn_states_actor, action, masks
         )
 
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         
         return values, action_log_probs, dist_entropy
 
-    def act(self, obs, rnn_states_actor, masks, available_actions=None, deterministic=False):
+    def act(self, obs, rnn_states_actor, masks, deterministic=False):
         """Compute actions using the given inputs."""
         actions, _, rnn_states_actor = self.actor(
-            obs, rnn_states_actor, masks, available_actions, deterministic
+            obs, rnn_states_actor, masks, deterministic
         )
         return actions, rnn_states_actor
 
 
 # =============================================================================
-# ALGORITHM TRAINER - 重命名为更清晰的名称
+# ALGORITHM TRAINER
 # =============================================================================
 
 def get_gard_norm(parameters):
@@ -319,8 +309,6 @@ class RMAPPOTrainer:
         self._use_clipped_value_loss = args.get('use_clipped_value_loss', False)
         self._use_popart = args.get('use_popart', False)
         self._use_valuenorm = args.get('use_valuenorm', False)
-        self._use_value_active_masks = args.get('use_value_active_masks', True)
-        self._use_policy_active_masks = args.get('use_policy_active_masks', True)
 
         assert (self._use_popart and self._use_valuenorm) == False, (
             "use_popart and use_valuenorm cannot be both True")
@@ -332,7 +320,7 @@ class RMAPPOTrainer:
         else:
             self.value_normalizer = None
 
-    def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
+    def cal_value_loss(self, values, value_preds_batch, return_batch):
         """Calculate value function loss. Always use Huber loss."""
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.clip_param, self.clip_param)
         
@@ -353,29 +341,28 @@ class RMAPPOTrainer:
         else:
             value_loss = value_loss_original
 
-        if self._use_value_active_masks:
-            value_loss = (value_loss * active_masks_batch).sum() / active_masks_batch.sum()
-        else:
-            value_loss = value_loss.mean()
+        value_loss = value_loss.mean()
 
         return value_loss
 
     def ppo_update(self, sample, update_actor=True):
-        """Single PPO update step."""
-        share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
-        value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
-        adv_targ, available_actions_batch = sample
-
-        old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
-        adv_targ = check(adv_targ).to(**self.tpdv)
-        value_preds_batch = check(value_preds_batch).to(**self.tpdv)
-        return_batch = check(return_batch).to(**self.tpdv)
-        active_masks_batch = check(active_masks_batch).to(**self.tpdv)
+        """Single PPO update step. Modified to use dict access instead of unpacking."""
+        # Use dict access instead of positional unpacking
+        share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)
+        obs_batch = check(sample["obs"]).to(**self.tpdv)
+        rnn_states_batch = check(sample["rnn_states_actor"]).to(**self.tpdv)
+        rnn_states_critic_batch = check(sample["rnn_states_critic"]).to(**self.tpdv)
+        actions_batch = check(sample["actions"]).to(**self.tpdv)
+        value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)
+        return_batch = check(sample["returns"]).to(**self.tpdv)
+        masks_batch = check(sample["masks"]).to(**self.tpdv)
+        old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)
+        adv_targ = check(sample["advantages"]).to(**self.tpdv)
 
         # Reshape to do in a single forward pass for all steps
         values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
             share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch,
-            actions_batch, masks_batch, available_actions_batch, active_masks_batch
+            actions_batch, masks_batch
         )
         
         # Actor update
@@ -384,11 +371,7 @@ class RMAPPOTrainer:
         surr1 = imp_weights * adv_targ
         surr2 = torch.clamp(imp_weights, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv_targ
 
-        if self._use_policy_active_masks:
-            policy_action_loss = (-torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum()
-        else:
-            policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
-
+        policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
         policy_loss = policy_action_loss
 
         self.policy.actor_optimizer.zero_grad()
@@ -402,7 +385,7 @@ class RMAPPOTrainer:
         self.policy.actor_optimizer.step()
 
         # Critic update
-        value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
+        value_loss = self.cal_value_loss(values, value_preds_batch, return_batch)
 
         self.policy.critic_optimizer.zero_grad()
 
@@ -424,9 +407,9 @@ class RMAPPOTrainer:
         else:
             advantages = buffer.returns - buffer.value_preds
         
-        # Advantage normalization
+        # Advantage normalization using masks instead of active_masks
         advantages_copy = advantages.clone()
-        advantages_copy[buffer.active_masks == 0.0] = float('nan')
+        advantages_copy[buffer.masks == 0.0] = float('nan')
         mean_advantages = torch.nanmean(advantages_copy)
         std_advantages = torch.nanstd(advantages_copy)
         advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)

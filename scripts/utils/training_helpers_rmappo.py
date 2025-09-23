@@ -50,7 +50,7 @@ class RMAPPOTrainingRunner:
         if max_global_steps is not None and max_global_steps > 0:
             self.max_global_steps = int(max_global_steps)
         else:
-            self.max_global_steps = int(rmappo_wrapper.params.get('max_global_steps', 200000))
+            self.max_global_steps = int(rmappo_wrapper.params.get('ppo', {}).get('max_global_steps', 200000))
         
         print(f"[RMAPPO RUNNER] Configured:")
         print(f"  Rollout horizon: {self.T}")
@@ -69,9 +69,9 @@ class RMAPPOTrainingRunner:
             
         episode_count = 0
         
-        # Collect complete rollout (T steps)
+        # Collect complete rollout (T steps) - no noise scheduling for rMAPPO
         for rollout_step in range(self.T):
-            # Select actions (no noise scheduling in rMAPPO)
+            # Select actions (on-policy, no noise scaling)
             actions, detail = self.rmappo.select_actions(current_obs, add_noise=True, noise_scale=1.0)
 
             # Environment interaction
@@ -114,7 +114,7 @@ class RMAPPOTrainingRunner:
         self.global_step += self.T * self.rmappo.num_envs
         self.global_episodes += episode_count
 
-        # Unified logging
+        # Unified logging (removed noise_scale)
         if stats and stats.get("training/policy_updates", 0) > 0:
             payload = {
                 # rMAPPO specific metrics
@@ -128,7 +128,6 @@ class RMAPPOTrainingRunner:
                 "train/episodes_done": self.global_episodes,
                 "training/policy_updates": stats.get("training/policy_updates", 0),
                 "training/value_updates": stats.get("training/value_updates", 0),
-                "exploration/noise_scale": 1.0,  # rMAPPO doesn't use noise scheduling
             }
             # Clean None values
             payload = {k: v for k, v in payload.items() if v is not None}
@@ -237,6 +236,11 @@ class RMAPPOMilestoneEvaluator:
         self.metrics.push_milestone(global_step, milestone, payload)
         
         print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
+
+        # CRITICAL FIX: Reset RNN states after evaluation
+        print(f"[EVAL] Resetting RNN states after evaluation...")
+        self.rmappo.rnn_states_actor.zero_()
+        self.rmappo.rnn_states_critic.zero_()
 
         return {"skip_episode_once": True}
 
@@ -426,13 +430,13 @@ class WandBLogger:
         'grad_norm/critic': 'model/{}/grad_norm_critic',
     }
     
+    # Removed exploration/noise_scale from global metrics
     GLOBAL_METRICS_MAP = {
         "model/entropy": "model/entropy",
         "model/ratio": "model/ppo_ratio",
         "train/episodes_done": "train/global_episodes", 
         "training/policy_updates": "train/policy_updates",
         "training/value_updates": "train/value_updates",
-        "exploration/noise_scale": "exploration/noise_scale",
         "eval/return_mean": "milestone/actor_return",
         "milestone/topk_best_score": "milestone/topk_best_return",
         "milestone/latest_completed": "milestone/latest_completed",

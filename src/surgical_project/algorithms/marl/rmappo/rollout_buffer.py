@@ -20,7 +20,6 @@ class SharedRolloutBuffer:
         self.value_preds = torch.zeros(T, N, 1, device=device)
         self.rewards = torch.zeros(T, N, 1, device=device)
         self.masks = torch.ones(T, N, 1, device=device)
-        self.active_masks = torch.ones(T, N, 1, device=device)
 
         # RNN states (state BEFORE consuming obs[t])
         self.rnn_states_actor  = torch.zeros(T, N, rnn_hidden_dim, device=device)
@@ -32,8 +31,7 @@ class SharedRolloutBuffer:
         self.step = 0
 
     def insert(self, t, *, obs, share_obs, actions, action_log_probs,
-               value_preds, rewards, masks, active_masks,
-               rnn_states_actor, rnn_states_critic):
+               value_preds, rewards, masks, rnn_states_actor, rnn_states_critic):
         assert t == self.step, f"insert step mismatch: {t} vs {self.step}"
         self.obs[t].copy_(obs)
         self.share_obs[t].copy_(share_obs)
@@ -42,7 +40,6 @@ class SharedRolloutBuffer:
         self.value_preds[t].copy_(value_preds)
         self.rewards[t].copy_(rewards)
         self.masks[t].copy_(masks)
-        self.active_masks[t].copy_(active_masks)
         self.rnn_states_actor[t].copy_(rnn_states_actor)
         self.rnn_states_critic[t].copy_(rnn_states_critic)
         self.step += 1
@@ -68,9 +65,9 @@ class SharedRolloutBuffer:
         self.advantages.copy_(advantages)
         self.returns = self.advantages + self.value_preds
 
-        # Advantage normalization w.r.t. active masks
+        # Advantage normalization w.r.t. masks only
         flat_adv = self.advantages.view(T * N, 1)
-        valid = self.active_masks.view(T * N, 1) > 0.5
+        valid = self.masks.view(T * N, 1) > 0.5
         mean = flat_adv[valid].mean()
         std = flat_adv[valid].std().clamp_min(1e-6)
         self.advantages = (self.advantages - mean) / std
@@ -93,7 +90,7 @@ class SharedRolloutBuffer:
             idx = perm[mb * mb_size:(mb + 1) * mb_size]
 
             obs_lst, s_obs_lst, act_lst, logp_lst = [], [], [], []
-            vp_lst, ret_lst, adv_lst, mask_lst, a_mask_lst = [], [], [], [], []
+            vp_lst, ret_lst, adv_lst, mask_lst = [], [], [], []
             rnn_a0_lst, rnn_c0_lst = [], []
 
             for k in idx:
@@ -109,7 +106,6 @@ class SharedRolloutBuffer:
                 ret_lst.append(self.returns[t0:t1, slot])
                 adv_lst.append(self.advantages[t0:t1, slot])
                 mask_lst.append(self.masks[t0:t1, slot])
-                a_mask_lst.append(self.active_masks[t0:t1, slot])
 
                 rnn_a0_lst.append(self.rnn_states_actor[t0, slot])
                 rnn_c0_lst.append(self.rnn_states_critic[t0, slot])
@@ -123,7 +119,6 @@ class SharedRolloutBuffer:
                 "returns": torch.stack(ret_lst, dim=1),          # [L, B, 1]
                 "advantages": torch.stack(adv_lst, dim=1),       # [L, B, 1]
                 "masks": torch.stack(mask_lst, dim=1),           # [L, B, 1]
-                "active_masks": torch.stack(a_mask_lst, dim=1),  # [L, B, 1]
                 "rnn_states_actor": torch.stack(rnn_a0_lst, dim=0),   # [B, H]
                 "rnn_states_critic": torch.stack(rnn_c0_lst, dim=0),  # [B, H]
             }

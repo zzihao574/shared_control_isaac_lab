@@ -200,7 +200,10 @@ class RMAPPOWrapper:
         return obs_tensor, share_obs_tensor
 
     def actions_to_env_format(self, actions_norm):
-        """Convert normalized actions to environment format."""
+        """Convert normalized actions to environment format with clamping."""
+        # CRITICAL FIX: Clamp actions to [-1, 1] before scaling
+        actions_norm = actions_norm.clamp(-1.0, 1.0)
+        
         N = actions_norm.shape[0]
         E = N // 2
         
@@ -230,7 +233,7 @@ class RMAPPOWrapper:
                 masks, deterministic=deterministic
             )
         
-        # Convert to environment format
+        # Convert to environment format (with clamping)
         env_actions = self.actions_to_env_format(actions_norm)
         
         # Store for rollout collection (if not in eval mode)
@@ -243,7 +246,7 @@ class RMAPPOWrapper:
         
         # Create detail info for StepTracer
         detail = {
-            "mean_actions": env_actions.copy(),
+            "mean_actions": {k: v.clone() for k, v in env_actions.items()},
             "noise_actions": {
                 "human": torch.zeros_like(env_actions["human"]),
                 "robot": torch.zeros_like(env_actions["robot"])
@@ -287,9 +290,8 @@ class RMAPPOWrapper:
         
         rewards_tensor = torch.tensor(reward_slots, device=self.device, dtype=torch.float32).unsqueeze(-1)
         next_masks = torch.tensor([0.0 if d else 1.0 for d in done_slots], device=self.device, dtype=torch.float32).unsqueeze(-1)
-        active_masks = next_masks.clone()
         
-        # Insert into buffer
+        # Insert into buffer (removed active_masks)
         self.buffer.insert(
             t=self.rollout_step,
             obs=self._current_step_data['obs'],
@@ -299,7 +301,6 @@ class RMAPPOWrapper:
             value_preds=self._current_step_data['value_preds'],
             rewards=rewards_tensor,
             masks=next_masks,
-            active_masks=active_masks,
             rnn_states_actor=self._current_step_data['rnn_states_actor'],
             rnn_states_critic=self._current_step_data['rnn_states_critic']
         )
@@ -442,7 +443,7 @@ class RMAPPOTrainer:
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
         # Unified max_global_steps logic
-        yaml_max_steps = int(self.config.params.get('max_global_steps', 200000))
+        yaml_max_steps = int(self.config.params.get('ppo', {}).get('max_global_steps', 200000))
         
         if self.args.max_global_steps > 0:
             self.max_global_steps = self.args.max_global_steps
@@ -527,7 +528,6 @@ class RMAPPOTrainer:
             if self.wandb_logger.enabled:
                 initial_stats = {
                     "train/episodes_done": 0,
-                    "exploration/noise_scale": 1.0,
                 }
                 self.metrics_hub.push_update(0, initial_stats)
             

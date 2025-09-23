@@ -1,5 +1,5 @@
 # Training parameters configuration with residual connections
-# Features configurable network layers, exponential noise scheduling, and per-env scaling
+# Features configurable network layers and per-env scaling
 
 # ==============================================================================
 # Global Settings
@@ -29,14 +29,6 @@ networks:
 obs_scaling:
   # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
   factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
-
-# ==============================================================================
-# Exploration Configuration
-# ==============================================================================
-exploration:
-  sigma_start: 0.6   # Initial noise = 0.6 × max_action
-  sigma_end: 0.1     # Final noise = 0.1 × max_action
-  decay_k: 3.0       # Decay rate for exponential schedule
 
 # ==============================================================================
 # Logging Configuration
@@ -157,20 +149,53 @@ termination_conditions:
   z_below_zero: false                 # Disable Z termination for now
   edge_collision: false               # Enable direct termination on obstacle entry
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
+
+# ==============================================================================
+# Rollout Configuration
+# ==============================================================================
+rollout_horizon: 256                  # Number of steps per rollout
+
+# ==============================================================================
+# PPO Algorithm Configuration
+# ==============================================================================
+ppo:
+  # Learning rates
+  actor_lr: 0.0007                    # Actor learning rate
+  critic_lr: 0.001                    # Critic learning rate
   
-# ==============================================================================
-# MADDPG Algorithm Configuration - Optimized for Shared Networks with Residuals
-# ==============================================================================
-maddpg_config:
-  lr_actor: 0.0007                    # Actor learning rate
-  lr_critic: 0.001                    # Critic learning rate
-  gamma: 0.99                        # Discount factor
-  batch_size: 1024                    # Training batch size (increased for stability)
-  max_global_steps: 200000           # Primary termination condition: stop after this many training steps
-  update_interval: 10                 # Updates every N steps
-  min_buffer_size: 6000              # Minimum buffer size to start training (per-env baseline)
-  tau: 0.002                         # Target network update rate (slower for stability)
-  max_replay_buffer_len: 7200       # Maximum replay buffer size (per-env baseline)
+  # Discount and GAE
+  gamma: 0.99                         # Discount factor
+  gae_lambda: 0.95                    # GAE lambda
+  
+  # PPO specific
+  clip_param: 0.2                     # PPO clipping parameter
+  ppo_epoch: 10                       # Number of PPO epochs per update
+  num_mini_batch: 4                   # Number of mini-batches per epoch
+  data_chunk_length: 16               # RNN sequence length for training
+  
+  # Loss coefficients
+  value_loss_coef: 0.5                # Value function loss coefficient
+  entropy_coef: 0.01                  # Entropy regularization coefficient
+  
+  # Optimization
+  max_grad_norm: 0.5                  # Gradient clipping threshold
+  opt_eps: 1e-5                       # Optimizer epsilon
+  weight_decay: 0.0                   # Weight decay
+  
+  # Network architecture
+  hidden_size: 256                    # Hidden layer size
+  recurrent_N: 1                      # Number of RNN layers
+  use_orthogonal: true                # Use orthogonal initialization
+  gain: 0.01                          # Initialization gain
+  
+  # Value normalization options
+  use_popart: false                   # Use PopArt normalization
+  use_valuenorm: false                # Use value normalization
+  use_clipped_value_loss: false       # Use clipped value loss
+  huber_delta: 1.0                    # Huber loss delta
+  
+  # Training termination
+  max_global_steps: 200000            # Primary termination condition: stop after this many training steps
 
 # ==============================================================================
 # Training Monitoring
