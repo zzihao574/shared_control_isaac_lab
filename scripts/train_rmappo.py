@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-rMAPPO training script with dedicated rMAPPO training helpers integration.
+rMAPPO training script with dual independent networks integration.
 Features same CLI interface as MADDPG, complete training infrastructure reuse.
 """
 
@@ -10,6 +10,8 @@ import os
 import torch
 import numpy as np
 import random
+import copy
+import yaml
 from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import warnings
@@ -59,9 +61,33 @@ def setup_environment(args, config):
     return env, env_cfg
 
 
+def load_dual_network_config(config_path: str):
+    """Load YAML config and merge agent-specific parameters."""
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    
+    common = cfg.get("algo", cfg)  # Fallback to root if no 'algo' section
+    per_agent = cfg.get("agents", {})
+    
+    def merge_config_for_agent(agent_id: str):
+        final = copy.deepcopy(common)
+        agent_overrides = per_agent.get(agent_id, {})
+        final.update(agent_overrides)
+        return final
+    
+    return {
+        "human": merge_config_for_agent("human"),
+        "robot": merge_config_for_agent("robot"),
+        "common": common,
+        "raw_config": cfg
+    }
+
+
 def initialize_rmappo_algorithm(env, config, args):
-    """Create and initialize rMAPPO algorithm wrapper."""
-    from surgical_project.algorithms.ppo import R_MAPPO, RMAPPO, SharedRolloutBuffer
+    """Create and initialize dual rMAPPO algorithm wrapper."""
+    # ✅ 修正后的导入路径
+    from surgical_project.algorithms.marl.rmappo.r_mappo_core import RMAPPOPolicy, RMAPPOTrainer
+    from surgical_project.algorithms.marl.rmappo.rollout_buffer import SharedRolloutBuffer
     
     device = config.get_compute_device()
     
@@ -77,41 +103,20 @@ def initialize_rmappo_algorithm(env, config, args):
     obs_dim = int(obs_dict["human"].shape[1])
     share_obs_dim = obs_dim * 2  # Centralized: human||robot
     act_dim = 3
-    num_agents = 2
-    N = num_envs * num_agents
 
-    print(f"[RMAPPO] Architecture:")
+    print(f"[RMAPPO] Dual Network Architecture:")
     print(f"  Environments: {num_envs}")
-    print(f"  Agents: {num_agents} (human, robot)")
+    print(f"  Agents: human, robot (independent networks)")
     print(f"  Obs dim: {obs_dim}, Share obs dim: {share_obs_dim}")
     print(f"  Action dim: {act_dim}")
-    print(f"  Total slots: {N}")
 
-    # Create policy
-    ppo_config = config.params.get('ppo', {})
-    policy = R_MAPPO(
-        obs_space_desc={'shape': (obs_dim,)},
-        cent_obs_space_desc={'shape': (share_obs_dim,)},
-        act_space_desc={'shape': (act_dim,)},
-        device=device,
-        args=ppo_config,
+    # Load dual config
+    dual_config = load_dual_network_config(args.config)
+    
+    # Create wrapper with dual configs
+    return DualRMAPPOWrapper(
+        dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, config.params
     )
-
-    # Create trainer
-    trainer = RMAPPO(
-        args=ppo_config,
-        policy=policy,
-        device=device
-    )
-
-    # Create buffer
-    T = int(config.params.get('rollout_horizon', 256))
-    buffer = SharedRolloutBuffer(
-        T=T, N=N, obs_dim=obs_dim, share_obs_dim=share_obs_dim,
-        act_dim=act_dim, rnn_hidden_dim=ppo_config.get('hidden_size', 256), device=device
-    )
-
-    return RMAPPOWrapper(policy, trainer, buffer, config.params, device, num_envs)
 
 
 def inject_step_tracer(env, config, num_envs):
@@ -130,231 +135,277 @@ def inject_step_tracer(env, config, num_envs):
     print(f"  Console logging: {'enabled' if actual_env.step_tracer.enable_console_logging else 'disabled'}")
 
 
-class RMAPPOWrapper:
-    """Wrapper to make rMAPPO compatible with existing training infrastructure."""
+class DualRMAPPOWrapper:
+    """
+    Dual independent network rMAPPO wrapper.
+    Manages two completely separate networks with synchronized training.
+    """
     
-    def __init__(self, policy, trainer, buffer, params, device, num_envs):
-        self.policy = policy
-        self.trainer = trainer
-        self.buffer = buffer
-        self.params = params
+    def __init__(self, dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, params):
+        # ✅ 修正后的导入路径 
+        from surgical_project.algorithms.marl.rmappo.r_mappo_core import RMAPPOPolicy, RMAPPOTrainer
+        from surgical_project.algorithms.marl.rmappo.rollout_buffer import SharedRolloutBuffer
+        
         self.device = device
         self.num_envs = num_envs
-        
-        # Get agent configuration
+        self.params = params
         self.agent_ids = ["human", "robot"]
-        self.num_agents = len(self.agent_ids)
         
-        # RNN states
-        H = params.get('ppo', {}).get('hidden_size', 256)
-        N = num_envs * self.num_agents
-        self.rnn_states_actor = torch.zeros(N, H, device=device)
-        self.rnn_states_critic = torch.zeros(N, H, device=device)
-        
-        # Rollout collection state
-        self.rollout_step = 0
+        # Rollout parameters
         self.T = int(params.get('rollout_horizon', 256))
+        self.rollout_step = 0
         
-        # Force limits
+        # Force constraints
         constraints = params.get('constraints', {})
         self.max_robot_force = float(constraints.get('max_robot_force', 0.04))
         self.max_human_force = float(constraints.get('max_human_force', 0.04))
         
+        # Create space descriptors
+        obs_space_desc = {'shape': (obs_dim,)}
+        cent_obs_space_desc = {'shape': (share_obs_dim,)}
+        act_space_desc = {'shape': (act_dim,)}
+        
+        # Initialize dual networks
+        self.policies = {}
+        self.trainers = {}
+        self.buffers = {}
+        self.rnn_states = {}
+        
+        # 1. Initialize human network first
+        human_config = dual_config["human"]
+        pol_h = RMAPPOPolicy(
+            obs_space_desc=obs_space_desc,
+            cent_obs_space_desc=cent_obs_space_desc, 
+            act_space_desc=act_space_desc,
+            device=device,
+            args=human_config
+        )
+        trn_h = RMAPPOTrainer(args=human_config, policy=pol_h, device=device)
+        buf_h = SharedRolloutBuffer(
+            T=self.T, N=num_envs, obs_dim=obs_dim, share_obs_dim=share_obs_dim,
+            act_dim=act_dim, rnn_hidden_dim=human_config.get('hidden_size', 256), device=device
+        )
+        
+        self.policies["human"] = pol_h
+        self.trainers["human"] = trn_h 
+        self.buffers["human"] = buf_h
+        self.rnn_states["human"] = {
+            "actor": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
+            "critic": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
+        }
+        
+        # 2. Initialize robot network and copy weights from human
+        robot_config = dual_config["robot"]
+        pol_r = RMAPPOPolicy(
+            obs_space_desc=obs_space_desc,
+            cent_obs_space_desc=cent_obs_space_desc,
+            act_space_desc=act_space_desc, 
+            device=device,
+            args=robot_config
+        )
+        trn_r = RMAPPOTrainer(args=robot_config, policy=pol_r, device=device)
+        buf_r = SharedRolloutBuffer(
+            T=self.T, N=num_envs, obs_dim=obs_dim, share_obs_dim=share_obs_dim,
+            act_dim=act_dim, rnn_hidden_dim=robot_config.get('hidden_size', 256), device=device
+        )
+        
+        # ✅ Copy human weights to robot for identical initialization
+        pol_r.actor.load_state_dict(pol_h.actor.state_dict())
+        pol_r.critic.load_state_dict(pol_h.critic.state_dict())
+        
+        self.policies["robot"] = pol_r
+        self.trainers["robot"] = trn_r
+        self.buffers["robot"] = buf_r
+        self.rnn_states["robot"] = {
+            "actor": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
+            "critic": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
+        }
+        
         # Eval mode flag
         self._is_eval_mode = False
         
-        print(f"[RMAPPO WRAPPER] Initialized:")
+        print(f"[DUAL RMAPPO] Initialized:")
         print(f"  Rollout horizon: {self.T}")
-        print(f"  RNN hidden size: {H}")
+        print(f"  Networks: independent human & robot")
+        print(f"  Initial weights: robot copied from human")
         print(f"  Force limits: robot={self.max_robot_force}, human={self.max_human_force}")
 
     def set_eval_mode(self, is_eval: bool):
-        """Set evaluation mode."""
+        """Set evaluation mode for both networks."""
         self._is_eval_mode = is_eval
-        if is_eval:
-            self.trainer.prep_rollout()
-        else:
-            self.trainer.prep_training()
+        for aid in self.agent_ids:
+            if is_eval:
+                self.trainers[aid].prep_rollout()
+            else:
+                self.trainers[aid].prep_training()
 
-    def build_obs_tensors(self, obs_dict):
-        """Convert obs dict to tensors for rMAPPO."""
-        human = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
-        robot = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
-        E = human.shape[0]
+    def build_obs_tensors(self, obs_dict, agent_id: str):
+        """Convert agent-specific obs dict to tensors."""
+        obs = torch.as_tensor(obs_dict[agent_id], device=self.device, dtype=torch.float32)
         
-        # Local observations: [human0, robot0, human1, robot1, ...]
-        obs_slots = []
-        for e in range(E):
-            obs_slots.append(human[e])
-            obs_slots.append(robot[e])
-        obs_tensor = torch.stack(obs_slots, dim=0)  # [N, obs_dim]
+        # Build centralized observation (human||robot) for each environment
+        human_obs = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
+        robot_obs = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
+        share_obs = torch.cat([human_obs, robot_obs], dim=1)  # [E, 2*obs_dim]
         
-        # Shared observations: centralized [human||robot] for each slot
-        share_tensor_per_env = torch.cat([human, robot], dim=1)  # [E, 2*obs_dim]
-        share_slots = []
-        for e in range(E):
-            share_slots.append(share_tensor_per_env[e])  # human||robot
-            share_slots.append(share_tensor_per_env[e])  # same for robot slot
-        share_obs_tensor = torch.stack(share_slots, dim=0)  # [N, 2*obs_dim]
-        
-        return obs_tensor, share_obs_tensor
+        return obs, share_obs
 
-    def actions_to_env_format(self, actions_norm):
-        """Convert normalized actions to environment format with clamping."""
-        # CRITICAL FIX: Clamp actions to [-1, 1] before scaling
-        actions_norm = actions_norm.clamp(-1.0, 1.0)
+    def actions_to_env_format(self, actions_dict):
+        """Convert normalized actions to environment format with per-agent clamping."""
+        env_actions = {}
+        force_limits = {"human": self.max_human_force, "robot": self.max_robot_force}
         
-        N = actions_norm.shape[0]
-        E = N // 2
-        
-        human_actions, robot_actions = [], []
-        for e in range(E):
-            human_act = actions_norm[2*e] * self.max_human_force
-            robot_act = actions_norm[2*e+1] * self.max_robot_force
-            human_actions.append(human_act)
-            robot_actions.append(robot_act)
+        for aid, actions_norm in actions_dict.items():
+            # Clamp to [-1, 1] then scale by agent-specific limits
+            actions_norm = actions_norm.clamp(-1.0, 1.0)
+            env_actions[aid] = actions_norm * force_limits[aid]
             
-        return {
-            "human": torch.stack(human_actions, dim=0),
-            "robot": torch.stack(robot_actions, dim=0)
-        }
+        return env_actions
 
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0):
-        """Generate actions compatible with training loop."""
-        obs_tensor, share_obs_tensor = self.build_obs_tensors(observations)
-        masks = torch.ones(obs_tensor.shape[0], 1, device=self.device)
+        """Generate actions from both networks independently."""
+        actions_norm = {}
+        action_log_probs = {}
+        values = {}
         
-        # Get actions from policy (deterministic in eval mode)
+        # Determine if deterministic (eval mode or no noise)
         deterministic = self._is_eval_mode or not add_noise
         
-        with torch.no_grad():
-            values, actions_norm, action_log_probs, rnn_a_new, rnn_c_new = self.policy.get_actions(
-                share_obs_tensor, obs_tensor, self.rnn_states_actor, self.rnn_states_critic, 
-                masks, deterministic=deterministic
-            )
+        for aid in self.agent_ids:
+            obs, share_obs = self.build_obs_tensors(observations, aid)
+            masks = torch.ones(obs.shape[0], 1, device=self.device)
+            
+            with torch.no_grad():
+                v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
+                    share_obs, obs, 
+                    self.rnn_states[aid]["actor"], self.rnn_states[aid]["critic"],
+                    masks, deterministic=deterministic
+                )
+            
+            actions_norm[aid] = a
+            action_log_probs[aid] = lp
+            values[aid] = v
+            
+            # Update RNN states (if not in eval mode)
+            if not self._is_eval_mode:
+                self.rnn_states[aid]["actor"] = rnn_a_new
+                self.rnn_states[aid]["critic"] = rnn_c_new
         
-        # Convert to environment format (with clamping)
+        # Convert to environment format
         env_actions = self.actions_to_env_format(actions_norm)
         
-        # Store for rollout collection (if not in eval mode)
+        # Store rollout data (if not in eval mode)
         if not self._is_eval_mode:
-            self._store_rollout_data(obs_tensor, share_obs_tensor, actions_norm, 
-                                   action_log_probs, values, masks)
-            # Update RNN states
-            self.rnn_states_actor = rnn_a_new
-            self.rnn_states_critic = rnn_c_new
+            self._store_rollout_data(observations, actions_norm, action_log_probs, values)
         
         # Create detail info for StepTracer
         detail = {
             "mean_actions": {k: v.clone() for k, v in env_actions.items()},
             "noise_actions": {
-                "human": torch.zeros_like(env_actions["human"]),
-                "robot": torch.zeros_like(env_actions["robot"])
+                aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids
             }
         }
         
         return env_actions, detail
 
-    def _store_rollout_data(self, obs_tensor, share_obs_tensor, actions_norm, 
-                           action_log_probs, values, masks):
-        """Store data for current rollout step."""
-        # This will be called by add_experience_to_buffer with reward/done info
-        self._current_step_data = {
-            'obs': obs_tensor,
-            'share_obs': share_obs_tensor,
-            'actions': actions_norm,
-            'action_log_probs': action_log_probs,
-            'value_preds': values,
-            'masks': masks,
-            'rnn_states_actor': self.rnn_states_actor.clone(),
-            'rnn_states_critic': self.rnn_states_critic.clone()
-        }
+    def _store_rollout_data(self, observations, actions_norm, action_log_probs, values):
+        """Store data for current rollout step (per-agent)."""
+        self._current_step_data = {}
+        for aid in self.agent_ids:
+            obs, share_obs = self.build_obs_tensors(observations, aid)
+            masks = torch.ones(obs.shape[0], 1, device=self.device)
+            
+            self._current_step_data[aid] = {
+                'obs': obs,
+                'share_obs': share_obs,
+                'actions': actions_norm[aid], 
+                'action_log_probs': action_log_probs[aid],
+                'value_preds': values[aid],
+                'masks': masks,
+                'rnn_states_actor': self.rnn_states[aid]["actor"].clone(),
+                'rnn_states_critic': self.rnn_states[aid]["critic"].clone()
+            }
 
     def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones):
-        """Add experience to rollout buffer."""
+        """Add experience to per-agent rollout buffers."""
         if self._is_eval_mode:
             return
             
-        # Process rewards and dones
-        E = self.num_envs
-        reward_slots, done_slots = [], []
-        
-        for e in range(E):
-            # Average human and robot rewards (or use separate - can be configured)
-            r_avg = (rewards["human"][e].item() + rewards["robot"][e].item()) / 2
-            reward_slots.extend([r_avg, r_avg])  # Same reward for both agents
+        for aid in self.agent_ids:
+            # Prepare rewards (use agent-specific rewards)
+            reward_tensor = rewards[aid].unsqueeze(-1) if len(rewards[aid].shape) == 1 else rewards[aid]
             
-            # OR logic for done
-            d = bool(dones["human"][e] or dones["robot"][e])
-            done_slots.extend([d, d])
-        
-        rewards_tensor = torch.tensor(reward_slots, device=self.device, dtype=torch.float32).unsqueeze(-1)
-        next_masks = torch.tensor([0.0 if d else 1.0 for d in done_slots], device=self.device, dtype=torch.float32).unsqueeze(-1)
-        
-        # Insert into buffer (removed active_masks)
-        self.buffer.insert(
-            t=self.rollout_step,
-            obs=self._current_step_data['obs'],
-            share_obs=self._current_step_data['share_obs'],
-            actions=self._current_step_data['actions'],
-            action_log_probs=self._current_step_data['action_log_probs'],
-            value_preds=self._current_step_data['value_preds'],
-            rewards=rewards_tensor,
-            masks=next_masks,
-            rnn_states_actor=self._current_step_data['rnn_states_actor'],
-            rnn_states_critic=self._current_step_data['rnn_states_critic']
-        )
-        
-        # Handle RNN state resets for done environments
-        if any(done_slots):
-            done_indices = torch.tensor([i for i, d in enumerate(done_slots) if d], device=self.device, dtype=torch.long)
-            self.rnn_states_actor.index_fill_(0, done_indices, 0.0)
-            self.rnn_states_critic.index_fill_(0, done_indices, 0.0)
+            # Prepare masks (0.0 if done, 1.0 otherwise)
+            done_mask = torch.where(dones[aid], 0.0, 1.0).unsqueeze(-1) if len(dones[aid].shape) == 1 else torch.where(dones[aid], 0.0, 1.0)
+            
+            # Insert into agent's buffer
+            self.buffers[aid].insert(
+                t=self.rollout_step,
+                obs=self._current_step_data[aid]['obs'],
+                share_obs=self._current_step_data[aid]['share_obs'],
+                actions=self._current_step_data[aid]['actions'],
+                action_log_probs=self._current_step_data[aid]['action_log_probs'],
+                value_preds=self._current_step_data[aid]['value_preds'],
+                rewards=reward_tensor,
+                masks=done_mask,
+                rnn_states_actor=self._current_step_data[aid]['rnn_states_actor'],
+                rnn_states_critic=self._current_step_data[aid]['rnn_states_critic']
+            )
+            
+            # Reset RNN states for done environments
+            done_indices = dones[aid].nonzero(as_tuple=False).squeeze(-1)
+            if done_indices.numel() > 0:
+                self.rnn_states[aid]["actor"][done_indices].zero_()
+                self.rnn_states[aid]["critic"][done_indices].zero_()
         
         self.rollout_step += 1
 
     def update(self):
-        """Perform rMAPPO update when rollout is complete."""
+        """Perform dual rMAPPO update when rollout is complete."""
         if self._is_eval_mode:
             return {}
             
         if self.rollout_step < self.T:
             return {}  # Not ready to update yet
         
-        # Bootstrap with final values
-        next_obs_dict = getattr(self, '_next_obs', None)
-        if next_obs_dict is not None:
-            _, share_obs_tensor = self.build_obs_tensors(next_obs_dict)
-            masks = torch.ones(share_obs_tensor.shape[0], 1, device=self.device)
+        stats = {}
+        
+        # Bootstrap and train each agent independently
+        for aid in self.agent_ids:
+            # Bootstrap with final values
+            next_obs_dict = getattr(self, '_next_obs', None)
+            if next_obs_dict is not None:
+                _, share_obs = self.build_obs_tensors(next_obs_dict, aid)
+                masks = torch.ones(share_obs.shape[0], 1, device=self.device)
+                
+                with torch.no_grad():
+                    last_values = self.policies[aid].get_values(
+                        share_obs, self.rnn_states[aid]["critic"], masks
+                    )
+            else:
+                last_values = torch.zeros(self.num_envs, 1, device=self.device)
             
-            with torch.no_grad():
-                last_values = self.policy.get_values(share_obs_tensor, self.rnn_states_critic, masks)
-        else:
-            last_values = torch.zeros(self.num_envs * self.num_agents, 1, device=self.device)
+            # Compute returns and advantages for this agent
+            gamma = self.params.get('ppo', {}).get('gamma', 0.99)
+            gae_lambda = self.params.get('ppo', {}).get('gae_lambda', 0.95)
+            self.buffers[aid].compute_returns_and_adv(last_values, gamma, gae_lambda)
+            
+            # Train this agent's networks
+            train_info = self.trainers[aid].train(self.buffers[aid])
+            
+            # Reset buffer
+            self.buffers[aid].after_update()
+            
+            # Store per-agent statistics  
+            for k, v in train_info.items():
+                stats[f"{k}/{aid}"] = v
         
-        # Compute returns and advantages
-        gamma = self.params.get('ppo', {}).get('gamma', 0.99)
-        gae_lambda = self.params.get('ppo', {}).get('gae_lambda', 0.95)
-        self.buffer.compute_returns_and_adv(last_values, gamma, gae_lambda)
-        
-        # Train
-        train_info = self.trainer.train(self.buffer)
-        
-        # Reset buffer
-        self.buffer.after_update()
+        # Reset rollout step
         self.rollout_step = 0
         
-        # Convert to expected format
-        stats = {
-            "training/policy_updates": 1,
-            "training/value_updates": 1,
-            "loss/actor": {"human": train_info.get('policy_loss', 0.0), "robot": train_info.get('policy_loss', 0.0)},
-            "loss/critic": {"human": train_info.get('value_loss', 0.0), "robot": train_info.get('value_loss', 0.0)},
-            "model/entropy": train_info.get('dist_entropy', 0.0),
-            "model/ratio": train_info.get('ratio', 1.0),
-            "grad_norm/actor": {"human": train_info.get('actor_grad_norm', 0.0), "robot": train_info.get('actor_grad_norm', 0.0)},
-            "grad_norm/critic": {"human": train_info.get('critic_grad_norm', 0.0), "robot": train_info.get('critic_grad_norm', 0.0)},
-        }
+        # Add unified training counters
+        stats["training/policy_updates"] = 2  # Both agents updated
+        stats["training/value_updates"] = 2
         
         return stats
 
@@ -364,11 +415,11 @@ class RMAPPOWrapper:
 
 
 class RMAPPOTrainer:
-    """Main rMAPPO trainer with unified infrastructure."""
+    """Main rMAPPO trainer with dual network infrastructure."""
     
     def __init__(self, args):
         self.args = args
-        print(f"[TRAINER] Initializing rMAPPO Trainer...")
+        print(f"[TRAINER] Initializing Dual rMAPPO Trainer...")
         
         self._setup_configuration()
         self._setup_environment()
@@ -377,7 +428,7 @@ class RMAPPOTrainer:
         self._setup_runners_and_evaluators()
         self._setup_milestone_management()
         
-        print(f"[TRAINER] rMAPPO Trainer initialized successfully")
+        print(f"[TRAINER] Dual rMAPPO Trainer initialized successfully")
 
     def _setup_configuration(self):
         """Load and setup training configuration."""
@@ -418,20 +469,20 @@ class RMAPPOTrainer:
     def _setup_logging_and_wandb(self):
         """Setup logging directory and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = f"logs/rmappo_final/{timestamp}"
+        self.log_dir = f"logs/rmappo_dual/{timestamp}"
         os.makedirs(self.log_dir, exist_ok=True)
         print(f"[SETUP] Log directory created: {self.log_dir}")
 
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
-            run_name = f"rmappo_final_{self.args.num_envs}envs_{timestamp}"
+            run_name = f"rmappo_dual_{self.args.num_envs}envs_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
             print(f"[SETUP] WandB initialized with run name: {run_name}")
 
     def _setup_training_components(self):
         """Initialize training components."""
-        print(f"[SETUP] Setting up rMAPPO training components...")
+        print(f"[SETUP] Setting up dual rMAPPO training components...")
         
         self.metrics_hub = MetricsHub()
         
@@ -459,7 +510,7 @@ class RMAPPOTrainer:
 
     def _setup_runners_and_evaluators(self):
         """Initialize training runner and evaluator."""
-        print(f"[SETUP] Creating rMAPPO TrainingRunner and MilestoneEvaluator...")
+        print(f"[SETUP] Creating dual rMAPPO TrainingRunner and MilestoneEvaluator...")
         
         self.runner = RMAPPOTrainingRunner(
             env=self.env,
@@ -518,7 +569,7 @@ class RMAPPOTrainer:
 
     def train(self):
         """Main training loop."""
-        print(f"[TRAIN] Starting rMAPPO training:")
+        print(f"[TRAIN] Starting dual rMAPPO training:")
         print(f"  Max steps: {self.max_global_steps}")
         print(f"  Rollout horizon: {self.rmappo.T}")
         print(f"  Milestone episodes: {self.milestone_episodes}")
@@ -569,9 +620,9 @@ class RMAPPOTrainer:
 
 
 def main():
-    """Main entry point for rMAPPO training."""
+    """Main entry point for dual rMAPPO training."""
     print("="*80)
-    print("rMAPPO Training with Dedicated Infrastructure")
+    print("Dual rMAPPO Training with Independent Networks")
     print("="*80)
     
     # Parse arguments (reuse existing parser)
@@ -591,7 +642,7 @@ def main():
     simulation_app = app_launcher.app
     
     try:
-        print(f"[MAIN] Creating rMAPPO Trainer...")
+        print(f"[MAIN] Creating Dual rMAPPO Trainer...")
         trainer = RMAPPOTrainer(args_cli)
         
         print(f"[MAIN] Starting training...")

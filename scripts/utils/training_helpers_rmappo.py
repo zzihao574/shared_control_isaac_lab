@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 """
-Training helper utilities for rMAPPO multi-environment parallel training.
+Training helper utilities for dual-network rMAPPO multi-environment parallel training.
 Features unified training execution, milestone evaluation, and optimized WandB logging.
-Adapted specifically for on-policy rollout collection and PPO updates.
+Adapted for independent human and robot networks with synchronized training.
 """
 
 import argparse
@@ -29,7 +29,7 @@ except ImportError:
 
 class RMAPPOTrainingRunner:
     """
-    Unified training loop executor for rMAPPO with rollout collection.
+    Unified training loop executor for dual-network rMAPPO with rollout collection.
     Features on-policy trajectory collection and unified global step tracking.
     """
     
@@ -52,12 +52,13 @@ class RMAPPOTrainingRunner:
         else:
             self.max_global_steps = int(rmappo_wrapper.params.get('ppo', {}).get('max_global_steps', 200000))
         
-        print(f"[RMAPPO RUNNER] Configured:")
+        print(f"[DUAL RMAPPO RUNNER] Configured:")
         print(f"  Rollout horizon: {self.T}")
         print(f"  Max steps: {self.max_global_steps}")
+        print(f"  Networks: independent human & robot")
 
     def execute_training_step(self):
-        """Execute one complete rollout and training update."""
+        """Execute one complete rollout and training update for both networks."""
         # Use current observations
         current_obs = self._current_obs
         if current_obs is None:
@@ -69,16 +70,16 @@ class RMAPPOTrainingRunner:
             
         episode_count = 0
         
-        # Collect complete rollout (T steps) - no noise scheduling for rMAPPO
+        # Collect complete rollout (T steps) - dual networks in parallel
         for rollout_step in range(self.T):
-            # Select actions (on-policy, no noise scaling)
+            # Select actions from both networks independently
             actions, detail = self.rmappo.select_actions(current_obs, add_noise=True, noise_scale=1.0)
 
             # Environment interaction
             self.env.unwrapped.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-            # Store joint transitions
+            # Store transitions for both agents
             done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
             
             self.rmappo.add_experience_to_buffer(
@@ -89,7 +90,7 @@ class RMAPPOTrainingRunner:
                 dones=done_any_dict
             )
 
-            # Count episodes using OR aggregation
+            # Count episodes using OR aggregation (unchanged from shared network version)
             done_any = None
             for aid in self.agent_ids:
                 d = done_any_dict[aid].to(torch.bool)
@@ -107,23 +108,26 @@ class RMAPPOTrainingRunner:
         # Store final observations for bootstrapping
         self.rmappo.store_next_obs(next_obs)
         
-        # Update networks (complete rollout collected)
+        # Update both networks (complete rollout collected)
         stats = self.rmappo.update()
 
         # Update global counters
         self.global_step += self.T * self.rmappo.num_envs
         self.global_episodes += episode_count
 
-        # Unified logging (removed noise_scale)
+        # Dual network logging - separate loss tracking per agent
         if stats and stats.get("training/policy_updates", 0) > 0:
             payload = {
-                # rMAPPO specific metrics
-                "loss/actor": stats.get("loss/actor"),
-                "loss/critic": stats.get("loss/critic"),
-                "model/entropy": stats.get("model/entropy", 0.0),
-                "model/ratio": stats.get("model/ratio", 1.0),
-                "grad_norm/actor": stats.get("grad_norm/actor"),
-                "grad_norm/critic": stats.get("grad_norm/critic"),
+                # Per-agent metrics from dual networks
+                "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.agent_ids},
+                "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.agent_ids},
+                "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
+                "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
+                
+                # Shared metrics (averaged from both networks where applicable)
+                "model/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
+                "model/ratio": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
+                
                 # Global metrics
                 "train/episodes_done": self.global_episodes,
                 "training/policy_updates": stats.get("training/policy_updates", 0),
@@ -158,25 +162,16 @@ class RMAPPOTrainingRunner:
         
         force_payload = {}
         
-        # Robot forces - current rollout all environments average
-        if "robot" in detail["mean_actions"]:
-            robot_forces = detail["mean_actions"]["robot"]  # [num_envs, 3]
-            robot_mean = robot_forces.mean(dim=0)  # [3] - cross-environment mean
-            force_payload.update({
-                "forces/robot_fx_mean": float(robot_mean[0].item()),
-                "forces/robot_fy_mean": float(robot_mean[1].item()),
-                "forces/robot_fz_mean": float(robot_mean[2].item()),
-            })
-        
-        # Human forces - current rollout all environments average  
-        if "human" in detail["mean_actions"]:
-            human_forces = detail["mean_actions"]["human"]  # [num_envs, 3]
-            human_mean = human_forces.mean(dim=0)  # [3] - cross-environment mean
-            force_payload.update({
-                "forces/human_fx_mean": float(human_mean[0].item()),
-                "forces/human_fy_mean": float(human_mean[1].item()),
-                "forces/human_fz_mean": float(human_mean[2].item()),
-            })
+        # Push per-agent force statistics
+        for aid in self.agent_ids:
+            if aid in detail["mean_actions"]:
+                forces = detail["mean_actions"][aid]  # [num_envs, 3]
+                mean_forces = forces.mean(dim=0)  # [3] - cross-environment mean
+                force_payload.update({
+                    f"forces/{aid}_fx_mean": float(mean_forces[0].item()),
+                    f"forces/{aid}_fy_mean": float(mean_forces[1].item()),
+                    f"forces/{aid}_fz_mean": float(mean_forces[2].item()),
+                })
         
         # Push to MetricsHub for WandB logging
         if force_payload:
@@ -192,8 +187,8 @@ class RMAPPOTrainingRunner:
 
 class RMAPPOMilestoneEvaluator:
     """
-    Milestone evaluator adapted for rMAPPO with single environment evaluation.
-    Features normalized return calculation and proper action masking.
+    Milestone evaluator adapted for dual-network rMAPPO with coordinated evaluation.
+    Features normalized return calculation and dual network coordination.
     """
     
     def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -205,17 +200,17 @@ class RMAPPOMilestoneEvaluator:
         self.agent_ids = agent_ids
 
     def run_evaluation(self, milestone: int, global_step: int) -> dict:
-        """Handle milestone evaluation and model saving."""
+        """Handle milestone evaluation and model saving for dual networks."""
         # In-place evaluation with return normalization
         return_norm, num_eps = self._run_single_evaluation_episode()
         
-        # Scale return_norm by 1000 for milestone tracking
+        # Scale return_norm by 1000 for milestone tracking (unchanged)
         milestone_return = return_norm * 1000
         
         print(f"[EVAL] Milestone {milestone}: return_norm={return_norm:.4f}, scaled={milestone_return:.2f}")
 
-        # Extract model weights
-        model_state = self._extract_model_state()
+        # Extract model weights from both networks
+        model_state = self._extract_dual_model_state()
 
         # Update TopK and save (using scaled return)
         self.topk.update(milestone_return, model_state, milestone)
@@ -237,19 +232,20 @@ class RMAPPOMilestoneEvaluator:
         
         print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
 
-        # CRITICAL FIX: Reset RNN states after evaluation
-        print(f"[EVAL] Resetting RNN states after evaluation...")
-        self.rmappo.rnn_states_actor.zero_()
-        self.rmappo.rnn_states_critic.zero_()
+        # CRITICAL FIX: Reset RNN states after evaluation for both networks
+        print(f"[EVAL] Resetting RNN states for both networks after evaluation...")
+        for aid in self.agent_ids:
+            self.rmappo.rnn_states[aid]["actor"].zero_()
+            self.rmappo.rnn_states[aid]["critic"].zero_()
 
         return {"skip_episode_once": True}
 
     def _run_single_evaluation_episode(self):
-        """Run single environment evaluation episode with proper action masking."""
+        """Run single environment evaluation episode with dual network coordination."""
         active_env = 0
         target_episodes = 1
         
-        print(f"[EVAL] Starting in-place rMAPPO evaluation (env0 only, 1 episode)...")
+        print(f"[EVAL] Starting in-place dual rMAPPO evaluation (env0 only, 1 episode)...")
         
         env = getattr(self.env, "unwrapped", self.env)
         obs, _ = env.reset()
@@ -260,11 +256,11 @@ class RMAPPOMilestoneEvaluator:
         ep_steps = torch.zeros(num_envs, dtype=torch.int64, device=self.rmappo.device)
         completed_return_norms = []
         
-        # Reset RNN states for evaluation
-        H = self.rmappo.params.get('ppo', {}).get('hidden_size', 256)
-        N = num_envs * 2
-        rnn_a = torch.zeros(N, H, device=self.rmappo.device)
-        rnn_c = torch.zeros(N, H, device=self.rmappo.device)
+        # Reset RNN states for evaluation (both networks)
+        for aid in self.agent_ids:
+            H = self.rmappo.params.get('ppo', {}).get('hidden_size', 256)
+            self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
+            self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
         
         # Get current global step for StepTracer
         training_global_step = getattr(env, '_trainer_global_step', 0)
@@ -282,17 +278,26 @@ class RMAPPOMilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # Build obs tensors for rMAPPO
-                obs_tensor, share_obs_tensor = self.rmappo.build_obs_tensors(current_obs)
-                masks = torch.ones(obs_tensor.shape[0], 1, device=self.rmappo.device)
-                
-                # Select actions deterministically
-                values, actions_norm, action_log_probs, rnn_a_new, rnn_c_new = self.rmappo.policy.get_actions(
-                    share_obs_tensor, obs_tensor, rnn_a, rnn_c, masks, deterministic=True
-                )
+                # Coordinate dual networks for action selection (deterministic)
+                actions_dict = {}
+                for aid in self.agent_ids:
+                    obs_tensor, share_obs_tensor = self.rmappo.build_obs_tensors(current_obs, aid)
+                    masks = torch.ones(obs_tensor.shape[0], 1, device=self.rmappo.device)
+                    
+                    values, actions_norm, action_log_probs, rnn_a_new, rnn_c_new = self.rmappo.policies[aid].get_actions(
+                        share_obs_tensor, obs_tensor, 
+                        self.rmappo.rnn_states[aid]["actor"], self.rmappo.rnn_states[aid]["critic"], 
+                        masks, deterministic=True
+                    )
+                    
+                    # Update RNN states for this agent
+                    self.rmappo.rnn_states[aid]["actor"] = rnn_a_new
+                    self.rmappo.rnn_states[aid]["critic"] = rnn_c_new
+                    
+                    actions_dict[aid] = actions_norm
                 
                 # Convert to environment format
-                env_actions = self.rmappo.actions_to_env_format(actions_norm)
+                env_actions = self.rmappo.actions_to_env_format(actions_dict)
                 
                 # Apply complete action masking - only env0 executes real actions
                 for aid, act in env_actions.items():
@@ -304,12 +309,10 @@ class RMAPPOMilestoneEvaluator:
                 # Create detail info for StepTracer (after masking)
                 detail_info = {
                     "mean_actions": {
-                        "human": env_actions["human"],
-                        "robot": env_actions["robot"],
+                        aid: env_actions[aid] for aid in self.agent_ids
                     },
                     "noise_actions": {
-                        "human": torch.zeros_like(env_actions["human"]),
-                        "robot": torch.zeros_like(env_actions["robot"]),
+                        aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids
                     }
                 }
                 env.set_detail_actor_info(detail_info)
@@ -324,7 +327,7 @@ class RMAPPOMilestoneEvaluator:
                     env.step_tracer.maybe_print_step(env, rewards, training_global_step, force_print=True)
                     env.step_tracer.enable_console_logging = original_logging
                 
-                # Accumulate env0 rewards and steps
+                # Accumulate env0 rewards and steps (sum of both agents)
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
                 avg_step_rewards = step_rewards.mean(dim=0)
                 ep_returns[active_env] += avg_step_rewards[active_env]
@@ -353,9 +356,6 @@ class RMAPPOMilestoneEvaluator:
                     
                     if len(completed_return_norms) >= target_episodes:
                         break
-                
-                # RNN state rollover (evaluation no reset unless done)
-                rnn_a, rnn_c = rnn_a_new, rnn_c_new
         
         final_return_norms = completed_return_norms[:target_episodes]
         avg_return_norm = sum(final_return_norms) / max(1, len(final_return_norms))
@@ -368,18 +368,17 @@ class RMAPPOMilestoneEvaluator:
         
         return avg_return_norm, len(final_return_norms)
 
-    def _extract_model_state(self):
-        """Extract model state for checkpoint saving."""
+    def _extract_dual_model_state(self):
+        """Extract model state for dual networks checkpoint saving."""
         model_state = {}
         
-        # rMAPPO uses policy wrapper, extract underlying networks
-        policy = self.rmappo.policy
-        prefix = 'shared'  # rMAPPO uses shared policy
-        
-        model_state.update({
-            f'{prefix}_actor': policy.actor.state_dict(),
-            f'{prefix}_critic': policy.critic.state_dict(),
-        })
+        # Extract state dicts from both networks
+        for aid in self.agent_ids:
+            policy = self.rmappo.policies[aid]
+            model_state.update({
+                f'{aid}_actor': policy.actor.state_dict(),
+                f'{aid}_critic': policy.critic.state_dict(),
+            })
         
         return model_state
 
@@ -418,11 +417,11 @@ class MetricsHub:
 
 class WandBLogger:
     """
-    Optimized WandB logger adapted for rMAPPO metrics.
+    Optimized WandB logger adapted for dual-network rMAPPO metrics.
     Features network configuration logging and milestone tracking.
     """
     
-    # rMAPPO-specific metric mappings
+    # Dual network agent metrics mapping
     AGENT_METRICS_MAP = {
         'loss/actor': 'train/{}/actor_loss',
         'loss/critic': 'train/{}/critic_loss',
@@ -430,7 +429,7 @@ class WandBLogger:
         'grad_norm/critic': 'model/{}/grad_norm_critic',
     }
     
-    # Removed exploration/noise_scale from global metrics
+    # Global metrics (unchanged from shared network version)
     GLOBAL_METRICS_MAP = {
         "model/entropy": "model/entropy",
         "model/ratio": "model/ppo_ratio",
@@ -440,7 +439,7 @@ class WandBLogger:
         "eval/return_mean": "milestone/actor_return",
         "milestone/topk_best_score": "milestone/topk_best_return",
         "milestone/latest_completed": "milestone/latest_completed",
-        # Force statistics
+        # Per-agent force statistics
         "forces/robot_fx_mean": "forces/robot_fx_mean",
         "forces/robot_fy_mean": "forces/robot_fy_mean",
         "forces/robot_fz_mean": "forces/robot_fz_mean",
@@ -458,7 +457,7 @@ class WandBLogger:
             print("[WANDB] Disabled")
 
     def initialize_run(self, config: Dict[str, Any], run_name: Optional[str] = None) -> None:
-        """Initialize WandB run with enhanced rMAPPO configuration tracking."""
+        """Initialize WandB run with enhanced dual-network rMAPPO configuration tracking."""
         if not self.enabled:
             return
         
@@ -467,12 +466,12 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy"],
-            notes="Multi-environment parallel rMAPPO training with RNN, rollout collection, and PPO updates",
+            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network"],
+            notes="Multi-environment parallel dual-network rMAPPO training with RNN, rollout collection, and PPO updates",
             settings=wandb.Settings(start_method="thread")
         )
         
-        # Log rMAPPO-specific configuration
+        # Log dual-network rMAPPO-specific configuration
         ppo_cfg = config.get("ppo", {})
         
         wandb.config.update({
@@ -483,7 +482,7 @@ class WandBLogger:
             "value_loss_coef": ppo_cfg.get("value_loss_coef", 0.5),
             "entropy_coef": ppo_cfg.get("entropy_coef", 0.01),
             "reward_scale": 0.01,
-            "agent_mode": "robot_human_shared",
+            "agent_mode": "robot_human_dual_network",  # Updated to reflect dual network architecture
             "reward_components": "trajectory+progress+potential_field",
             "termination_mode": "direct_obstacle_collision",
             "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
@@ -496,6 +495,9 @@ class WandBLogger:
             "use_popart": ppo_cfg.get("use_popart", False),
             "use_valuenorm": ppo_cfg.get("use_valuenorm", False),
             "use_clipped_value_loss": ppo_cfg.get("use_clipped_value_loss", False),
+            # Dual network info
+            "network_architecture": "dual_independent",
+            "network_init": "robot_copy_from_human",
         })
         
         print(f"[WANDB] Successfully initialized: {self.run.name}")
@@ -523,16 +525,16 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with rMAPPO metric mapping.")
+        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-        """Log metrics with rMAPPO-specific mapping."""
+        """Log metrics with dual-network rMAPPO-specific mapping."""
         if not self.enabled or not metrics_data:
             return
 
         log_data = {}
 
-        # Handle Per-Agent training metrics (for rMAPPO, we have shared policy)
+        # Handle Per-Agent training metrics (for dual networks)
         if any(key in metrics_data and isinstance(metrics_data.get(key), dict) 
                for key in self.AGENT_METRICS_MAP.keys()):
             
@@ -612,10 +614,11 @@ class TopKModelManager:
         return self.top_models
     
     def save_checkpoint(self, filepath: str, agent_ids: List[str]) -> None:
-        """Save checkpoint with top-K models."""
+        """Save checkpoint with top-K models (dual network support)."""
         checkpoint = {
             'agent_ids': agent_ids,
-            'algorithm': 'rmappo',
+            'algorithm': 'rmappo_dual',  # Updated to reflect dual network
+            'network_architecture': 'dual_independent',
             'top_k_count': len(self.top_models),
             'top_k_models': []
         }
@@ -635,18 +638,19 @@ class TopKModelManager:
         torch.save(checkpoint, filepath)
         if self.top_models:
             scores = [m[0] for m in self.top_models]
-            print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: "
+            print(f"[TOP-K] Saved {len(self.top_models)} best dual models, scores: "
                   f"{scores[0]:.2f} ~ {scores[-1]:.2f}")
 
 
 def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: int, global_episodes: int, max_milestone_triggered: Optional[int]) -> None:
-    """Save final rMAPPO networks to checkpoint file."""
-    final_path = os.path.join(log_directory, "final_rmappo_networks.pth")
+    """Save final dual rMAPPO networks to checkpoint file."""
+    final_path = os.path.join(log_directory, "final_rmappo_dual_networks.pth")
     
     final_checkpoint = {
         'params': rmappo_wrapper.params,
         'agent_ids': rmappo_wrapper.agent_ids,
-        'algorithm': 'rmappo',
+        'algorithm': 'rmappo_dual',
+        'network_architecture': 'dual_independent',
         'global_steps_total': global_step,
         'episodes_done_total': global_episodes,
         'max_milestone_triggered': max_milestone_triggered or 0,
@@ -654,25 +658,26 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
         'ppo_config': rmappo_wrapper.params.get('ppo', {}),
     }
     
-    # Save policy networks
-    policy = rmappo_wrapper.policy
-    final_checkpoint.update({
-        'shared_actor': policy.actor.state_dict(),
-        'shared_critic': policy.critic.state_dict(),
-    })
+    # Save both policy networks
+    for aid in rmappo_wrapper.agent_ids:
+        policy = rmappo_wrapper.policies[aid]
+        final_checkpoint.update({
+            f'{aid}_actor': policy.actor.state_dict(),
+            f'{aid}_critic': policy.critic.state_dict(),
+        })
     
     torch.save(final_checkpoint, final_path)
-    print(f"[CHECKPOINT] Final rMAPPO networks saved: {final_path}")
+    print(f"[CHECKPOINT] Final dual rMAPPO networks saved: {final_path}")
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
-    """Create command line argument parser for rMAPPO training."""
+    """Create command line argument parser for dual rMAPPO training."""
     if config_path is None:
         # Adjust path based on actual file location
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_rmappo.yaml')
 
-    parser = argparse.ArgumentParser(description="rMAPPO multi-environment parallel training")
+    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
