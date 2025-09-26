@@ -1,6 +1,9 @@
 """
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
 Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
+PHASE 1 MODIFICATIONS:
+- Removed duplicate advantage normalization from train() method
+- Keep only the buffer's advantage normalization to avoid numerical drift
 """
 
 import numpy as np
@@ -179,15 +182,7 @@ class RMAPPOPolicy:
                 
         return MockSpace(space_desc)
 
-    def lr_decay(self, episode, episodes):
-        """Decay the actor and critic learning rates."""
-        def update_linear_schedule(optimizer, episode, episodes, initial_lr):
-            lr = initial_lr - (initial_lr * (episode / float(episodes)))
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-                
-        update_linear_schedule(self.actor_optimizer, episode, episodes, self.actor_lr)
-        update_linear_schedule(self.critic_optimizer, episode, episodes, self.critic_lr)
+    # PHASE 3: Removed unused lr_decay method - prefer external scheduling
 
     def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, deterministic=False):
         """Compute actions and value function predictions."""
@@ -226,8 +221,8 @@ class RMAPPOPolicy:
 # ALGORITHM TRAINER (RENAMED)
 # =============================================================================
 
-def get_gard_norm(parameters):
-    """Calculate gradient norm."""
+def get_grad_norm(parameters):
+    """Calculate gradient norm. PHASE 3: Fixed function name spelling."""
     total_norm = 0
     for p in parameters:
         if p.grad is not None:
@@ -347,7 +342,10 @@ class RMAPPOAlgorithm:
         return value_loss
 
     def ppo_update(self, sample, update_actor=True):
-        """Single PPO update step. Modified to use dict access instead of unpacking."""
+        """
+        Single PPO update step. Modified to use dict access instead of unpacking.
+        PHASE 2: Added PPO monitoring metrics (clipfrac, approx_kl, value_expvar).
+        """
         # Use dict access instead of positional unpacking
         share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)
         obs_batch = check(sample["obs"]).to(**self.tpdv)
@@ -397,24 +395,42 @@ class RMAPPOAlgorithm:
 
         self.policy.critic_optimizer.step()
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        # PHASE 2: Calculate PPO monitoring metrics
+        with torch.no_grad():
+            # Clipping fraction
+            clipped = (imp_weights > 1.0 + self.clip_param) | (imp_weights < 1.0 - self.clip_param)
+            clipfrac = clipped.float().mean()
+            
+            # Approximate KL divergence
+            approx_kl = (old_action_log_probs_batch - action_log_probs).mean().clamp_min(0)
+            
+            # Value function explained variance
+            y = return_batch
+            y_hat = values
+            value_expvar = 1.0 - (y - y_hat).var() / (y.var() + 1e-8)
+
+        return {
+            "value_loss": value_loss.item(),
+            "critic_grad_norm": critic_grad_norm,
+            "policy_loss": policy_loss.item(),
+            "dist_entropy": dist_entropy.item(),
+            "actor_grad_norm": actor_grad_norm,
+            "imp_weights": imp_weights.mean().item(),
+            # PHASE 2: New PPO monitoring metrics
+            "clipfrac": clipfrac.item(),
+            "approx_kl": approx_kl.item(),
+            "value_expvar": value_expvar.item(),
+        }
 
     def train(self, buffer, update_actor=True):
         """
         Perform multi-epoch PPO training.
+        PHASE 1: Removed duplicate advantage normalization - use only buffer's normalization.
         """
-        if self._use_popart or self._use_valuenorm:
-            advantages = buffer.returns - self.value_normalizer.denormalize(buffer.value_preds)
-        else:
-            advantages = buffer.returns - buffer.value_preds
+        # PHASE 1: REMOVED duplicate advantage normalization
+        # The buffer already normalized advantages in compute_returns_and_adv()
+        # We directly use buffer.advantages which are already normalized
         
-        # Advantage normalization using masks instead of active_masks
-        advantages_copy = advantages.clone()
-        advantages_copy[buffer.masks == 0.0] = float('nan')
-        mean_advantages = torch.nanmean(advantages_copy)
-        std_advantages = torch.nanstd(advantages_copy)
-        advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
-
         train_info = {}
         train_info['value_loss'] = 0
         train_info['policy_loss'] = 0
@@ -422,21 +438,28 @@ class RMAPPOAlgorithm:
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        # PHASE 2: Add new PPO monitoring metrics
+        train_info['clipfrac'] = 0
+        train_info['approx_kl'] = 0
+        train_info['value_expvar'] = 0
 
         for _ in range(self.ppo_epoch):
             # Always use recurrent generator (simplified)
             data_generator = buffer.recurrent_generator(self.num_mini_batch, self.data_chunk_length)
 
             for sample in data_generator:
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights = \
-                    self.ppo_update(sample, update_actor)
+                update_info = self.ppo_update(sample, update_actor)
 
-                train_info['value_loss'] += value_loss.item()
-                train_info['policy_loss'] += policy_loss.item()
-                train_info['dist_entropy'] += dist_entropy.item()
-                train_info['actor_grad_norm'] += actor_grad_norm
-                train_info['critic_grad_norm'] += critic_grad_norm
-                train_info['ratio'] += imp_weights.mean()
+                train_info['value_loss'] += update_info["value_loss"]
+                train_info['policy_loss'] += update_info["policy_loss"]
+                train_info['dist_entropy'] += update_info["dist_entropy"]
+                train_info['actor_grad_norm'] += update_info["actor_grad_norm"]
+                train_info['critic_grad_norm'] += update_info["critic_grad_norm"]
+                train_info['ratio'] += update_info["imp_weights"]
+                # PHASE 2: Accumulate new metrics
+                train_info['clipfrac'] += update_info["clipfrac"]
+                train_info['approx_kl'] += update_info["approx_kl"]
+                train_info['value_expvar'] += update_info["value_expvar"]
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

@@ -2,6 +2,7 @@
 RNN modules for rMAPPO.
 CRITICAL FIX: RNNLayer.forward now enforces external 2D hidden states and internal 3D handling.
 This eliminates the "batch dimension confusion" where num_layers was mistaken for batch size.
+PHASE 1: No changes needed - this module works correctly with Phase 1 modifications.
 """
 
 import torch

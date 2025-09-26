@@ -2,6 +2,7 @@
 Utility functions and base modules for rMAPPO.
 Contains: basic utilities, continuous action distributions, action layer, and PopArt.
 Simplified to support only continuous actions with RNN networks.
+PHASE 1: No changes needed - this module is compatible with Phase 1 modifications.
 """
 
 import copy

@@ -1,4 +1,5 @@
 # surgical_direct_marl_env_cfg.py - Clean version after removing duplicate definitions
+# PHASE 1: No changes needed - compatible with Phase 1 modifications
 
 from __future__ import annotations
 

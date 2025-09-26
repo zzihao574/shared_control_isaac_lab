@@ -6,6 +6,16 @@ Features unified training execution, milestone evaluation, and optimized WandB l
 Adapted for independent human and robot networks with synchronized training.
 Updated to use unified mappo_args configuration source.
 CRITICAL FIX: Evaluation RNN state reset now uses 2D format [num_envs, H].
+PHASE 1 MODIFICATIONS:
+- Added eval mode control to prevent buffer writes and step counting during evaluation
+- Added skip episode once functionality
+- Fixed done_mask shape to [N,1]
+PHASE 2 MODIFICATIONS:
+- Fixed console step counter to display global environment logical steps (10, 20, 30...)
+FINAL MODIFICATIONS:
+- Unified step counting: global_step for collection steps only, train_updates for training rounds
+- Evaluation mode is truly read-only with consistent action masking
+- StepTracer prints every 10 steps during evaluation with forced console logging
 """
 
 import argparse
@@ -17,7 +27,7 @@ import pickle
 import math
 import traceback
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable, DefaultDict, Deque
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from collections import defaultdict, deque
 
 # WandB support
@@ -35,6 +45,7 @@ class RMAPPOTrainingRunner:
     Unified training loop executor for dual-network rMAPPO with rollout collection.
     Features on-policy trajectory collection and unified global step tracking.
     Updated to use unified mappo_args configuration source.
+    FINAL: Separated collection steps (global_step) from training rounds (train_updates).
     """
     
     def __init__(self, env, rmappo_wrapper, metrics_hub, agent_ids, max_global_steps=None):
@@ -42,10 +53,16 @@ class RMAPPOTrainingRunner:
         self.rmappo = rmappo_wrapper
         self.metrics = metrics_hub
         self.agent_ids = agent_ids
-        self.global_step = 0  # Current training step
+        
+        # FINAL: Clear separation of step counting
+        self.global_step = 0  # ONLY for environment collection steps (training mode only)
+        self.train_updates = 0  # ONLY for completed training rounds (rollout->update cycles)
         self.global_episodes = 0  # Total episodes completed
         self._skip_episode_once = False  # Flag to skip episode counting once
         self._current_obs = None  # Current observations cache
+        
+        # Evaluation mode control
+        self.is_eval_mode = False
         
         # rMAPPO specific parameters
         self.T = rmappo_wrapper.T  # Rollout horizon
@@ -54,7 +71,7 @@ class RMAPPOTrainingRunner:
         if max_global_steps is not None and max_global_steps > 0:
             self.max_global_steps = int(max_global_steps)
         else:
-            # CRITICAL FIX: Use unified mappo_args source instead of ppo
+            # Use unified mappo_args source instead of ppo
             mappo_args = rmappo_wrapper.params.get('mappo_args', {})
             if not mappo_args:
                 raise ValueError("[CONFIG ERROR] 'mappo_args' is missing from params. Ensure unified configuration loading is working.")
@@ -63,8 +80,13 @@ class RMAPPOTrainingRunner:
         
         print(f"[DUAL RMAPPO RUNNER] Configured:")
         print(f"  Rollout horizon: {self.T}")
-        print(f"  Max steps: {self.max_global_steps}")
+        print(f"  Max collection steps: {self.max_global_steps}")
+        print(f"  Step counting: global_step (collection) + train_updates (training rounds)")
         print(f"  Networks: independent human & robot")
+
+    def set_eval_mode(self, flag: bool):
+        """Set evaluation mode flag."""
+        self.is_eval_mode = bool(flag)
 
     def execute_training_step(self):
         """Execute one complete rollout and training update for both networks."""
@@ -82,34 +104,50 @@ class RMAPPOTrainingRunner:
             
             # Collect complete rollout (T steps) - dual networks in parallel
             for rollout_step in range(self.T):
+                # FINAL: Increment collection step counter and sync to environment (training only)
+                if not self.is_eval_mode:
+                    self.global_step += 1
+                    self.env.unwrapped.set_trainer_global_step(self.global_step)
+                
                 # Select actions from both networks independently
-                actions, detail = self.rmappo.select_actions(current_obs, add_noise=True, noise_scale=1.0)
+                actions, detail = self.rmappo.select_actions(
+                    current_obs, 
+                    add_noise=(not self.is_eval_mode),
+                    deterministic=self.is_eval_mode
+                )
 
                 # Environment interaction
                 self.env.unwrapped.set_detail_actor_info(detail)
                 next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-                # Store transitions for both agents
-                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
-                
-                self.rmappo.add_experience_to_buffer(
-                    obs=current_obs,
-                    actions=actions,
-                    rewards=rewards,
-                    next_obs=next_obs,
-                    dones=done_any_dict
-                )
+                # FINAL: Only store transitions during training, not evaluation
+                if not self.is_eval_mode:
+                    # Store transitions for both agents
+                    done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+                    
+                    self.rmappo.add_experience_to_buffer(
+                        obs=current_obs,
+                        actions=actions,
+                        rewards=rewards,
+                        next_obs=next_obs,
+                        dones=done_any_dict
+                    )
 
                 # Count episodes using OR aggregation (unchanged from shared network version)
+                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
                 done_any = None
                 for aid in self.agent_ids:
                     d = done_any_dict[aid].to(torch.bool)
                     done_any = d if done_any is None else (done_any | d)
                 
                 episode_increment = int(done_any.sum().item())
-                if self._skip_episode_once:
+                
+                # Skip episode counting during evaluation or when flag is set
+                if self.is_eval_mode or self._skip_episode_once:
                     episode_increment = 0
-                    self._skip_episode_once = False
+                    if self._skip_episode_once:
+                        self._skip_episode_once = False
+                        
                 episode_count += episode_increment
 
                 # Update current observations for next round
@@ -118,43 +156,51 @@ class RMAPPOTrainingRunner:
             # Store final observations for bootstrapping
             self.rmappo.store_next_obs(next_obs)
             
-            # Update both networks (complete rollout collected)
-            stats = self.rmappo.update()
+            # FINAL: Only update networks during training, not evaluation
+            if not self.is_eval_mode:
+                # Update both networks (complete rollout collected)
+                stats = self.rmappo.update()
 
-            # Update global counters
-            self.global_step += self.T * self.rmappo.num_envs
-            self.global_episodes += episode_count
+                # FINAL: Increment training round counter (removed global_step jump)
+                self.train_updates += 1
+                self.global_episodes += episode_count
 
-            # Dual network logging - separate loss tracking per agent
-            if stats and stats.get("training/policy_updates", 0) > 0:
-                payload = {
-                    # Per-agent metrics from dual networks
-                    "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.agent_ids},
-                    "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.agent_ids},
-                    "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
-                    "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
+                # Dual network logging - separate loss tracking per agent
+                if stats and stats.get("training/policy_updates", 0) > 0:
+                    payload = {
+                        # Per-agent metrics from dual networks
+                        "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.agent_ids},
+                        "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.agent_ids},
+                        "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
+                        "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
+                        
+                        # Shared metrics (averaged from both networks where applicable)
+                        "model/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
+                        "model/ratio": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
+                        
+                        # FINAL: Clear separation of step types in logging
+                        "train/collection_steps": self.global_step,
+                        "train/training_rounds": self.train_updates,
+                        "train/episodes_done": self.global_episodes,
+                        "training/policy_updates": stats.get("training/policy_updates", 0),
+                        "training/value_updates": stats.get("training/value_updates", 0),
+                    }
+                    # Clean None values
+                    payload = {k: v for k, v in payload.items() if v is not None}
                     
-                    # Shared metrics (averaged from both networks where applicable)
-                    "model/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
-                    "model/ratio": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
-                    
-                    # Global metrics
-                    "train/episodes_done": self.global_episodes,
-                    "training/policy_updates": stats.get("training/policy_updates", 0),
-                    "training/value_updates": stats.get("training/value_updates", 0),
-                }
-                # Clean None values
-                payload = {k: v for k, v in payload.items() if v is not None}
+                    # FINAL: Use collection steps for x-axis, but include training rounds info
+                    self.metrics.push_update(self.global_step, payload)
+
+                # Push force statistics every rollout
+                self._push_current_rollout_force_statistics(detail)
                 
-                self.metrics.push_update(self.global_step, payload)
-
-            # Push force statistics every rollout
-            self._push_current_rollout_force_statistics(detail)
-
-            # Step counting and environment synchronization
-            actual_env = getattr(self.env, "unwrapped", self.env)
-            if hasattr(actual_env, "set_trainer_global_step"):
-                actual_env.set_trainer_global_step(self.global_step)
+                # Memory cleanup every 10 rollouts
+                if self.train_updates % 10 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            else:
+                # Return empty stats during evaluation
+                stats = {}
 
             # Update current observations for next rollout
             self._current_obs = next_obs
@@ -162,10 +208,10 @@ class RMAPPOTrainingRunner:
             return next_obs
             
         except Exception as e:
-            print(f"\n[RUNNER ERROR] Exception in execute_training_step at global_step {self.global_step}: {e}")
+            print(f"\n[RUNNER ERROR] Exception in execute_training_step at collection_step {self.global_step}: {e}")
             traceback.print_exc()
             raise
- 
+
     def mark_skip_episode_once(self):
         """Mark to skip episode counting once for milestone evaluation."""
         self._skip_episode_once = True
@@ -193,7 +239,7 @@ class RMAPPOTrainingRunner:
             self.metrics.push_update(self.global_step, force_payload)
 
     def run_until(self, max_global_steps: int):
-        """Run training until reaching maximum steps."""
+        """Run training until reaching maximum collection steps."""
         obs, _ = self.env.reset()
         self._current_obs = obs
         while self.global_step < max_global_steps:
@@ -206,6 +252,7 @@ class RMAPPOMilestoneEvaluator:
     Features normalized return calculation and dual network coordination.
     Updated to use unified mappo_args configuration source.
     CRITICAL FIX: Evaluation RNN state reset now uses 2D format.
+    FINAL: Evaluation is truly read-only with consistent action masking and improved StepTracer.
     """
     
     def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -282,7 +329,7 @@ class RMAPPOMilestoneEvaluator:
             self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
             self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
         
-        # Get current global step for StepTracer
+        # Get current global step for StepTracer (frozen during evaluation)
         training_global_step = getattr(env, '_trainer_global_step', 0)
         eval_step_counter = 0
         
@@ -326,24 +373,22 @@ class RMAPPOMilestoneEvaluator:
                         masked_actions[active_env] = act[active_env]
                         env_actions[aid] = masked_actions
                 
-                # Create detail info for StepTracer (after masking)
+                # FINAL: Create detail info with same masking as env_actions for consistency
                 detail_info = {
-                    "mean_actions": {
-                        aid: env_actions[aid] for aid in self.agent_ids
-                    },
-                    "noise_actions": {
-                        aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids
-                    }
+                    "mean_actions": {aid: env_actions[aid].clone() for aid in self.agent_ids},  # Already masked
+                    "noise_actions": {aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids}  # No noise in eval
                 }
                 env.set_detail_actor_info(detail_info)
                 
                 obs, rewards, terminated, truncated, infos = env.step(env_actions)
                 
-                # Call StepTracer every 10 eval steps
-                if (hasattr(env, 'step_tracer') and env.step_tracer is not None and 
-                    eval_step_counter % 10 == 0):
+                # FINAL: StepTracer with forced console logging every 10 steps
+                if (eval_step_counter % 10 == 0 and hasattr(env, 'step_tracer') and 
+                    env.step_tracer is not None):
+                    # Temporarily enable console logging for evaluation visibility
                     original_logging = env.step_tracer.enable_console_logging
                     env.step_tracer.enable_console_logging = True
+                    # Use frozen training step (stable during evaluation)
                     env.step_tracer.maybe_print_step(env, rewards, training_global_step, force_print=True)
                     env.step_tracer.enable_console_logging = original_logging
                 
@@ -376,6 +421,10 @@ class RMAPPOMilestoneEvaluator:
                     
                     if len(completed_return_norms) >= target_episodes:
                         break
+                
+                # Memory cleanup every 100 steps
+                if eval_step_counter % 100 == 0:
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         final_return_norms = completed_return_norms[:target_episodes]
         avg_return_norm = sum(final_return_norms) / max(1, len(final_return_norms))
@@ -410,10 +459,10 @@ class MetricsHub:
     """
     
     def __init__(self, ring: int = 100):
-        self.subs: DefaultDict[str, list[Callable[[dict], None]]] = defaultdict(list)  # Event subscribers
-        self.update_ring: Deque[dict] = deque(maxlen=ring)  # Update history ring buffer
+        self.subs = defaultdict(list)  # Event subscribers
+        self.update_ring = deque(maxlen=ring)  # Update history ring buffer
 
-    def subscribe(self, event: str, handler: Callable[[dict], None]) -> None:
+    def subscribe(self, event: str, handler) -> None:
         """Subscribe to an event type with a handler function."""
         self.subs[event].append(handler)
 
@@ -440,6 +489,7 @@ class WandBLogger:
     Optimized WandB logger adapted for dual-network rMAPPO metrics.
     Features network configuration logging and milestone tracking.
     Updated to use unified mappo_args configuration source.
+    FINAL: Enhanced with collection steps vs training rounds separation.
     """
     
     # Dual network agent metrics mapping
@@ -450,10 +500,12 @@ class WandBLogger:
         'grad_norm/critic': 'model/{}/grad_norm_critic',
     }
     
-    # Global metrics (unchanged from shared network version)
+    # Global metrics (enhanced with step type separation)
     GLOBAL_METRICS_MAP = {
         "model/entropy": "model/entropy",
         "model/ratio": "model/ppo_ratio",
+        "train/collection_steps": "train/collection_steps",  # NEW: Environment interaction steps
+        "train/training_rounds": "train/training_rounds",    # NEW: Training update rounds
         "train/episodes_done": "train/global_episodes", 
         "training/policy_updates": "train/policy_updates",
         "training/value_updates": "train/value_updates",
@@ -487,8 +539,8 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network"],
-            notes="Multi-environment parallel dual-network rMAPPO training with RNN, rollout collection, and PPO updates",
+            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network", "step-counting-fixed"],
+            notes="Multi-environment parallel dual-network rMAPPO training with RNN, rollout collection, PPO updates, and unified step counting",
             settings=wandb.Settings(start_method="thread")
         )
         
@@ -520,6 +572,9 @@ class WandBLogger:
             "network_architecture": "dual_independent",
             "network_init": "robot_copy_from_human",
             "rnn_state_format": "external_2d_internal_3d",  # Document the fix
+            # FINAL: Step counting documentation
+            "step_counting_method": "collection_steps_separate_from_training_rounds",
+            "evaluation_mode": "read_only_deterministic_with_masking",
         })
         
         print(f"[WANDB] Successfully initialized: {self.run.name}")
@@ -547,7 +602,7 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping.")
+        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping and step separation.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
         """Log metrics with dual-network rMAPPO-specific mapping."""
@@ -643,6 +698,7 @@ class TopKModelManager:
             'algorithm': 'rmappo_dual',  # Updated to reflect dual network
             'network_architecture': 'dual_independent',
             'rnn_state_format': 'external_2d_internal_3d',  # Document the fix
+            'step_counting_method': 'collection_steps_separate_from_training_rounds',  # NEW
             'top_k_count': len(self.top_models),
             'top_k_models': []
         }
@@ -676,7 +732,9 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
         'algorithm': 'rmappo_dual',
         'network_architecture': 'dual_independent',
         'rnn_state_format': 'external_2d_internal_3d',  # Document the fix
-        'global_steps_total': global_step,
+        'step_counting_method': 'collection_steps_separate_from_training_rounds',  # NEW
+        'global_steps_total': global_step,  # Collection steps
+        'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),  # Training rounds (if available)
         'episodes_done_total': global_episodes,
         'max_milestone_triggered': max_milestone_triggered or 0,
         'rollout_horizon': rmappo_wrapper.T,
@@ -694,6 +752,7 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
     
     torch.save(final_checkpoint, final_path)
     print(f"[CHECKPOINT] Final dual rMAPPO networks saved: {final_path}")
+    print(f"[CHECKPOINT] Final stats: collection_steps={global_step}, episodes={global_episodes}")
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
@@ -703,7 +762,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_rmappo.yaml')
 
-    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training")
+    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training with unified step counting")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
@@ -716,7 +775,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         "--max_global_steps", 
         type=int, 
         default=0,  # 0 means unspecified, will use YAML config
-        help="Stop after this many global training steps; if >0, it becomes the primary stop condition."
+        help="Stop after this many environment collection steps; if >0, it becomes the primary stop condition."
     )
     
     # Model management

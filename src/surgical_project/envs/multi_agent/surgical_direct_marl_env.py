@@ -1,6 +1,7 @@
 """
 Human-robot collaborative surgical MARL environment for shared networks.
 Features physics-based constraints, four-zone rewards, and potential field guidance.
+PHASE 1: No changes needed - compatible with eval mode and done_mask shape fixes.
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     - Potential field reward for trajectory guidance
     - Unified coordinate system handling
     - Console logging support via injected StepTracer
+    
+    PHASE 1: Compatible with eval mode control and done_mask shape fixes.
     """
     
     cfg: SurgicalDirectMARLEnvCfg

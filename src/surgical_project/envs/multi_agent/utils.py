@@ -1,6 +1,7 @@
 """
 Environment utilities for shared network MADDPG/RMAPPO training.
 Provides physics-based constraint analysis and console debugging components.
+PHASE 1: No changes needed - this module is compatible with Phase 1 modifications.
 """
 
 import torch
@@ -218,6 +219,7 @@ class StepTracer:
     """
     Console debugging with four-zone reward system monitoring.
     Provides detailed console output for debugging reward calculations and agent behaviors.
+    PHASE 1: Compatible with eval mode control and Phase 1 modifications.
     """
     
     def __init__(self, num_envs: int, device: torch.device,
@@ -232,7 +234,10 @@ class StepTracer:
         self.max_envs_to_print = max_envs_to_print
 
     def maybe_print_step(self, env, rewards: Dict, global_step: int, force_print: bool = False):
-        """Print step information if conditions are met."""
+        """
+        Print step information if conditions are met.
+        PHASE 1: Added force_print parameter for evaluation mode.
+        """
         if not self.enable_console_logging:
             return
             

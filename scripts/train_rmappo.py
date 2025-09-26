@@ -4,6 +4,14 @@
 rMAPPO training script with dual independent networks integration.
 Features unified configuration source and enhanced error reporting.
 CRITICAL FIX: External RNN hidden states now use 2D format [num_envs, H] instead of 3D.
+PHASE 1 MODIFICATIONS:
+- Added eval mode control to DualRMAPPOWrapper
+- Fixed done_mask shape to [N,1] 
+- Added eval mode coordination in TrainingOrchestrator
+FINAL MODIFICATIONS:
+- Unified step counting: global_step for collection steps, train_updates for training rounds
+- Improved progress reporting with separated step types
+- Enhanced termination conditions based on collection steps
 """
 
 import sys
@@ -226,6 +234,7 @@ class DualRMAPPOWrapper:
     Dual independent network rMAPPO wrapper.
     Manages two completely separate networks with synchronized training.
     FIXED: External RNN states now use 2D format [num_envs, H].
+    FINAL: Enhanced with training round counter and eval mode improvements.
     """
     
     def __init__(self, dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, params):
@@ -241,6 +250,12 @@ class DualRMAPPOWrapper:
         # Rollout parameters
         self.T = int(params.get('rollout_horizon', 256))
         self.rollout_step = 0
+        
+        # FINAL: Add training round counter for wrapper access
+        self.train_updates = 0
+        
+        # Evaluation mode control
+        self._is_eval_mode = False
         
         # Force constraints
         constraints = params.get('constraints', {})
@@ -312,9 +327,6 @@ class DualRMAPPOWrapper:
             "critic": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
         }
         
-        # Eval mode flag
-        self._is_eval_mode = False
-        
         print(f"[DUAL RMAPPO] Initialized:")
         print(f"  Rollout horizon: {self.T}")
         print(f"  Networks: independent human & robot")
@@ -332,15 +344,23 @@ class DualRMAPPOWrapper:
                 self.trainers[aid].prep_training()
 
     def build_obs_tensors(self, obs_dict, agent_id: str):
-        """Convert agent-specific obs dict to tensors."""
+        """
+        Convert agent-specific obs dict to tensors.
+        Optimized with shared_obs caching.
+        """
         obs = torch.as_tensor(obs_dict[agent_id], device=self.device, dtype=torch.float32)
         
-        # Build centralized observation (human||robot) for each environment
-        human_obs = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
-        robot_obs = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
-        share_obs = torch.cat([human_obs, robot_obs], dim=1)  # [E, 2*obs_dim]
+        # Build centralized observation with caching
+        if not hasattr(self, '_cached_share_obs') or self._cached_share_obs is None:
+            human_obs = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
+            robot_obs = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
+            self._cached_share_obs = torch.cat([human_obs, robot_obs], dim=1)  # [E, 2*obs_dim]
         
-        return obs, share_obs
+        return obs, self._cached_share_obs
+    
+    def _clear_obs_cache(self):
+        """Clear shared observation cache for next step."""
+        self._cached_share_obs = None
 
     def actions_to_env_format(self, actions_dict):
         """Convert normalized actions to environment format with per-agent clamping."""
@@ -354,14 +374,21 @@ class DualRMAPPOWrapper:
             
         return env_actions
 
-    def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0):
-        """Generate actions from both networks independently."""
+    def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, deterministic: bool = None, noise_scale: float = 1.0):
+        """
+        Generate actions from both networks independently.
+        Enhanced with explicit deterministic parameter and observation caching optimization.
+        """
+        # Clear cache at start of action selection
+        self._clear_obs_cache()
+        
         actions_norm = {}
         action_log_probs = {}
         values = {}
         
-        # Determine if deterministic (eval mode or no noise)
-        deterministic = self._is_eval_mode or not add_noise
+        # Use explicit deterministic parameter if provided, otherwise use eval mode or noise settings
+        if deterministic is None:
+            deterministic = self._is_eval_mode or not add_noise
         
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(observations, aid)
@@ -390,9 +417,9 @@ class DualRMAPPOWrapper:
         if not self._is_eval_mode:
             self._store_rollout_data(observations, actions_norm, action_log_probs, values)
         
-        # Create detail info for StepTracer
+        # Create detail info for StepTracer (simplified to avoid memory overhead)
         detail = {
-            "mean_actions": {k: v.clone() for k, v in env_actions.items()},
+            "mean_actions": {k: v.detach().clone() for k, v in env_actions.items()},
             "noise_actions": {
                 aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids
             }
@@ -401,25 +428,30 @@ class DualRMAPPOWrapper:
         return env_actions, detail
 
     def _store_rollout_data(self, observations, actions_norm, action_log_probs, values):
-        """Store data for current rollout step (per-agent)."""
+        """Store data for current rollout step (per-agent) with memory optimization."""
         self._current_step_data = {}
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(observations, aid)
             masks = torch.ones(obs.shape[0], 1, device=self.device)
             
+            # Use detach() to avoid gradient accumulation
             self._current_step_data[aid] = {
-                'obs': obs,
-                'share_obs': share_obs,
-                'actions': actions_norm[aid], 
-                'action_log_probs': action_log_probs[aid],
-                'value_preds': values[aid],
+                'obs': obs.detach(),
+                'share_obs': share_obs.detach(),
+                'actions': actions_norm[aid].detach(), 
+                'action_log_probs': action_log_probs[aid].detach(),
+                'value_preds': values[aid].detach(),
                 'masks': masks,
-                'rnn_states_actor': self.rnn_states[aid]["actor"].clone(),
-                'rnn_states_critic': self.rnn_states[aid]["critic"].clone()
+                'rnn_states_actor': self.rnn_states[aid]["actor"].detach().clone(),
+                'rnn_states_critic': self.rnn_states[aid]["critic"].detach().clone()
             }
 
-    def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones):
-        """Add experience to per-agent rollout buffers."""
+    def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones, infos=None):
+        """
+        Add experience to per-agent rollout buffers.
+        Enhanced with eval mode check and termination reason analysis for term_masks.
+        """
+        # Skip buffer writes during evaluation
         if self._is_eval_mode:
             return
             
@@ -427,8 +459,29 @@ class DualRMAPPOWrapper:
             # Prepare rewards (use agent-specific rewards)
             reward_tensor = rewards[aid].unsqueeze(-1) if len(rewards[aid].shape) == 1 else rewards[aid]
             
-            # Prepare masks (0.0 if done, 1.0 otherwise)
-            done_mask = torch.where(dones[aid], 0.0, 1.0).unsqueeze(-1) if len(dones[aid].shape) == 1 else torch.where(dones[aid], 0.0, 1.0)
+            # Analyze termination reasons from infos
+            if infos is not None:
+                success = infos[aid].get("success", False) if isinstance(infos[aid], dict) else False
+                hit_obstacle = infos[aid].get("hit_obstacle", False) if isinstance(infos[aid], dict) else False  
+                hit_ground = infos[aid].get("hit_ground", False) if isinstance(infos[aid], dict) else False
+                time_limit = infos[aid].get("time_limit", False) if isinstance(infos[aid], dict) else False
+                
+                # If no specific termination info, infer from truncated vs terminated
+                if not any([success, hit_obstacle, hit_ground, time_limit]):
+                    # Assume truncated episodes are time_limit, terminated episodes are task completion
+                    time_limit = bool(dones[aid].any())  # Simplified assumption
+            else:
+                # Fallback: assume all done episodes are time_limit (truncated)
+                time_limit = bool(dones[aid].any()) if torch.is_tensor(dones[aid]) else bool(dones[aid])
+                success = hit_obstacle = hit_ground = False
+            
+            # Compute masks
+            # mask: 0 when any episode ends, 1 otherwise  
+            mask_t = (1.0 - dones[aid].float()).view(-1, 1)  # [num_envs, 1]
+            
+            # term_mask: 0 for true terminal states (success/fail), 1 for time_limit
+            is_terminal = success or hit_obstacle or hit_ground
+            term_mask_t = torch.zeros_like(mask_t) if is_terminal else torch.ones_like(mask_t)
             
             # Insert into agent's buffer
             self.buffers[aid].insert(
@@ -439,9 +492,10 @@ class DualRMAPPOWrapper:
                 action_log_probs=self._current_step_data[aid]['action_log_probs'],
                 value_preds=self._current_step_data[aid]['value_preds'],
                 rewards=reward_tensor,
-                masks=done_mask,
+                masks=mask_t,
                 rnn_states_actor=self._current_step_data[aid]['rnn_states_actor'],
-                rnn_states_critic=self._current_step_data[aid]['rnn_states_critic']
+                rnn_states_critic=self._current_step_data[aid]['rnn_states_critic'],
+                term_masks=term_mask_t
             )
             
             # FIXED: Reset RNN states for done environments - 2D indexing
@@ -453,7 +507,11 @@ class DualRMAPPOWrapper:
         self.rollout_step += 1
 
     def update(self):
-        """Perform dual rMAPPO update when rollout is complete."""
+        """
+        Perform dual rMAPPO update when rollout is complete.
+        Enhanced with eval mode check and training counter.
+        """
+        # Skip updates during evaluation
         if self._is_eval_mode:
             return {}
             
@@ -492,6 +550,9 @@ class DualRMAPPOWrapper:
             for k, v in train_info.items():
                 stats[f"{k}/{aid}"] = v
         
+        # FINAL: Increment training round counter
+        self.train_updates += 1
+        
         # Reset rollout step
         self.rollout_step = 0
         
@@ -507,7 +568,10 @@ class DualRMAPPOWrapper:
 
 
 class TrainingOrchestrator:
-    """Main rMAPPO trainer with dual network infrastructure (renamed from RMAPPOTrainer)."""
+    """
+    Main rMAPPO trainer with dual network infrastructure.
+    Enhanced with unified step counting and improved progress reporting.
+    """
     
     def __init__(self, args):
         self.args = args
@@ -631,7 +695,8 @@ class TrainingOrchestrator:
         self.max_milestone_triggered = 0
 
     def set_eval_mode(self, is_eval: bool):
-        """Set evaluation mode."""
+        """Set evaluation mode for both runner and wrapper."""
+        self.runner.set_eval_mode(is_eval)
         self.rmappo.set_eval_mode(is_eval)
 
     def evaluate_milestone_if_due(self):
@@ -649,6 +714,7 @@ class TrainingOrchestrator:
         if candidate > self.max_milestone_triggered:
             print(f"[MILESTONE] Crossed threshold: episodes {self.runner.global_episodes} >= milestone {candidate}")
             
+            # Coordinated eval mode setting
             self.set_eval_mode(True)
             
             try:
@@ -656,6 +722,7 @@ class TrainingOrchestrator:
                 if result.get("skip_episode_once", False):
                     self.runner.mark_skip_episode_once()
             finally:
+                # Always restore training mode
                 self.set_eval_mode(False)
             
             # Refresh observations
@@ -665,9 +732,9 @@ class TrainingOrchestrator:
             self.max_milestone_triggered = candidate
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with enhanced progress reporting."""
         print(f"[TRAIN] Starting dual rMAPPO training:")
-        print(f"  Max steps: {self.max_global_steps}")
+        print(f"  Max collection steps: {self.max_global_steps}")
         print(f"  Rollout horizon: {self.rmappo.T}")
         print(f"  Milestone episodes: {self.milestone_episodes}")
         
@@ -676,6 +743,8 @@ class TrainingOrchestrator:
             if self.wandb_logger.enabled:
                 initial_stats = {
                     "train/episodes_done": 0,
+                    "train/collection_steps": 0,
+                    "train/training_rounds": 0,
                 }
                 self.metrics_hub.push_update(0, initial_stats)
             
@@ -689,8 +758,10 @@ class TrainingOrchestrator:
                     self.runner.execute_training_step()
                     self.evaluate_milestone_if_due()
                     
-                    if self.runner.global_step % 2000 == 0:
-                        print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes}")
+                    # FINAL: Enhanced progress reporting with separated step types
+                    if self.runner.global_step > 0 and self.runner.global_step % 2000 == 0:
+                        print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes} | "
+                              f"Training rounds: {self.runner.train_updates}")
                     
                     if self.runner.global_step >= self.max_global_steps:
                         break
@@ -701,10 +772,11 @@ class TrainingOrchestrator:
                     raise
             
             print(f"\n[TRAINING COMPLETE]")
-            print(f"  Total steps: {self.runner.global_step}")
+            print(f"  Total collection steps: {self.runner.global_step}")
+            print(f"  Total training rounds: {self.runner.train_updates}")
             print(f"  Total episodes: {self.runner.global_episodes}")
             
-            # Save final model
+            # Save final model with enhanced step information
             save_final_rmappo_networks(
                 log_directory=self.log_dir,
                 rmappo_wrapper=self.rmappo,
@@ -727,7 +799,7 @@ class TrainingOrchestrator:
 def main():
     """Main entry point for dual rMAPPO training with enhanced error handling."""
     print("="*80)
-    print("Dual rMAPPO Training with Independent Networks")
+    print("Dual rMAPPO Training with Independent Networks and Unified Step Counting")
     print("="*80)
     
     try:
@@ -739,7 +811,7 @@ def main():
         print(f"[MAIN] Arguments parsed:")
         print(f"  Task: {args_cli.task}")
         print(f"  Environments: {args_cli.num_envs}")
-        print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
+        print(f"  Max collection steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
         print(f"  WandB: {args_cli.wandb}")
         
         # Launch Isaac Sim
