@@ -1,6 +1,6 @@
 """
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
-Simplified naming: RMAPPOPolicy (policy) + RMAPPOTrainer (algorithm).
+Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
 """
 
 import numpy as np
@@ -138,11 +138,11 @@ class RMAPPOPolicy:
         self.device = device
         self.args = args
         
-        # Extract learning rates and optimizer settings
-        self.actor_lr = args.get('actor_lr', 3e-4)
-        self.critic_lr = args.get('critic_lr', 3e-4) 
-        self.opt_eps = args.get('opt_eps', 1e-5)
-        self.weight_decay = args.get('weight_decay', 0.0)
+        # Extract learning rates and optimizer settings (with explicit type conversion)
+        self.actor_lr = float(args.get('actor_lr', 3e-4))
+        self.critic_lr = float(args.get('critic_lr', 3e-4)) 
+        self.opt_eps = float(args.get('opt_eps', 1e-5))
+        self.weight_decay = float(args.get('weight_decay', 0.0))
 
         # Create mock space objects for compatibility
         self.obs_space = self._create_mock_space(obs_space_desc)
@@ -223,7 +223,7 @@ class RMAPPOPolicy:
 
 
 # =============================================================================
-# ALGORITHM TRAINER
+# ALGORITHM TRAINER (RENAMED)
 # =============================================================================
 
 def get_gard_norm(parameters):
@@ -285,9 +285,10 @@ class ValueNorm:
         return values * torch.sqrt(self.var) + self.mean
 
 
-class RMAPPOTrainer:
+class RMAPPOAlgorithm:
     """
-    rMAPPO Algorithm Trainer 
+    rMAPPO Algorithm Trainer (renamed from RMAPPOTrainer)
+    职责：执行PPO算法更新，包括loss计算、梯度更新等
     """
 
     def __init__(self, args, policy, device=torch.device("cpu")):

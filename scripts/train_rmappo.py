@@ -2,7 +2,8 @@
 
 """
 rMAPPO training script with dual independent networks integration.
-Features same CLI interface as MADDPG, complete training infrastructure reuse.
+Features unified configuration source and enhanced error reporting.
+CRITICAL FIX: External RNN hidden states now use 2D format [num_envs, H] instead of 3D.
 """
 
 import sys
@@ -12,6 +13,7 @@ import numpy as np
 import random
 import copy
 import yaml
+import traceback
 from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import warnings
@@ -61,34 +63,102 @@ def setup_environment(args, config):
     return env, env_cfg
 
 
+def _select_mappo_block(cfg: dict) -> dict:
+    """Select and validate mappo configuration block (single source of truth)."""
+    has_mappo = "mappo" in cfg and isinstance(cfg["mappo"], dict)
+    has_ppo   = "ppo"   in cfg and isinstance(cfg["ppo"], dict)
+    has_algo  = "algo"  in cfg and isinstance(cfg["algo"], dict)
+    has_agents = "agents" in cfg and isinstance(cfg["agents"], dict)
+    has_networks = "networks" in cfg and isinstance(cfg["networks"], dict)
+
+    # Only allow mappo to exist; if mixed use or all missing -> raise error
+    conflicting_blocks = []
+    if has_ppo:
+        conflicting_blocks.append("ppo")
+    if has_algo:
+        conflicting_blocks.append("algo")
+    if has_agents:
+        conflicting_blocks.append("agents")
+    if has_networks:
+        conflicting_blocks.append("networks")
+    
+    if has_mappo and conflicting_blocks:
+        raise ValueError(f"[CONFIG ERROR] Found 'mappo' together with {conflicting_blocks}. "
+                        f"Keep ONLY 'mappo:' as the single source of hyperparameters.")
+    
+    if not has_mappo:
+        available_blocks = [k for k in ["ppo", "algo", "agents", "networks"] if k in cfg]
+        if available_blocks:
+            raise ValueError(f"[CONFIG ERROR] Found deprecated blocks {available_blocks} but missing 'mappo:'. "
+                           f"Please rename your algorithm block to 'mappo:' and remove others.")
+        else:
+            raise ValueError("[CONFIG ERROR] Missing 'mappo:' block. Please define it as the single source of hyperparameters.")
+
+    return cfg["mappo"]
+
+
+def _validate_mappo_args(args: dict, agent_id: str):
+    """Validate required mappo arguments."""
+    required = ["hidden_size", "recurrent_N", "actor_lr", "critic_lr",
+                "clip_param", "ppo_epoch", "num_mini_batch", "data_chunk_length",
+                "value_loss_coef", "entropy_coef", "max_grad_norm", "opt_eps",
+                "gamma", "gae_lambda", "max_global_steps"]
+    
+    missing = [k for k in required if k not in args]
+    if missing:
+        raise ValueError(f"[CONFIG ERROR] Missing required keys for {agent_id}: {missing}")
+    
+    # Additional validation for common mistakes
+    if args.get("data_chunk_length", 0) <= 0:
+        raise ValueError(f"[CONFIG ERROR] data_chunk_length must be > 0, got {args.get('data_chunk_length')}")
+    
+    if args.get("hidden_size", 0) <= 0:
+        raise ValueError(f"[CONFIG ERROR] hidden_size must be > 0, got {args.get('hidden_size')}")
+
+
 def load_dual_network_config(config_path: str):
-    """Load YAML config and merge agent-specific parameters."""
-    with open(config_path, 'r') as f:
-        cfg = yaml.safe_load(f)
-    
-    common = cfg.get("algo", cfg)  # Fallback to root if no 'algo' section
-    per_agent = cfg.get("agents", {})
-    
-    def merge_config_for_agent(agent_id: str):
-        final = copy.deepcopy(common)
-        agent_overrides = per_agent.get(agent_id, {})
-        final.update(agent_overrides)
-        return final
-    
-    return {
-        "human": merge_config_for_agent("human"),
-        "robot": merge_config_for_agent("robot"),
-        "common": common,
-        "raw_config": cfg
-    }
+    """
+    Load YAML config with unified mappo block validation.
+    Returns dual configuration for human/robot with strict validation.
+    """
+    try:
+        with open(config_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+    except Exception as e:
+        raise FileNotFoundError(f"[CONFIG ERROR] Failed to load config file {config_path}: {e}")
+
+    try:
+        # Select and validate mappo block
+        common = _select_mappo_block(cfg)
+        
+        # Strong validation
+        _validate_mappo_args(common, "mappo")
+        
+        # Human/robot completely consistent: return dual copy
+        import copy
+        human_config = copy.deepcopy(common)
+        robot_config = copy.deepcopy(common)
+        
+        print(f"[CONFIG] Successfully loaded unified mappo configuration:")
+        print(f"  Actor LR: {common.get('actor_lr')}")
+        print(f"  Hidden size: {common.get('hidden_size')}")
+        print(f"  Max steps: {common.get('max_global_steps')}")
+        print(f"  Networks: independent human & robot (identical initialization)")
+        
+        return {
+            "human": human_config,
+            "robot": robot_config,
+            "common": common,
+            "raw_config": cfg
+        }
+        
+    except Exception as e:
+        print(f"[CONFIG ERROR] Configuration validation failed: {e}")
+        raise
 
 
 def initialize_rmappo_algorithm(env, config, args):
     """Create and initialize dual rMAPPO algorithm wrapper."""
-    # ✅ 修正后的导入路径
-    from surgical_project.algorithms.marl.rmappo.r_mappo_core import RMAPPOPolicy, RMAPPOTrainer
-    from surgical_project.algorithms.marl.rmappo.rollout_buffer import SharedRolloutBuffer
-    
     device = config.get_compute_device()
     
     # Get environment count and dimensions
@@ -102,7 +172,13 @@ def initialize_rmappo_algorithm(env, config, args):
     obs_dict, _ = env.reset()
     obs_dim = int(obs_dict["human"].shape[1])
     share_obs_dim = obs_dim * 2  # Centralized: human||robot
-    act_dim = 3
+    
+    # Get action dimension from environment (avoid hardcoding)
+    try:
+        act_dim = int(env.unwrapped.action_space['human'].shape[0])
+    except Exception:
+        act_dim = 3  # Fallback to default
+        print(f"[WARNING] Could not determine action dimension from env, using default: {act_dim}")
 
     print(f"[RMAPPO] Dual Network Architecture:")
     print(f"  Environments: {num_envs}")
@@ -110,8 +186,18 @@ def initialize_rmappo_algorithm(env, config, args):
     print(f"  Obs dim: {obs_dim}, Share obs dim: {share_obs_dim}")
     print(f"  Action dim: {act_dim}")
 
-    # Load dual config
+    # Load dual config with unified mappo source
     dual_config = load_dual_network_config(args.config)
+    
+    # CRITICAL: Add mappo_args to params for unified access
+    config.params['mappo_args'] = dual_config['common']
+    
+    # Validate rollout horizon compatibility
+    rollout_horizon = config.params.get('rollout_horizon', 256)
+    data_chunk_length = dual_config['common'].get('data_chunk_length', 16)
+    if rollout_horizon % data_chunk_length != 0:
+        raise ValueError(f"[CONFIG ERROR] rollout_horizon ({rollout_horizon}) must be divisible by "
+                        f"data_chunk_length ({data_chunk_length}) for RNN training")
     
     # Create wrapper with dual configs
     return DualRMAPPOWrapper(
@@ -139,11 +225,12 @@ class DualRMAPPOWrapper:
     """
     Dual independent network rMAPPO wrapper.
     Manages two completely separate networks with synchronized training.
+    FIXED: External RNN states now use 2D format [num_envs, H].
     """
     
     def __init__(self, dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, params):
-        # ✅ 修正后的导入路径 
-        from surgical_project.algorithms.marl.rmappo.r_mappo_core import RMAPPOPolicy, RMAPPOTrainer
+        # Updated import path for algorithm layer
+        from surgical_project.algorithms.marl.rmappo.r_mappo_core import RMAPPOPolicy, RMAPPOAlgorithm
         from surgical_project.algorithms.marl.rmappo.rollout_buffer import SharedRolloutBuffer
         
         self.device = device
@@ -180,7 +267,7 @@ class DualRMAPPOWrapper:
             device=device,
             args=human_config
         )
-        trn_h = RMAPPOTrainer(args=human_config, policy=pol_h, device=device)
+        trn_h = RMAPPOAlgorithm(args=human_config, policy=pol_h, device=device)
         buf_h = SharedRolloutBuffer(
             T=self.T, N=num_envs, obs_dim=obs_dim, share_obs_dim=share_obs_dim,
             act_dim=act_dim, rnn_hidden_dim=human_config.get('hidden_size', 256), device=device
@@ -189,6 +276,8 @@ class DualRMAPPOWrapper:
         self.policies["human"] = pol_h
         self.trainers["human"] = trn_h 
         self.buffers["human"] = buf_h
+        
+        # FIXED: 3D -> 2D for external RNN states
         self.rnn_states["human"] = {
             "actor": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
@@ -203,19 +292,21 @@ class DualRMAPPOWrapper:
             device=device,
             args=robot_config
         )
-        trn_r = RMAPPOTrainer(args=robot_config, policy=pol_r, device=device)
+        trn_r = RMAPPOAlgorithm(args=robot_config, policy=pol_r, device=device)
         buf_r = SharedRolloutBuffer(
             T=self.T, N=num_envs, obs_dim=obs_dim, share_obs_dim=share_obs_dim,
             act_dim=act_dim, rnn_hidden_dim=robot_config.get('hidden_size', 256), device=device
         )
         
-        # ✅ Copy human weights to robot for identical initialization
+        # Copy human weights to robot for identical initialization
         pol_r.actor.load_state_dict(pol_h.actor.state_dict())
         pol_r.critic.load_state_dict(pol_h.critic.state_dict())
         
         self.policies["robot"] = pol_r
         self.trainers["robot"] = trn_r
         self.buffers["robot"] = buf_r
+        
+        # FIXED: 3D -> 2D for external RNN states
         self.rnn_states["robot"] = {
             "actor": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
@@ -229,6 +320,7 @@ class DualRMAPPOWrapper:
         print(f"  Networks: independent human & robot")
         print(f"  Initial weights: robot copied from human")
         print(f"  Force limits: robot={self.max_robot_force}, human={self.max_human_force}")
+        print(f"  RNN states: FIXED to 2D format [num_envs, hidden_size]")
 
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode for both networks."""
@@ -352,7 +444,7 @@ class DualRMAPPOWrapper:
                 rnn_states_critic=self._current_step_data[aid]['rnn_states_critic']
             )
             
-            # Reset RNN states for done environments
+            # FIXED: Reset RNN states for done environments - 2D indexing
             done_indices = dones[aid].nonzero(as_tuple=False).squeeze(-1)
             if done_indices.numel() > 0:
                 self.rnn_states[aid]["actor"][done_indices].zero_()
@@ -386,8 +478,8 @@ class DualRMAPPOWrapper:
                 last_values = torch.zeros(self.num_envs, 1, device=self.device)
             
             # Compute returns and advantages for this agent
-            gamma = self.params.get('ppo', {}).get('gamma', 0.99)
-            gae_lambda = self.params.get('ppo', {}).get('gae_lambda', 0.95)
+            gamma = self.params.get('mappo_args', {}).get('gamma', 0.99)
+            gae_lambda = self.params.get('mappo_args', {}).get('gae_lambda', 0.95)
             self.buffers[aid].compute_returns_and_adv(last_values, gamma, gae_lambda)
             
             # Train this agent's networks
@@ -414,21 +506,26 @@ class DualRMAPPOWrapper:
         self._next_obs = next_obs
 
 
-class RMAPPOTrainer:
-    """Main rMAPPO trainer with dual network infrastructure."""
+class TrainingOrchestrator:
+    """Main rMAPPO trainer with dual network infrastructure (renamed from RMAPPOTrainer)."""
     
     def __init__(self, args):
         self.args = args
-        print(f"[TRAINER] Initializing Dual rMAPPO Trainer...")
+        print(f"[ORCHESTRATOR] Initializing Dual rMAPPO Training Orchestrator...")
         
-        self._setup_configuration()
-        self._setup_environment()
-        self._setup_logging_and_wandb()
-        self._setup_training_components()
-        self._setup_runners_and_evaluators()
-        self._setup_milestone_management()
+        try:
+            self._setup_configuration()
+            self._setup_environment()
+            self._setup_logging_and_wandb()
+            self._setup_training_components()
+            self._setup_runners_and_evaluators()
+            self._setup_milestone_management()
+        except Exception as e:
+            print(f"[ORCHESTRATOR ERROR] Failed to initialize: {e}")
+            traceback.print_exc()
+            raise
         
-        print(f"[TRAINER] Dual rMAPPO Trainer initialized successfully")
+        print(f"[ORCHESTRATOR] Dual rMAPPO Training Orchestrator initialized successfully")
 
     def _setup_configuration(self):
         """Load and setup training configuration."""
@@ -493,15 +590,15 @@ class RMAPPOTrainer:
         self.rmappo = initialize_rmappo_algorithm(self.env, self.config, self.args)
         self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
-        # Unified max_global_steps logic
-        yaml_max_steps = int(self.config.params.get('ppo', {}).get('max_global_steps', 200000))
+        # Unified max_global_steps logic using mappo_args
+        mappo_max_steps = int(self.config.params.get('mappo_args', {}).get('max_global_steps', 200000))
         
         if self.args.max_global_steps > 0:
             self.max_global_steps = self.args.max_global_steps
             print(f"[SETUP] Using CLI max_global_steps: {self.max_global_steps}")
         else:
-            self.max_global_steps = yaml_max_steps
-            print(f"[SETUP] Using YAML max_global_steps: {self.max_global_steps}")
+            self.max_global_steps = mappo_max_steps
+            print(f"[SETUP] Using MAPPO max_global_steps: {self.max_global_steps}")
         
         if self.max_global_steps <= 0:
             self.max_global_steps = 200000
@@ -588,14 +685,20 @@ class RMAPPOTrainer:
             
             # Main training loop
             while self.runner.global_step < self.max_global_steps:
-                self.runner.execute_training_step()
-                self.evaluate_milestone_if_due()
-                
-                if self.runner.global_step % 2000 == 0:
-                    print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes}")
-                
-                if self.runner.global_step >= self.max_global_steps:
-                    break
+                try:
+                    self.runner.execute_training_step()
+                    self.evaluate_milestone_if_due()
+                    
+                    if self.runner.global_step % 2000 == 0:
+                        print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes}")
+                    
+                    if self.runner.global_step >= self.max_global_steps:
+                        break
+                        
+                except Exception as e:
+                    print(f"[TRAIN ERROR] Exception during training step {self.runner.global_step}: {e}")
+                    traceback.print_exc()
+                    raise
             
             print(f"\n[TRAINING COMPLETE]")
             print(f"  Total steps: {self.runner.global_step}")
@@ -614,45 +717,58 @@ class RMAPPOTrainer:
             print(f"\nTraining interrupted by user")
             raise
         finally:
-            self.env.close()
-            self.wandb_logger.finalize_run()
+            if hasattr(self, 'env'):
+                self.env.close()
+            if hasattr(self, 'wandb_logger'):
+                self.wandb_logger.finalize_run()
             print("[TRAIN] Cleanup completed")
 
 
 def main():
-    """Main entry point for dual rMAPPO training."""
+    """Main entry point for dual rMAPPO training with enhanced error handling."""
     print("="*80)
     print("Dual rMAPPO Training with Independent Networks")
     print("="*80)
     
-    # Parse arguments (reuse existing parser)
-    parser = create_argument_parser()
-    AppLauncher.add_app_launcher_args(parser)
-    args_cli = parser.parse_args()
-    
-    print(f"[MAIN] Arguments parsed:")
-    print(f"  Task: {args_cli.task}")
-    print(f"  Environments: {args_cli.num_envs}")
-    print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
-    print(f"  WandB: {args_cli.wandb}")
-    
-    # Launch Isaac Sim
-    print(f"[MAIN] Launching Isaac Sim...")
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
-    
     try:
-        print(f"[MAIN] Creating Dual rMAPPO Trainer...")
-        trainer = RMAPPOTrainer(args_cli)
+        # Parse arguments (reuse existing parser)
+        parser = create_argument_parser()
+        AppLauncher.add_app_launcher_args(parser)
+        args_cli = parser.parse_args()
         
-        print(f"[MAIN] Starting training...")
-        trainer.train()
+        print(f"[MAIN] Arguments parsed:")
+        print(f"  Task: {args_cli.task}")
+        print(f"  Environments: {args_cli.num_envs}")
+        print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
+        print(f"  WandB: {args_cli.wandb}")
         
-        print(f"[MAIN] Training completed successfully")
+        # Launch Isaac Sim
+        print(f"[MAIN] Launching Isaac Sim...")
+        app_launcher = AppLauncher(args_cli)
+        simulation_app = app_launcher.app
         
-    finally:
-        print(f"[MAIN] Closing Isaac Sim...")
-        simulation_app.close()
+        try:
+            print(f"[MAIN] Creating Dual rMAPPO Training Orchestrator...")
+            trainer = TrainingOrchestrator(args_cli)
+            
+            print(f"[MAIN] Starting training...")
+            trainer.train()
+            
+            print(f"[MAIN] Training completed successfully")
+            
+        except Exception as e:
+            print(f"[MAIN ERROR] Training failed: {e}")
+            traceback.print_exc()
+            raise
+            
+        finally:
+            print(f"[MAIN] Closing Isaac Sim...")
+            simulation_app.close()
+    
+    except Exception as e:
+        print(f"\n[MAIN FATAL ERROR] Unhandled exception in main: {e}")
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
                 import yaml
                 import os
                 current_dir = os.path.dirname(os.path.abspath(__file__))
-                yaml_file = os.path.join(current_dir, "agents", "training_params.yaml")
+                yaml_file = os.path.join(current_dir, "agents", "training_params_rmappo.yaml")
                 
                 if not os.path.exists(yaml_file):
                     raise FileNotFoundError(f"YAML config not found at: {yaml_file}")

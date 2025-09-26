@@ -1,15 +1,10 @@
 # Training parameters configuration for dual independent networks
-# Features per-agent configuration with common base parameters
+# Features unified single configuration source: mappo only
 
 # ==============================================================================
-# Global Settings
+# Unified Algorithm Configuration (Single Source of Truth)
 # ==============================================================================
-seed: 42
-
-# ==============================================================================
-# Common Algorithm Parameters (Base Configuration)
-# ==============================================================================
-algo:
+mappo:
   # Learning rates
   actor_lr: 0.0007                    # Actor learning rate
   critic_lr: 0.001                    # Critic learning rate
@@ -30,7 +25,7 @@ algo:
   
   # Optimization
   max_grad_norm: 0.5                  # Gradient clipping threshold
-  opt_eps: 1e-5                       # Optimizer epsilon
+  opt_eps: 0.00001                    # Optimizer epsilon (1e-5 in decimal)
   weight_decay: 0.0                   # Weight decay
   
   # Network architecture
@@ -49,57 +44,14 @@ algo:
   max_global_steps: 200000            # Primary termination condition
 
 # ==============================================================================
-# Agent-Specific Overrides (Only Differences from Common Parameters)
+# Global Settings
 # ==============================================================================
-agents:
-  human:
-    # Human agent uses slightly different hyperparameters for better cooperation
-    clip_param: 0.15                  # Lower clipping for more stable updates
-    entropy_coef: 0.005               # Lower entropy for more focused actions
-    actor_lr: 0.0005                  # Slightly lower learning rate
-    
-  robot:
-    # Robot agent uses slightly more aggressive parameters for exploration
-    clip_param: 0.25                  # Higher clipping for more exploration
-    value_loss_coef: 0.7              # Higher value loss weight
-    entropy_coef: 0.015               # Higher entropy for exploration
+seed: 42
 
 # ==============================================================================
-# Network Architecture Configuration
+# Rollout Configuration
 # ==============================================================================
-networks:
-  actor:
-    hidden_layers: [128, 128, 128, 128]
-    input_bypass_layers: [1, 2]  # Enable residual connections at layers 1 and 2
-    orthogonal_init: true
-    ortho_gain_hidden: 1.414
-    ortho_gain_output: 0.01    
-  critic:
-    hidden_layers: [256, 256, 128, 128]
-    input_bypass_layers: [0, 2]  # Enable residual connections at layers 0 and 2
-    orthogonal_init: true
-    ortho_gain_hidden: 1.414
-    ortho_gain_output: 0.01
-
-# ==============================================================================
-# State Normalization Configuration
-# ==============================================================================
-obs_scaling:
-  # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
-  factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
-
-# ==============================================================================
-# Logging Configuration
-# ==============================================================================
-logging:
-  enable_console_logging: true  # Enable detailed console logging for debugging
-
-# ==============================================================================
-# Trajectory Parameters (Task Logic)
-# ==============================================================================
-trajectory:
-  start_point: [0.14, -0.2, 0.03]     # Starting position in 3D space (meters)
-  end_point: [0.14, 0.2, 0.03]        # Target end position in 3D space (meters)
+rollout_horizon: 256                  # Number of steps per rollout
 
 # ==============================================================================
 # Physics Constraints (Runtime Constraints)
@@ -128,6 +80,19 @@ initial_conditions:
     yaw: 0.0
     pitch: 2.0944                     # ~120 degrees
     roll: 0.0
+
+# ==============================================================================
+# Logging Configuration
+# ==============================================================================
+logging:
+  enable_console_logging: true  # Enable detailed console logging for debugging
+
+# ==============================================================================
+# Trajectory Parameters (Task Logic)
+# ==============================================================================
+trajectory:
+  start_point: [0.14, -0.2, 0.03]     # Starting position in 3D space (meters)
+  end_point: [0.14, 0.2, 0.03]        # Target end position in 3D space (meters)
 
 # ==============================================================================
 # Constraint Geometry
@@ -209,51 +174,11 @@ termination_conditions:
   safety_distance_threshold: 0.0     # Direct termination when entering obstacle
 
 # ==============================================================================
-# Rollout Configuration
+# State Normalization Configuration
 # ==============================================================================
-rollout_horizon: 256                  # Number of steps per rollout
-
-# ==============================================================================
-# PPO Algorithm Configuration (Legacy Compatibility)
-# ==============================================================================
-ppo:
-  # Learning rates
-  actor_lr: 0.0007                    # Actor learning rate
-  critic_lr: 0.001                    # Critic learning rate
-  
-  # Discount and GAE
-  gamma: 0.99                         # Discount factor
-  gae_lambda: 0.95                    # GAE lambda
-  
-  # PPO specific
-  clip_param: 0.2                     # PPO clipping parameter
-  ppo_epoch: 10                       # Number of PPO epochs per update
-  num_mini_batch: 4                   # Number of mini-batches per epoch
-  data_chunk_length: 16               # RNN sequence length for training
-  
-  # Loss coefficients
-  value_loss_coef: 0.5                # Value function loss coefficient
-  entropy_coef: 0.01                  # Entropy regularization coefficient
-  
-  # Optimization
-  max_grad_norm: 0.5                  # Gradient clipping threshold
-  opt_eps: 1e-5                       # Optimizer epsilon
-  weight_decay: 0.0                   # Weight decay
-  
-  # Network architecture
-  hidden_size: 256                    # Hidden layer size
-  recurrent_N: 1                      # Number of RNN layers
-  use_orthogonal: true                # Use orthogonal initialization
-  gain: 0.01                          # Initialization gain
-  
-  # Value normalization options
-  use_popart: false                   # Use PopArt normalization
-  use_valuenorm: false                # Use value normalization
-  use_clipped_value_loss: false       # Use clipped value loss
-  huber_delta: 1.0                    # Huber loss delta
-  
-  # Training termination
-  max_global_steps: 200000            # Primary termination condition: stop after this many training steps
+obs_scaling:
+  # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
+  factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
 
 # ==============================================================================
 # Training Monitoring
