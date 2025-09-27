@@ -3,15 +3,7 @@
 """
 rMAPPO training script with dual independent networks integration.
 Features unified configuration source and enhanced error reporting.
-CRITICAL FIX: External RNN hidden states now use 2D format [num_envs, H] instead of 3D.
-PHASE 1 MODIFICATIONS:
-- Added eval mode control to DualRMAPPOWrapper
-- Fixed done_mask shape to [N,1] 
-- Added eval mode coordination in TrainingOrchestrator
-FINAL MODIFICATIONS:
-- Unified step counting: global_step for collection steps, train_updates for training rounds
-- Improved progress reporting with separated step types
-- Enhanced termination conditions based on collection steps
+MODIFIED: Added Tanh-Gaussian action domain alignment and obs scaling support.
 """
 
 import sys
@@ -233,8 +225,7 @@ class DualRMAPPOWrapper:
     """
     Dual independent network rMAPPO wrapper.
     Manages two completely separate networks with synchronized training.
-    FIXED: External RNN states now use 2D format [num_envs, H].
-    FINAL: Enhanced with training round counter and eval mode improvements.
+    MODIFIED: Added Tanh-Gaussian action domain and obs scaling support.
     """
     
     def __init__(self, dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, params):
@@ -250,17 +241,35 @@ class DualRMAPPOWrapper:
         # Rollout parameters
         self.T = int(params.get('rollout_horizon', 256))
         self.rollout_step = 0
-        
-        # FINAL: Add training round counter for wrapper access
         self.train_updates = 0
         
         # Evaluation mode control
         self._is_eval_mode = False
         
-        # Force constraints
+        # Force constraints for physical scaling
         constraints = params.get('constraints', {})
         self.max_robot_force = float(constraints.get('max_robot_force', 0.04))
         self.max_human_force = float(constraints.get('max_human_force', 0.04))
+        
+        # MODIFIED: Load obs scaling factors
+        obs_scaling_config = params.get('obs_scaling', {})
+        self.obs_scale_factors = {}
+        if 'factors' in obs_scaling_config:
+            # Single scaling factor array for both agents (they have same obs structure)
+            factors_list = obs_scaling_config['factors']
+            if len(factors_list) != obs_dim:
+                raise ValueError(f"obs_scaling.factors length ({len(factors_list)}) != obs_dim ({obs_dim})")
+            
+            scale_tensor = torch.tensor(factors_list, device=device, dtype=torch.float32)
+            self.obs_scale_factors['human'] = scale_tensor
+            self.obs_scale_factors['robot'] = scale_tensor
+            
+            print(f"[OBS SCALING] Loaded scaling factors: {factors_list}")
+        else:
+            # No scaling - use identity
+            self.obs_scale_factors['human'] = torch.ones(obs_dim, device=device, dtype=torch.float32)
+            self.obs_scale_factors['robot'] = torch.ones(obs_dim, device=device, dtype=torch.float32)
+            print(f"[OBS SCALING] No scaling factors found, using identity scaling")
         
         # Create space descriptors
         obs_space_desc = {'shape': (obs_dim,)}
@@ -292,7 +301,6 @@ class DualRMAPPOWrapper:
         self.trainers["human"] = trn_h 
         self.buffers["human"] = buf_h
         
-        # FIXED: 3D -> 2D for external RNN states
         self.rnn_states["human"] = {
             "actor": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
@@ -321,7 +329,6 @@ class DualRMAPPOWrapper:
         self.trainers["robot"] = trn_r
         self.buffers["robot"] = buf_r
         
-        # FIXED: 3D -> 2D for external RNN states
         self.rnn_states["robot"] = {
             "actor": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
@@ -332,7 +339,7 @@ class DualRMAPPOWrapper:
         print(f"  Networks: independent human & robot")
         print(f"  Initial weights: robot copied from human")
         print(f"  Force limits: robot={self.max_robot_force}, human={self.max_human_force}")
-        print(f"  RNN states: FIXED to 2D format [num_envs, hidden_size]")
+        print(f"  Action domain: Tanh-Gaussian [-1, 1] -> physical forces")
 
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode for both networks."""
@@ -343,14 +350,28 @@ class DualRMAPPOWrapper:
             else:
                 self.trainers[aid].prep_training()
 
+    def build_obs_scaled(self, obs_raw):
+        """
+        MODIFIED: Build scaled observations from raw observations.
+        Apply obs_scaling.factors to each agent's observation.
+        """
+        obs_scaled = {}
+        for aid in self.agent_ids:
+            if aid in obs_raw:
+                # Apply per-element scaling: obs_raw[aid] * scaling_factors
+                obs_scaled[aid] = obs_raw[aid] * self.obs_scale_factors[aid].unsqueeze(0)
+            else:
+                raise ValueError(f"Agent {aid} not found in obs_raw")
+        return obs_scaled
+
     def build_obs_tensors(self, obs_dict, agent_id: str):
         """
         Convert agent-specific obs dict to tensors.
-        Optimized with shared_obs caching.
+        MODIFIED: obs_dict is expected to contain already scaled observations.
         """
         obs = torch.as_tensor(obs_dict[agent_id], device=self.device, dtype=torch.float32)
         
-        # Build centralized observation with caching
+        # Build centralized observation (concatenate human and robot obs)
         if not hasattr(self, '_cached_share_obs') or self._cached_share_obs is None:
             human_obs = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
             robot_obs = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
@@ -363,13 +384,19 @@ class DualRMAPPOWrapper:
         self._cached_share_obs = None
 
     def actions_to_env_format(self, actions_dict):
-        """Convert normalized actions to environment format with per-agent clamping."""
+        """
+        MODIFIED: Convert normalized actions [-1, 1] to environment format.
+        No more clamping - Tanh-Gaussian ensures [-1, 1] bounds.
+        """
         env_actions = {}
         force_limits = {"human": self.max_human_force, "robot": self.max_robot_force}
         
         for aid, actions_norm in actions_dict.items():
-            # Clamp to [-1, 1] then scale by agent-specific limits
-            actions_norm = actions_norm.clamp(-1.0, 1.0)
+            # Optional safety assertion for debugging
+            if torch.any(torch.abs(actions_norm) > 1.0001):
+                print(f"[WARNING] Agent {aid} actions outside [-1,1]: {actions_norm.min():.3f} to {actions_norm.max():.3f}")
+            
+            # Linear scaling from [-1, 1] to physical force range
             env_actions[aid] = actions_norm * force_limits[aid]
             
         return env_actions
@@ -377,8 +404,11 @@ class DualRMAPPOWrapper:
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, deterministic: bool = None, noise_scale: float = 1.0):
         """
         Generate actions from both networks independently.
-        Enhanced with explicit deterministic parameter and observation caching optimization.
+        MODIFIED: Apply obs scaling before action selection.
         """
+        # MODIFIED: Scale observations before processing
+        obs_scaled = self.build_obs_scaled(observations)
+        
         # Clear cache at start of action selection
         self._clear_obs_cache()
         
@@ -391,7 +421,7 @@ class DualRMAPPOWrapper:
             deterministic = self._is_eval_mode or not add_noise
         
         for aid in self.agent_ids:
-            obs, share_obs = self.build_obs_tensors(observations, aid)
+            obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
             masks = torch.ones(obs.shape[0], 1, device=self.device)
             
             with torch.no_grad():
@@ -401,7 +431,7 @@ class DualRMAPPOWrapper:
                     masks, deterministic=deterministic
                 )
             
-            actions_norm[aid] = a
+            actions_norm[aid] = a  # Already in [-1, 1] from Tanh-Gaussian
             action_log_probs[aid] = lp
             values[aid] = v
             
@@ -415,9 +445,9 @@ class DualRMAPPOWrapper:
         
         # Store rollout data (if not in eval mode)
         if not self._is_eval_mode:
-            self._store_rollout_data(observations, actions_norm, action_log_probs, values)
+            self._store_rollout_data(obs_scaled, actions_norm, action_log_probs, values)
         
-        # Create detail info for StepTracer (simplified to avoid memory overhead)
+        # Create detail info for StepTracer
         detail = {
             "mean_actions": {k: v.detach().clone() for k, v in env_actions.items()},
             "noise_actions": {
@@ -427,11 +457,14 @@ class DualRMAPPOWrapper:
         
         return env_actions, detail
 
-    def _store_rollout_data(self, observations, actions_norm, action_log_probs, values):
-        """Store data for current rollout step (per-agent) with memory optimization."""
+    def _store_rollout_data(self, observations_scaled, actions_norm, action_log_probs, values):
+        """
+        Store data for current rollout step (per-agent) with memory optimization.
+        MODIFIED: observations_scaled are already processed.
+        """
         self._current_step_data = {}
         for aid in self.agent_ids:
-            obs, share_obs = self.build_obs_tensors(observations, aid)
+            obs, share_obs = self.build_obs_tensors(observations_scaled, aid)
             masks = torch.ones(obs.shape[0], 1, device=self.device)
             
             # Use detach() to avoid gradient accumulation
@@ -446,10 +479,10 @@ class DualRMAPPOWrapper:
                 'rnn_states_critic': self.rnn_states[aid]["critic"].detach().clone()
             }
 
-    def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones, infos=None):
+    def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones, terminated=None, truncated=None, infos=None):
         """
         Add experience to per-agent rollout buffers.
-        Enhanced with eval mode check and termination reason analysis for term_masks.
+        MODIFIED: Added term_masks generation for time-limit vs terminal distinction.
         """
         # Skip buffer writes during evaluation
         if self._is_eval_mode:
@@ -459,29 +492,37 @@ class DualRMAPPOWrapper:
             # Prepare rewards (use agent-specific rewards)
             reward_tensor = rewards[aid].unsqueeze(-1) if len(rewards[aid].shape) == 1 else rewards[aid]
             
-            # Analyze termination reasons from infos
-            if infos is not None:
-                success = infos[aid].get("success", False) if isinstance(infos[aid], dict) else False
-                hit_obstacle = infos[aid].get("hit_obstacle", False) if isinstance(infos[aid], dict) else False  
-                hit_ground = infos[aid].get("hit_ground", False) if isinstance(infos[aid], dict) else False
-                time_limit = infos[aid].get("time_limit", False) if isinstance(infos[aid], dict) else False
+            # MODIFIED: Generate proper term_masks based on termination reason
+            # mask: 0 when episode ends (any reason), 1 otherwise
+            mask_t = (1.0 - dones[aid].float()).view(-1, 1)
+            
+            # term_mask: 0 for true terminal states, 1 for time-limit truncation
+            if terminated is not None and truncated is not None:
+                # Use provided terminated/truncated info
+                is_terminal = terminated[aid]  # True terminal state (success/failure)
+                is_truncated = truncated[aid]  # Time-limit truncation
                 
-                # If no specific termination info, infer from truncated vs terminated
-                if not any([success, hit_obstacle, hit_ground, time_limit]):
-                    # Assume truncated episodes are time_limit, terminated episodes are task completion
-                    time_limit = bool(dones[aid].any())  # Simplified assumption
+                # term_mask = 1 for truncated (allow bootstrap), 0 for terminated (no bootstrap)
+                term_mask_t = (~is_terminal).float().view(-1, 1)
             else:
-                # Fallback: assume all done episodes are time_limit (truncated)
-                time_limit = bool(dones[aid].any()) if torch.is_tensor(dones[aid]) else bool(dones[aid])
-                success = hit_obstacle = hit_ground = False
-            
-            # Compute masks
-            # mask: 0 when any episode ends, 1 otherwise  
-            mask_t = (1.0 - dones[aid].float()).view(-1, 1)  # [num_envs, 1]
-            
-            # term_mask: 0 for true terminal states (success/fail), 1 for time_limit
-            is_terminal = success or hit_obstacle or hit_ground
-            term_mask_t = torch.zeros_like(mask_t) if is_terminal else torch.ones_like(mask_t)
+                # Fallback: analyze info to infer termination type
+                if infos is not None and aid in infos:
+                    info = infos[aid]
+                    if isinstance(info, dict):
+                        success = info.get("success", False)
+                        hit_obstacle = info.get("hit_obstacle", False)
+                        hit_ground = info.get("hit_ground", False)
+                        time_limit = info.get("time_limit", False)
+                        
+                        # True terminal states: success, collisions
+                        is_terminal = success or hit_obstacle or hit_ground
+                        term_mask_t = torch.zeros_like(mask_t) if is_terminal else torch.ones_like(mask_t)
+                    else:
+                        # Conservative fallback: assume all dones are time-limit
+                        term_mask_t = torch.ones_like(mask_t)
+                else:
+                    # Conservative fallback: assume all dones are time-limit
+                    term_mask_t = torch.ones_like(mask_t)
             
             # Insert into agent's buffer
             self.buffers[aid].insert(
@@ -495,10 +536,10 @@ class DualRMAPPOWrapper:
                 masks=mask_t,
                 rnn_states_actor=self._current_step_data[aid]['rnn_states_actor'],
                 rnn_states_critic=self._current_step_data[aid]['rnn_states_critic'],
-                term_masks=term_mask_t
+                term_masks=term_mask_t  # MODIFIED: Pass term_masks to buffer
             )
             
-            # FIXED: Reset RNN states for done environments - 2D indexing
+            # Reset RNN states for done environments
             done_indices = dones[aid].nonzero(as_tuple=False).squeeze(-1)
             if done_indices.numel() > 0:
                 self.rnn_states[aid]["actor"][done_indices].zero_()
@@ -525,7 +566,9 @@ class DualRMAPPOWrapper:
             # Bootstrap with final values
             next_obs_dict = getattr(self, '_next_obs', None)
             if next_obs_dict is not None:
-                _, share_obs = self.build_obs_tensors(next_obs_dict, aid)
+                # MODIFIED: Scale next_obs before computing final values
+                next_obs_scaled = self.build_obs_scaled(next_obs_dict)
+                _, share_obs = self.build_obs_tensors(next_obs_scaled, aid)
                 masks = torch.ones(share_obs.shape[0], 1, device=self.device)
                 
                 with torch.no_grad():
@@ -550,7 +593,7 @@ class DualRMAPPOWrapper:
             for k, v in train_info.items():
                 stats[f"{k}/{aid}"] = v
         
-        # FINAL: Increment training round counter
+        # Increment training round counter
         self.train_updates += 1
         
         # Reset rollout step
@@ -758,7 +801,7 @@ class TrainingOrchestrator:
                     self.runner.execute_training_step()
                     self.evaluate_milestone_if_due()
                     
-                    # FINAL: Enhanced progress reporting with separated step types
+                    # Enhanced progress reporting with separated step types
                     if self.runner.global_step > 0 and self.runner.global_step % 2000 == 0:
                         print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes} | "
                               f"Training rounds: {self.runner.train_updates}")
@@ -799,7 +842,7 @@ class TrainingOrchestrator:
 def main():
     """Main entry point for dual rMAPPO training with enhanced error handling."""
     print("="*80)
-    print("Dual rMAPPO Training with Independent Networks and Unified Step Counting")
+    print("Dual rMAPPO Training with Tanh-Gaussian Action Domain and Obs Scaling")
     print("="*80)
     
     try:

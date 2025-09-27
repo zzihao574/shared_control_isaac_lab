@@ -1,8 +1,8 @@
 """
 On-policy rollout buffer with RNN support for rMAPPO.
-Complete implementation from user's migration plan.
-PHASE 1: Ensured compatibility with eval mode and done_mask shape fixes.
-Note: term_masks/trunc_masks additions will be in Phase 2.
+Complete implementation with GAE term_masks support for time-limit bootstrap.
+MODIFIED: Added term_masks support for proper time-limit vs terminal state handling.
+ADDITIONAL FIX: Added protection against empty mini-batches when num_mini_batch is too large.
 """
 
 import torch
@@ -11,7 +11,7 @@ class SharedRolloutBuffer:
     """
     On-policy rollout buffer with RNN support.
     Shapes use (T, N, ...), where N = num_envs * num_agents.
-    PHASE 1: Fixed advantage normalization to be the single source of truth.
+    MODIFIED: Added term_masks for proper GAE bootstrap handling and mini-batch protection.
     """
     def __init__(self, T, N, obs_dim, share_obs_dim, act_dim, rnn_hidden_dim, device):
         self.T, self.N = T, N
@@ -24,7 +24,9 @@ class SharedRolloutBuffer:
         self.rewards = torch.zeros(T, N, 1, device=device)
         self.masks = torch.ones(T, N, 1, device=device)
 
-        # PHASE 2: Add term_masks for time-limit bootstrap support
+        # MODIFIED: Added term_masks for time-limit bootstrap support
+        # term_mask = 0 for true terminal states (success/failure)
+        # term_mask = 1 for time-limit truncation (should use bootstrap)
         self.term_masks = torch.ones(T, N, 1, device=device)
 
         # RNN states (state BEFORE consuming obs[t])
@@ -40,8 +42,7 @@ class SharedRolloutBuffer:
                value_preds, rewards, masks, rnn_states_actor, rnn_states_critic, term_masks=None):
         """
         Insert experience at timestep t.
-        PHASE 1: Ensures masks are properly shaped [N,1] from done_mask fixes.
-        PHASE 2: Added term_masks support for time-limit bootstrap.
+        MODIFIED: Added term_masks parameter for time-limit vs terminal distinction.
         """
         assert t == self.step, f"insert step mismatch: {t} vs {self.step}"
         self.obs[t].copy_(obs)
@@ -50,13 +51,14 @@ class SharedRolloutBuffer:
         self.action_log_probs[t].copy_(action_log_probs)
         self.value_preds[t].copy_(value_preds)
         self.rewards[t].copy_(rewards)
-        self.masks[t].copy_(masks)  # PHASE 1: Now guaranteed to be [N,1] shape
+        self.masks[t].copy_(masks)
         
-        # PHASE 2: Handle term_masks
+        # MODIFIED: Handle term_masks properly
         if term_masks is not None:
             self.term_masks[t].copy_(term_masks)
         else:
-            # Fallback: assume all dones are terminal (conservative)
+            # Fallback: assume all dones are terminal (conservative approach)
+            # This maintains backward compatibility but is suboptimal
             self.term_masks[t].copy_(masks)
             
         self.rnn_states_actor[t].copy_(rnn_states_actor)
@@ -67,10 +69,15 @@ class SharedRolloutBuffer:
     def compute_returns_and_adv(self, last_values, gamma, gae_lambda):
         """
         Compute returns and advantages using GAE with time-limit bootstrap support.
-        PHASE 1: This is the SINGLE SOURCE OF TRUTH for advantage normalization.
-        PHASE 2: Added term_masks support for proper time-limit handling.
-        last_values: V(s_T) for each rollout slot [N, 1]
-        GAE computed backward over t = T-1 ... 0
+        MODIFIED: Use term_masks for proper bootstrap handling at time limits.
+        
+        Key insight: 
+        - masks[t]: 0 when episode ends (any reason), 1 otherwise
+        - term_masks[t]: 0 for true terminal states, 1 for time-limit truncation
+        
+        For GAE delta calculation:
+        - Use term_masks to control bootstrap: allow V(s_{t+1}) for time-limit, deny for terminal
+        - Use masks for recursion cutoff: cut GAE propagation at any episode boundary
         """
         T, N = self.T, self.N
         assert self.step == T, "buffer not full when computing returns"
@@ -78,33 +85,44 @@ class SharedRolloutBuffer:
         gae = torch.zeros(N, 1, device=self.device)
 
         for t in reversed(range(T)):
-            mask = self.masks[t]  # 0 at episode boundary for next step
-            term_mask = self.term_masks[t]  # PHASE 2: 0 for terminal, 1 for time-limit
+            mask = self.masks[t]  # 0 at episode boundary, 1 otherwise
+            term_mask = self.term_masks[t]  # 0 for terminal, 1 for time-limit
             
-            # PHASE 2: Time-limit bootstrap - allow bootstrap for time-limit, deny for terminal
-            next_v_bootstrap = torch.where(term_mask == 0, torch.zeros_like(last_values), last_values)
+            # MODIFIED: Time-limit bootstrap correction
+            # For time-limit (term_mask=1): use bootstrap value
+            # For terminal (term_mask=0): no bootstrap (value = 0)
+            next_v_bootstrap = term_mask * last_values
             
+            # GAE delta with corrected bootstrap
             delta = self.rewards[t] + gamma * next_v_bootstrap * mask - self.value_preds[t]
+            
+            # GAE recursion (always cut at episode boundary via mask)
             gae = delta + gamma * gae_lambda * mask * gae
             advantages[t] = gae
+            
+            # Update last_values for next iteration
             last_values = self.value_preds[t]
 
         self.advantages.copy_(advantages)
         self.returns = self.advantages + self.value_preds
 
-        # PHASE 1: SINGLE SOURCE advantage normalization - removed from RMAPPOAlgorithm.train()
-        # This is the only place where advantages get normalized
+        # Advantage normalization (single source of truth)
         flat_adv = self.advantages.view(T * N, 1)
         valid = self.masks.view(T * N, 1) > 0.5
-        mean = flat_adv[valid].mean()
-        std = flat_adv[valid].std().clamp_min(1e-6)
-        self.advantages = (self.advantages - mean) / std
+        
+        if valid.sum() > 0:  # Avoid division by zero
+            mean = flat_adv[valid].mean()
+            std = flat_adv[valid].std().clamp_min(1e-6)
+            self.advantages = (self.advantages - mean) / std
+        else:
+            # If no valid advantages, keep as zeros
+            self.advantages.zero_()
 
     def recurrent_generator(self, num_mini_batch, data_chunk_length):
         """
         Yield mini-batches of sequential chunks for RNN training.
         Only shuffle chunk order, preserve within-chunk time order.
-        PHASE 1: Compatible with fixed mask shapes.
+        FIXED: Added protection against empty mini-batches when num_mini_batch is too large.
         """
         T, N = self.T, self.N
         L = data_chunk_length
@@ -112,11 +130,33 @@ class SharedRolloutBuffer:
         chunks_per_slot = T // L
         total_chunks = N * chunks_per_slot
 
-        perm = torch.randperm(total_chunks)
-        mb_size = total_chunks // num_mini_batch
+        # FIXED: 更健壮：如果 num_mini_batch 过大，自动下调，避免 mb_size==0
+        if total_chunks == 0:
+            return  # 没有可用数据
+        
+        if num_mini_batch > total_chunks:
+            # 可选：打印一次警告，方便调参
+            if not hasattr(self, "_warned_mini_batch_clamp"):
+                print(f"[BUFFER WARN] num_mini_batch({num_mini_batch}) > total_chunks({total_chunks}), clamp to total_chunks.")
+                self._warned_mini_batch_clamp = True
+        
+        num_mini_batch = min(num_mini_batch, total_chunks)
+        mb_size = max(1, total_chunks // num_mini_batch)
 
+        perm = torch.randperm(total_chunks)
+        
         for mb in range(num_mini_batch):
-            idx = perm[mb * mb_size:(mb + 1) * mb_size]
+            start = mb * mb_size
+            end = min((mb + 1) * mb_size, total_chunks)
+            
+            # FIXED: 防空切片
+            if end <= start:
+                continue
+                
+            idx = perm[start:end]
+            
+            if idx.numel() == 0:
+                continue
 
             obs_lst, s_obs_lst, act_lst, logp_lst = [], [], [], []
             vp_lst, ret_lst, adv_lst, mask_lst = [], [], [], []
@@ -133,7 +173,7 @@ class SharedRolloutBuffer:
                 logp_lst.append(self.action_log_probs[t0:t1, slot])
                 vp_lst.append(self.value_preds[t0:t1, slot])
                 ret_lst.append(self.returns[t0:t1, slot])
-                adv_lst.append(self.advantages[t0:t1, slot])  # PHASE 1: Already normalized
+                adv_lst.append(self.advantages[t0:t1, slot])
                 mask_lst.append(self.masks[t0:t1, slot])
 
                 rnn_a0_lst.append(self.rnn_states_actor[t0, slot])

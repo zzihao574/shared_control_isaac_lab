@@ -1,9 +1,7 @@
 """
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
 Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
-PHASE 1 MODIFICATIONS:
-- Removed duplicate advantage normalization from train() method
-- Keep only the buffer's advantage normalization to avoid numerical drift
+MODIFIED: Fixed gradient norm type conversion and updated ACTLayer to use Tanh-Gaussian.
 """
 
 import numpy as np
@@ -43,8 +41,8 @@ class R_Actor(nn.Module):
         # Always use RNN (no conditional)
         self.rnn = RNNLayer(self.hidden_size, self.hidden_size, self._recurrent_N, self._use_orthogonal)
 
-        # Action layer
-        self.act = ACTLayer(action_space, self.hidden_size, self._use_orthogonal, self._gain)
+        # Action layer with Tanh-Gaussian enabled by default
+        self.act = ACTLayer(action_space, self.hidden_size, self._use_orthogonal, self._gain, use_tanh=True)
 
         self.to(device)
 
@@ -182,8 +180,6 @@ class RMAPPOPolicy:
                 
         return MockSpace(space_desc)
 
-    # PHASE 3: Removed unused lr_decay method - prefer external scheduling
-
     def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, deterministic=False):
         """Compute actions and value function predictions."""
         actions, action_log_probs, rnn_states_actor = self.actor(
@@ -222,7 +218,7 @@ class RMAPPOPolicy:
 # =============================================================================
 
 def get_grad_norm(parameters):
-    """Calculate gradient norm. PHASE 3: Fixed function name spelling."""
+    """Calculate gradient norm."""
     total_norm = 0
     for p in parameters:
         if p.grad is not None:
@@ -343,26 +339,70 @@ class RMAPPOAlgorithm:
 
     def ppo_update(self, sample, update_actor=True):
         """
-        Single PPO update step. Modified to use dict access instead of unpacking.
-        PHASE 2: Added PPO monitoring metrics (clipfrac, approx_kl, value_expvar).
+        Single PPO update step. Modified to use dict access and shape validation.
+        FIXED: Added comprehensive shape guards to prevent batch mismatch errors.
         """
-        # Use dict access instead of positional unpacking
-        share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)
-        obs_batch = check(sample["obs"]).to(**self.tpdv)
-        rnn_states_batch = check(sample["rnn_states_actor"]).to(**self.tpdv)
-        rnn_states_critic_batch = check(sample["rnn_states_critic"]).to(**self.tpdv)
-        actions_batch = check(sample["actions"]).to(**self.tpdv)
-        value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)
-        return_batch = check(sample["returns"]).to(**self.tpdv)
-        masks_batch = check(sample["masks"]).to(**self.tpdv)
-        old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)
-        adv_targ = check(sample["advantages"]).to(**self.tpdv)
+        # Use dict access - keep original 3D format for validation
+        share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)  # [L, B, share_obs_dim]
+        obs_batch = check(sample["obs"]).to(**self.tpdv)  # [L, B, obs_dim]
+        rnn_states_batch = check(sample["rnn_states_actor"]).to(**self.tpdv)  # [B, H]
+        rnn_states_critic_batch = check(sample["rnn_states_critic"]).to(**self.tpdv)  # [B, H]
+        actions_batch = check(sample["actions"]).to(**self.tpdv)  # [L, B, act_dim]
+        value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)  # [L, B, 1]
+        return_batch = check(sample["returns"]).to(**self.tpdv)  # [L, B, 1]
+        masks_batch = check(sample["masks"]).to(**self.tpdv)  # [L, B, 1]
+        old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)  # [L, B, 1]
+        adv_targ = check(sample["advantages"]).to(**self.tpdv)  # [L, B, 1]
 
-        # Reshape to do in a single forward pass for all steps
+        # FIXED: Shape validation guards to catch dimension mismatches early
+        L, B = obs_batch.shape[:2]
+        
+        assert actions_batch.shape[:2] == (L, B), \
+            f"[ppo_update] actions {actions_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert masks_batch.shape[:2] == (L, B), \
+            f"[ppo_update] masks {masks_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert share_obs_batch.shape[:2] == (L, B), \
+            f"[ppo_update] share_obs {share_obs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert value_preds_batch.shape[:2] == (L, B), \
+            f"[ppo_update] value_preds {value_preds_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert return_batch.shape[:2] == (L, B), \
+            f"[ppo_update] returns {return_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert old_action_log_probs_batch.shape[:2] == (L, B), \
+            f"[ppo_update] old_action_log_probs {old_action_log_probs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert adv_targ.shape[:2] == (L, B), \
+            f"[ppo_update] advantages {adv_targ.shape[:2]} != obs {obs_batch.shape[:2]}"
+        
+        # Flatten for network processing
+        share_obs_flat = share_obs_batch.view(L * B, -1)  # [L*B, share_obs_dim]
+        obs_flat = obs_batch.view(L * B, -1)  # [L*B, obs_dim]
+        actions_flat = actions_batch.view(L * B, -1)  # [L*B, act_dim]
+        masks_flat = masks_batch.view(L * B, -1)  # [L*B, 1]
+
+        # FIXED: Post-flatten validation to ensure strict consistency
+        assert actions_flat.size(0) == obs_flat.size(0), \
+            f"[ppo_update] flatten mismatch: actions {actions_flat.size(0)} vs obs {obs_flat.size(0)}"
+        assert masks_flat.size(0) == obs_flat.size(0), \
+            f"[ppo_update] flatten mismatch: masks {masks_flat.size(0)} vs obs {obs_flat.size(0)}"
+        assert share_obs_flat.size(0) == obs_flat.size(0), \
+            f"[ppo_update] flatten mismatch: share_obs {share_obs_flat.size(0)} vs obs {obs_flat.size(0)}"
+
+        # Forward pass through networks with flattened inputs
         values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
-            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch,
-            actions_batch, masks_batch
+            share_obs_flat, obs_flat, rnn_states_batch, rnn_states_critic_batch,
+            actions_flat, masks_flat
         )
+        
+        # FIXED: Additional validation after forward pass
+        assert action_log_probs.size(0) == actions_flat.size(0), \
+            f"[ppo_update] forward pass mismatch: action_log_probs {action_log_probs.size(0)} vs actions {actions_flat.size(0)}"
+        assert values.size(0) == actions_flat.size(0), \
+            f"[ppo_update] forward pass mismatch: values {values.size(0)} vs actions {actions_flat.size(0)}"
+        
+        # Flatten target tensors for loss computation
+        value_preds_batch = value_preds_batch.view(L * B, -1)  # [L*B, 1]
+        return_batch = return_batch.view(L * B, -1)  # [L*B, 1]
+        old_action_log_probs_batch = old_action_log_probs_batch.view(L * B, -1)  # [L*B, 1]
+        adv_targ = adv_targ.view(L * B, -1)  # [L*B, 1]
         
         # Actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
@@ -395,7 +435,7 @@ class RMAPPOAlgorithm:
 
         self.policy.critic_optimizer.step()
 
-        # PHASE 2: Calculate PPO monitoring metrics
+        # Calculate PPO monitoring metrics
         with torch.no_grad():
             # Clipping fraction
             clipped = (imp_weights > 1.0 + self.clip_param) | (imp_weights < 1.0 - self.clip_param)
@@ -403,34 +443,23 @@ class RMAPPOAlgorithm:
             
             # Approximate KL divergence
             approx_kl = (old_action_log_probs_batch - action_log_probs).mean().clamp_min(0)
-            
-            # Value function explained variance
-            y = return_batch
-            y_hat = values
-            value_expvar = 1.0 - (y - y_hat).var() / (y.var() + 1e-8)
 
+        # FIXED: Convert tensor grad norms to float to avoid serialization issues
         return {
             "value_loss": value_loss.item(),
-            "critic_grad_norm": critic_grad_norm,
+            "critic_grad_norm": float(critic_grad_norm.item()),
             "policy_loss": policy_loss.item(),
             "dist_entropy": dist_entropy.item(),
-            "actor_grad_norm": actor_grad_norm,
+            "actor_grad_norm": float(actor_grad_norm.item()),
             "imp_weights": imp_weights.mean().item(),
-            # PHASE 2: New PPO monitoring metrics
             "clipfrac": clipfrac.item(),
             "approx_kl": approx_kl.item(),
-            "value_expvar": value_expvar.item(),
         }
 
     def train(self, buffer, update_actor=True):
         """
         Perform multi-epoch PPO training.
-        PHASE 1: Removed duplicate advantage normalization - use only buffer's normalization.
         """
-        # PHASE 1: REMOVED duplicate advantage normalization
-        # The buffer already normalized advantages in compute_returns_and_adv()
-        # We directly use buffer.advantages which are already normalized
-        
         train_info = {}
         train_info['value_loss'] = 0
         train_info['policy_loss'] = 0
@@ -438,10 +467,8 @@ class RMAPPOAlgorithm:
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
-        # PHASE 2: Add new PPO monitoring metrics
         train_info['clipfrac'] = 0
         train_info['approx_kl'] = 0
-        train_info['value_expvar'] = 0
 
         for _ in range(self.ppo_epoch):
             # Always use recurrent generator (simplified)
@@ -456,10 +483,8 @@ class RMAPPOAlgorithm:
                 train_info['actor_grad_norm'] += update_info["actor_grad_norm"]
                 train_info['critic_grad_norm'] += update_info["critic_grad_norm"]
                 train_info['ratio'] += update_info["imp_weights"]
-                # PHASE 2: Accumulate new metrics
                 train_info['clipfrac'] += update_info["clipfrac"]
                 train_info['approx_kl'] += update_info["approx_kl"]
-                train_info['value_expvar'] += update_info["value_expvar"]
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

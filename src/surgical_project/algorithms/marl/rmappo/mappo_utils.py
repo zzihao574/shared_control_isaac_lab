@@ -2,7 +2,7 @@
 Utility functions and base modules for rMAPPO.
 Contains: basic utilities, continuous action distributions, action layer, and PopArt.
 Simplified to support only continuous actions with RNN networks.
-PHASE 1: No changes needed - this module is compatible with Phase 1 modifications.
+MODIFIED: Added Tanh-Gaussian distribution for bounded action space.
 """
 
 import copy
@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import TransformedDistribution, TanhTransform
 
 
 # ============================================================================
@@ -102,14 +103,42 @@ class DiagGaussian(nn.Module):
         return FixedNormal(action_mean, action_logstd.exp())
 
 
+class TanhDiagGaussian(nn.Module):
+    """Tanh-Gaussian distribution for bounded continuous actions in [-1, 1]."""
+    
+    def __init__(self, in_dim, out_dim, use_orthogonal=True, gain=0.01):
+        super().__init__()
+        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
+        def init_(m): 
+            init_method(m.weight, gain=gain)
+            nn.init.constant_(m.bias, 0.0)
+            return m
+        
+        self.fc_mean = init_(nn.Linear(in_dim, out_dim))
+        self.logstd = AddBias(torch.zeros(out_dim))
+
+    def base_dist(self, x):
+        """Get base normal distribution before tanh transform."""
+        mean = self.fc_mean(x)
+        logstd = self.logstd(torch.zeros_like(mean))
+        return FixedNormal(mean, logstd.exp())
+
+    def dist(self, x):
+        """Get transformed distribution (Normal -> Tanh)."""
+        return TransformedDistribution(
+            self.base_dist(x), 
+            [TanhTransform(cache_size=1)]
+        )
+
+
 # ============================================================================
 # ACTION LAYER
 # ============================================================================
 
 class ACTLayer(nn.Module):
-    """Action layer for continuous actions only (Box action space)."""
+    """Action layer for continuous actions with configurable distribution type."""
     
-    def __init__(self, action_space, inputs_dim, use_orthogonal, gain):
+    def __init__(self, action_space, inputs_dim, use_orthogonal, gain, use_tanh=True):
         super(ACTLayer, self).__init__()
         
         # Only support Box action space (continuous)
@@ -117,33 +146,68 @@ class ACTLayer(nn.Module):
             raise ValueError(f"Only Box action space supported, got {action_space.__class__.__name__}")
         
         action_dim = action_space.shape[0]
-        self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
+        self.use_tanh = use_tanh
+        
+        if use_tanh:
+            self._dist = TanhDiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
+        else:
+            self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
     
     def forward(self, x, available_actions=None, deterministic=False):
         """Compute actions and action logprobs from given input."""
-        action_logit = self.action_out(x)
-        actions = action_logit.mode() if deterministic else action_logit.sample()
-        action_log_probs = action_logit.log_probs(actions)
+        if self.use_tanh:
+            d = self._dist.dist(x)
+            if deterministic:
+                # For deterministic actions, use mean of base distribution then tanh
+                base_mean = self._dist.base_dist(x).mean
+                actions = torch.tanh(base_mean)
+            else:
+                actions = d.rsample()
+            action_log_probs = d.log_prob(actions).sum(-1, keepdim=True)
+        else:
+            action_logit = self.action_out(x)
+            actions = action_logit.mode() if deterministic else action_logit.sample()
+            action_log_probs = action_logit.log_probs(actions)
+        
         return actions, action_log_probs
 
     def get_probs(self, x, available_actions=None):
         """Compute action probabilities from inputs."""
-        action_logits = self.action_out(x)
-        action_probs = action_logits.probs
-        return action_probs
+        if self.use_tanh:
+            # For tanh gaussian, return mean of transformed distribution
+            d = self._dist.dist(x)
+            return d.mean
+        else:
+            action_logits = self.action_out(x)
+            return action_logits.probs
 
     def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
         """Compute log probability and entropy of given actions."""
-        action_logit = self.action_out(x)
-        action_log_probs = action_logit.log_probs(action)
-        
-        if active_masks is not None:
-            if len(action_logit.entropy().shape) == len(active_masks.shape):
-                dist_entropy = (action_logit.entropy() * active_masks).sum() / active_masks.sum()
+        if self.use_tanh:
+            d = self._dist.dist(x)
+            action_log_probs = d.log_prob(action).sum(-1, keepdim=True)
+            
+            # For entropy, use base distribution entropy (more stable)
+            base_entropy = self._dist.base_dist(x).entropy().sum(-1)
+            
+            if active_masks is not None:
+                if len(base_entropy.shape) == len(active_masks.shape):
+                    dist_entropy = (base_entropy * active_masks).sum() / active_masks.sum()
+                else:
+                    dist_entropy = (base_entropy * active_masks.squeeze(-1)).sum() / active_masks.sum()
             else:
-                dist_entropy = (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+                dist_entropy = base_entropy.mean()
         else:
-            dist_entropy = action_logit.entropy().mean()
+            action_logit = self.action_out(x)
+            action_log_probs = action_logit.log_probs(action)
+            
+            if active_masks is not None:
+                if len(action_logit.entropy().shape) == len(active_masks.shape):
+                    dist_entropy = (action_logit.entropy() * active_masks).sum() / active_masks.sum()
+                else:
+                    dist_entropy = (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+            else:
+                dist_entropy = action_logit.entropy().mean()
 
         return action_log_probs, dist_entropy
 

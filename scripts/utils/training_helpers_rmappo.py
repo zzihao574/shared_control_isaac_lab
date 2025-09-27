@@ -4,18 +4,7 @@
 Training helper utilities for dual-network rMAPPO multi-environment parallel training.
 Features unified training execution, milestone evaluation, and optimized WandB logging.
 Adapted for independent human and robot networks with synchronized training.
-Updated to use unified mappo_args configuration source.
-CRITICAL FIX: Evaluation RNN state reset now uses 2D format [num_envs, H].
-PHASE 1 MODIFICATIONS:
-- Added eval mode control to prevent buffer writes and step counting during evaluation
-- Added skip episode once functionality
-- Fixed done_mask shape to [N,1]
-PHASE 2 MODIFICATIONS:
-- Fixed console step counter to display global environment logical steps (10, 20, 30...)
-FINAL MODIFICATIONS:
-- Unified step counting: global_step for collection steps only, train_updates for training rounds
-- Evaluation mode is truly read-only with consistent action masking
-- StepTracer prints every 10 steps during evaluation with forced console logging
+MODIFIED: Added obs scaling support and term_masks generation for proper GAE bootstrap.
 """
 
 import argparse
@@ -44,8 +33,7 @@ class RMAPPOTrainingRunner:
     """
     Unified training loop executor for dual-network rMAPPO with rollout collection.
     Features on-policy trajectory collection and unified global step tracking.
-    Updated to use unified mappo_args configuration source.
-    FINAL: Separated collection steps (global_step) from training rounds (train_updates).
+    MODIFIED: Added obs scaling integration in training loop.
     """
     
     def __init__(self, env, rmappo_wrapper, metrics_hub, agent_ids, max_global_steps=None):
@@ -54,7 +42,7 @@ class RMAPPOTrainingRunner:
         self.metrics = metrics_hub
         self.agent_ids = agent_ids
         
-        # FINAL: Clear separation of step counting
+        # Clear separation of step counting
         self.global_step = 0  # ONLY for environment collection steps (training mode only)
         self.train_updates = 0  # ONLY for completed training rounds (rollout->update cycles)
         self.global_episodes = 0  # Total episodes completed
@@ -89,7 +77,10 @@ class RMAPPOTrainingRunner:
         self.is_eval_mode = bool(flag)
 
     def execute_training_step(self):
-        """Execute one complete rollout and training update for both networks."""
+        """
+        Execute one complete rollout and training update for both networks.
+        MODIFIED: Uses obs scaling in select_actions call.
+        """
         try:
             # Use current observations
             current_obs = self._current_obs
@@ -104,12 +95,13 @@ class RMAPPOTrainingRunner:
             
             # Collect complete rollout (T steps) - dual networks in parallel
             for rollout_step in range(self.T):
-                # FINAL: Increment collection step counter and sync to environment (training only)
+                # Increment collection step counter and sync to environment (training only)
                 if not self.is_eval_mode:
                     self.global_step += 1
                     self.env.unwrapped.set_trainer_global_step(self.global_step)
                 
-                # Select actions from both networks independently
+                # MODIFIED: select_actions now handles obs scaling internally
+                # current_obs (raw) -> rmappo.select_actions() -> actions (env format)
                 actions, detail = self.rmappo.select_actions(
                     current_obs, 
                     add_noise=(not self.is_eval_mode),
@@ -120,17 +112,21 @@ class RMAPPOTrainingRunner:
                 self.env.unwrapped.set_detail_actor_info(detail)
                 next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-                # FINAL: Only store transitions during training, not evaluation
+                # Only store transitions during training, not evaluation
                 if not self.is_eval_mode:
-                    # Store transitions for both agents
+                    # Store transitions for both agents with proper term_masks
                     done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
                     
+                    # MODIFIED: Pass terminated and truncated info for proper term_masks generation
                     self.rmappo.add_experience_to_buffer(
-                        obs=current_obs,
+                        obs=current_obs,  # Raw obs - scaling handled inside rmappo
                         actions=actions,
                         rewards=rewards,
                         next_obs=next_obs,
-                        dones=done_any_dict
+                        dones=done_any_dict,
+                        terminated=terminated,  # MODIFIED: Pass terminated info
+                        truncated=truncated,    # MODIFIED: Pass truncated info
+                        infos=infos
                     )
 
                 # Count episodes using OR aggregation (unchanged from shared network version)
@@ -156,12 +152,12 @@ class RMAPPOTrainingRunner:
             # Store final observations for bootstrapping
             self.rmappo.store_next_obs(next_obs)
             
-            # FINAL: Only update networks during training, not evaluation
+            # Only update networks during training, not evaluation
             if not self.is_eval_mode:
                 # Update both networks (complete rollout collected)
                 stats = self.rmappo.update()
 
-                # FINAL: Increment training round counter (removed global_step jump)
+                # Increment training round counter
                 self.train_updates += 1
                 self.global_episodes += episode_count
 
@@ -178,7 +174,7 @@ class RMAPPOTrainingRunner:
                         "model/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
                         "model/ratio": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
                         
-                        # FINAL: Clear separation of step types in logging
+                        # Clear separation of step types in logging
                         "train/collection_steps": self.global_step,
                         "train/training_rounds": self.train_updates,
                         "train/episodes_done": self.global_episodes,
@@ -188,7 +184,7 @@ class RMAPPOTrainingRunner:
                     # Clean None values
                     payload = {k: v for k, v in payload.items() if v is not None}
                     
-                    # FINAL: Use collection steps for x-axis, but include training rounds info
+                    # Use collection steps for x-axis, but include training rounds info
                     self.metrics.push_update(self.global_step, payload)
 
                 # Push force statistics every rollout
@@ -250,9 +246,7 @@ class RMAPPOMilestoneEvaluator:
     """
     Milestone evaluator adapted for dual-network rMAPPO with coordinated evaluation.
     Features normalized return calculation and dual network coordination.
-    Updated to use unified mappo_args configuration source.
-    CRITICAL FIX: Evaluation RNN state reset now uses 2D format.
-    FINAL: Evaluation is truly read-only with consistent action masking and improved StepTracer.
+    MODIFIED: Evaluation uses rmappo's internal obs scaling.
     """
     
     def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids):
@@ -296,7 +290,7 @@ class RMAPPOMilestoneEvaluator:
         
         print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
 
-        # CRITICAL FIX: Reset RNN states after evaluation for both networks
+        # Reset RNN states after evaluation for both networks
         print(f"[EVAL] Resetting RNN states for both networks after evaluation...")
         for aid in self.agent_ids:
             self.rmappo.rnn_states[aid]["actor"].zero_()
@@ -305,7 +299,10 @@ class RMAPPOMilestoneEvaluator:
         return {"skip_episode_once": True}
 
     def _run_single_evaluation_episode(self):
-        """Run single environment evaluation episode with dual network coordination."""
+        """
+        Run single environment evaluation episode with dual network coordination.
+        MODIFIED: Uses rmappo's select_actions which handles obs scaling internally.
+        """
         active_env = 0
         target_episodes = 1
         
@@ -320,12 +317,11 @@ class RMAPPOMilestoneEvaluator:
         ep_steps = torch.zeros(num_envs, dtype=torch.int64, device=self.rmappo.device)
         completed_return_norms = []
         
-        # FIXED: Reset RNN states for evaluation (both networks) using 2D format
+        # Reset RNN states for evaluation (both networks) using 2D format
         for aid in self.agent_ids:
             # Use mappo_args instead of ppo for hidden_size
             mappo_args = self.rmappo.params.get('mappo_args', {})
             H = mappo_args.get('hidden_size', 256)
-            # FIXED: 3D -> 2D format
             self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
             self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
         
@@ -345,44 +341,31 @@ class RMAPPOMilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # Coordinate dual networks for action selection (deterministic)
-                actions_dict = {}
-                for aid in self.agent_ids:
-                    obs_tensor, share_obs_tensor = self.rmappo.build_obs_tensors(current_obs, aid)
-                    masks = torch.ones(obs_tensor.shape[0], 1, device=self.rmappo.device)
-                    
-                    values, actions_norm, action_log_probs, rnn_a_new, rnn_c_new = self.rmappo.policies[aid].get_actions(
-                        share_obs_tensor, obs_tensor, 
-                        self.rmappo.rnn_states[aid]["actor"], self.rmappo.rnn_states[aid]["critic"], 
-                        masks, deterministic=True
-                    )
-                    
-                    # Update RNN states for this agent
-                    self.rmappo.rnn_states[aid]["actor"] = rnn_a_new
-                    self.rmappo.rnn_states[aid]["critic"] = rnn_c_new
-                    
-                    actions_dict[aid] = actions_norm
-                
-                # Convert to environment format
-                env_actions = self.rmappo.actions_to_env_format(actions_dict)
+                # MODIFIED: Use rmappo.select_actions which handles obs scaling internally
+                # No need to manually scale obs here - rmappo does it internally
+                actions_dict, detail_info = self.rmappo.select_actions(
+                    current_obs,
+                    add_noise=False,
+                    deterministic=True
+                )
                 
                 # Apply complete action masking - only env0 executes real actions
-                for aid, act in env_actions.items():
+                for aid, act in actions_dict.items():
                     if act.ndim == 2:
                         masked_actions = torch.zeros_like(act)
                         masked_actions[active_env] = act[active_env]
-                        env_actions[aid] = masked_actions
+                        actions_dict[aid] = masked_actions
                 
-                # FINAL: Create detail info with same masking as env_actions for consistency
+                # Update detail info with same masking for consistency
                 detail_info = {
-                    "mean_actions": {aid: env_actions[aid].clone() for aid in self.agent_ids},  # Already masked
-                    "noise_actions": {aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids}  # No noise in eval
+                    "mean_actions": {aid: actions_dict[aid].clone() for aid in self.agent_ids},
+                    "noise_actions": {aid: torch.zeros_like(actions_dict[aid]) for aid in self.agent_ids}
                 }
                 env.set_detail_actor_info(detail_info)
                 
-                obs, rewards, terminated, truncated, infos = env.step(env_actions)
+                obs, rewards, terminated, truncated, infos = env.step(actions_dict)
                 
-                # FINAL: StepTracer with forced console logging every 10 steps
+                # StepTracer with forced console logging every 10 steps
                 if (eval_step_counter % 10 == 0 and hasattr(env, 'step_tracer') and 
                     env.step_tracer is not None):
                     # Temporarily enable console logging for evaluation visibility
@@ -488,8 +471,7 @@ class WandBLogger:
     """
     Optimized WandB logger adapted for dual-network rMAPPO metrics.
     Features network configuration logging and milestone tracking.
-    Updated to use unified mappo_args configuration source.
-    FINAL: Enhanced with collection steps vs training rounds separation.
+    MODIFIED: Enhanced with Tanh-Gaussian and obs scaling documentation.
     """
     
     # Dual network agent metrics mapping
@@ -504,8 +486,8 @@ class WandBLogger:
     GLOBAL_METRICS_MAP = {
         "model/entropy": "model/entropy",
         "model/ratio": "model/ppo_ratio",
-        "train/collection_steps": "train/collection_steps",  # NEW: Environment interaction steps
-        "train/training_rounds": "train/training_rounds",    # NEW: Training update rounds
+        "train/collection_steps": "train/collection_steps",
+        "train/training_rounds": "train/training_rounds", 
         "train/episodes_done": "train/global_episodes", 
         "training/policy_updates": "train/policy_updates",
         "training/value_updates": "train/value_updates",
@@ -530,7 +512,10 @@ class WandBLogger:
             print("[WANDB] Disabled")
 
     def initialize_run(self, config: Dict[str, Any], run_name: Optional[str] = None) -> None:
-        """Initialize WandB run with enhanced dual-network rMAPPO configuration tracking."""
+        """
+        Initialize WandB run with enhanced dual-network rMAPPO configuration tracking.
+        MODIFIED: Added Tanh-Gaussian and obs scaling documentation.
+        """
         if not self.enabled:
             return
         
@@ -539,8 +524,8 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network", "step-counting-fixed"],
-            notes="Multi-environment parallel dual-network rMAPPO training with RNN, rollout collection, PPO updates, and unified step counting",
+            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network", "tanh-gaussian", "obs-scaling"],
+            notes="Multi-environment parallel dual-network rMAPPO training with Tanh-Gaussian action domain, obs scaling, and term_masks GAE support",
             settings=wandb.Settings(start_method="thread")
         )
         
@@ -555,7 +540,7 @@ class WandBLogger:
             "value_loss_coef": mappo_cfg.get("value_loss_coef", 0.5),
             "entropy_coef": mappo_cfg.get("entropy_coef", 0.01),
             "reward_scale": 0.01,
-            "agent_mode": "robot_human_dual_network",  # Updated to reflect dual network architecture
+            "agent_mode": "robot_human_dual_network",
             "reward_components": "trajectory+progress+potential_field",
             "termination_mode": "direct_obstacle_collision",
             "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
@@ -571,8 +556,13 @@ class WandBLogger:
             # Dual network info
             "network_architecture": "dual_independent",
             "network_init": "robot_copy_from_human",
-            "rnn_state_format": "external_2d_internal_3d",  # Document the fix
-            # FINAL: Step counting documentation
+            "rnn_state_format": "external_2d_internal_3d",
+            # MODIFIED: Document new features
+            "action_distribution": "tanh_gaussian",
+            "action_domain": "bounded_minus_one_to_one",
+            "obs_scaling_enabled": bool(config.get("obs_scaling", {}).get("factors")),
+            "obs_scaling_factors": config.get("obs_scaling", {}).get("factors", "none"),
+            "gae_term_masks_enabled": True,
             "step_counting_method": "collection_steps_separate_from_training_rounds",
             "evaluation_mode": "read_only_deterministic_with_masking",
         })
@@ -602,7 +592,7 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping and step separation.")
+        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping and enhanced feature tracking.")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
         """Log metrics with dual-network rMAPPO-specific mapping."""
@@ -695,10 +685,12 @@ class TopKModelManager:
         """Save checkpoint with top-K models (dual network support)."""
         checkpoint = {
             'agent_ids': agent_ids,
-            'algorithm': 'rmappo_dual',  # Updated to reflect dual network
+            'algorithm': 'rmappo_dual',
             'network_architecture': 'dual_independent',
-            'rnn_state_format': 'external_2d_internal_3d',  # Document the fix
-            'step_counting_method': 'collection_steps_separate_from_training_rounds',  # NEW
+            'rnn_state_format': 'external_2d_internal_3d',
+            'action_distribution': 'tanh_gaussian',  # MODIFIED: Document action distribution
+            'obs_scaling_enabled': True,  # MODIFIED: Document obs scaling
+            'step_counting_method': 'collection_steps_separate_from_training_rounds',
             'top_k_count': len(self.top_models),
             'top_k_models': []
         }
@@ -731,10 +723,12 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
         'agent_ids': rmappo_wrapper.agent_ids,
         'algorithm': 'rmappo_dual',
         'network_architecture': 'dual_independent',
-        'rnn_state_format': 'external_2d_internal_3d',  # Document the fix
-        'step_counting_method': 'collection_steps_separate_from_training_rounds',  # NEW
-        'global_steps_total': global_step,  # Collection steps
-        'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),  # Training rounds (if available)
+        'rnn_state_format': 'external_2d_internal_3d',
+        'action_distribution': 'tanh_gaussian',  # MODIFIED: Document action distribution
+        'obs_scaling_enabled': bool(rmappo_wrapper.params.get('obs_scaling', {}).get('factors')),  # MODIFIED
+        'step_counting_method': 'collection_steps_separate_from_training_rounds',
+        'global_steps_total': global_step,
+        'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),
         'episodes_done_total': global_episodes,
         'max_milestone_triggered': max_milestone_triggered or 0,
         'rollout_horizon': rmappo_wrapper.T,
@@ -762,7 +756,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_rmappo.yaml')
 
-    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training with unified step counting")
+    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training with Tanh-Gaussian and obs scaling")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
