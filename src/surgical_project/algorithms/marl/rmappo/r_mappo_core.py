@@ -2,13 +2,80 @@
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
 Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
 MODIFIED: Fixed gradient norm type conversion and updated ACTLayer to use Tanh-Gaussian.
+FAIL-FAST: Removed all NaN/Inf repair, gradient clipping, and emergency fallbacks.
+MODIFIED: Added 12-core gradient monitoring system with dump mechanism for forensics.
+MODIFIED: Updated WandB logging keys to 7-prefix structure (policy/ppo/value/rnn/grad/train/lifecycle).
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
+import os
 from .mappo_utils import init, check, get_shape_from_obs_space, ACTLayer, PopArt
 from .rnn import RNNLayer
+
+
+# =============================================================================
+# FAIL-FAST CHECKING FUNCTIONS
+# =============================================================================
+
+def finite_check(name: str, x: torch.Tensor, raise_on_fail: bool = True) -> bool:
+    """Check for NaN/Inf in tensor - fail fast, no repair"""
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"{name}: expected Tensor, got {type(x)}")
+    if not torch.is_floating_point(x):
+        return True
+    ok = torch.isfinite(x).all().item()
+    if ok:
+        return True
+    bad_ratio = (~torch.isfinite(x)).float().mean().item()
+    try:
+        min_v = torch.nanmin(x).item()
+        max_v = torch.nanmax(x).item()
+    except Exception:
+        min_v, max_v = float("nan"), float("nan")
+    msg = (f"[NUMERIC ERROR] {name}: non-finite values detected\n"
+           f"  - bad_ratio={bad_ratio*100:.2f}%\n"
+           f"  - range=[{min_v:.3e}, {max_v:.3e}]\n"
+           f"  - shape={tuple(x.shape)}, device={x.device}, dtype={x.dtype}")
+    if raise_on_fail:
+        raise ValueError(msg)
+    else:
+        print("[WARNING]", msg)
+        return False
+
+def grad_norm_and_check(named_params, module_name: str) -> float:
+    """Calculate gradient norm and check for NaN/Inf - no clipping"""
+    total = 0.0
+    for name, p in named_params:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        finite_check(f"{module_name}.grad[{name}]", g)  # Fail if NaN/Inf found
+        total += g.pow(2).sum().item()
+    return total ** 0.5
+
+
+def _dump_batch(prefix, tensors, dir_="/tmp/rmappo_spikes"):
+    """Dump batch snapshot for gradient spike forensics."""
+    import os, torch
+    os.makedirs(dir_, exist_ok=True)
+    path = os.path.join(dir_, f"{prefix}.pt")
+    torch.save({k: v.detach().cpu() for k,v in tensors.items()}, path)
+    print(f"[DUMP] Saved batch snapshot to {path}")  # CLI: only exception line
+    return path
+
+
+def _flat(x):
+    """Flatten tensor for monitoring - keep last dimension for multi-dim actions."""
+    return x.view(-1, x.size(-1)) if x.dim() > 2 else x.view(-1)
+
+
+def _h_mean_norm(h):
+    """Calculate mean norm of RNN hidden states."""
+    if h.dim() == 3: 
+        h = h[-1]  # Take last layer
+    return h.view(-1, h.size(-1)).norm(p=2, dim=1).mean()
 
 
 # =============================================================================
@@ -16,10 +83,7 @@ from .rnn import RNNLayer
 # =============================================================================
 
 class R_Actor(nn.Module):
-    """
-    Actor network for rMAPPO with RNN only.
-    Simplified: removed CNN/MLP choices, always use RNN.
-    """
+    """Actor network for rMAPPO with RNN only."""
     def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
         super(R_Actor, self).__init__()
         self.hidden_size = args['hidden_size']
@@ -31,17 +95,17 @@ class R_Actor(nn.Module):
 
         obs_shape = get_shape_from_obs_space(obs_space)
         
-        # Simplified: directly create a basic linear layer as base
+        # Basic linear layer as base
         self.base = nn.Sequential(
             nn.Linear(obs_shape[0], self.hidden_size),
             nn.ReLU(),
             nn.Linear(self.hidden_size, self.hidden_size)
         )
 
-        # Always use RNN (no conditional)
+        # Always use RNN
         self.rnn = RNNLayer(self.hidden_size, self.hidden_size, self._recurrent_N, self._use_orthogonal)
 
-        # Action layer with Tanh-Gaussian enabled by default
+        # Action layer with Tanh-Gaussian
         self.act = ACTLayer(action_space, self.hidden_size, self._use_orthogonal, self._gain, use_tanh=True)
 
         self.to(device)
@@ -52,9 +116,20 @@ class R_Actor(nn.Module):
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
+        # Input validation - fail immediately
+        finite_check("actor_obs_input", obs)
+        finite_check("actor_rnn_states_input", rnn_states)
+
         actor_features = self.base(obs)
+        finite_check("actor_base_features", actor_features)
+        
         actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+        finite_check("actor_rnn_output", actor_features)
+        finite_check("actor_rnn_states_output", rnn_states)
+        
         actions, action_log_probs = self.act(actor_features, available_actions=None, deterministic=deterministic)
+        finite_check("actor_actions_output", actions)
+        finite_check("actor_log_probs_output", action_log_probs)
 
         return actions, action_log_probs, rnn_states
 
@@ -65,21 +140,27 @@ class R_Actor(nn.Module):
         action = check(action).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
+        # Input validation - fail immediately
+        finite_check("actor_eval_obs", obs)
+        finite_check("actor_eval_rnn_states", rnn_states)
+        finite_check("actor_eval_action", action)
+
         actor_features = self.base(obs)
+        finite_check("actor_eval_base_features", actor_features)
+        
         actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+        finite_check("actor_eval_rnn_output", actor_features)
 
         action_log_probs, dist_entropy = self.act.evaluate_actions(
             actor_features, action, available_actions=None, active_masks=None
         )
+        finite_check("actor_eval_log_probs", action_log_probs)
 
         return action_log_probs, dist_entropy
 
 
 class R_Critic(nn.Module):
-    """
-    Critic network for rMAPPO with RNN only.
-    Simplified: removed CNN/MLP choices, always use RNN.
-    """
+    """Critic network for rMAPPO with RNN only."""
     def __init__(self, args, cent_obs_space, device=torch.device("cpu")):
         super(R_Critic, self).__init__()
         self.hidden_size = args['hidden_size']
@@ -91,14 +172,14 @@ class R_Critic(nn.Module):
 
         cent_obs_shape = get_shape_from_obs_space(cent_obs_space)
         
-        # Simplified: directly create a basic linear layer as base
+        # Basic linear layer as base
         self.base = nn.Sequential(
             nn.Linear(cent_obs_shape[0], self.hidden_size),
             nn.ReLU(),
             nn.Linear(self.hidden_size, self.hidden_size)
         )
 
-        # Always use RNN (no conditional)
+        # Always use RNN
         self.rnn = RNNLayer(self.hidden_size, self.hidden_size, self._recurrent_N, self._use_orthogonal)
 
         # Value output layer
@@ -118,9 +199,19 @@ class R_Critic(nn.Module):
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
+        # Input validation - fail immediately
+        finite_check("critic_obs_input", cent_obs)
+        finite_check("critic_rnn_states_input", rnn_states)
+
         critic_features = self.base(cent_obs)
+        finite_check("critic_base_features", critic_features)
+        
         critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
+        finite_check("critic_rnn_output", critic_features)
+        finite_check("critic_rnn_states_output", rnn_states)
+        
         values = self.v_out(critic_features)
+        finite_check("critic_values_output", values)
 
         return values, rnn_states
 
@@ -130,16 +221,13 @@ class R_Critic(nn.Module):
 # =============================================================================
 
 class RMAPPOPolicy:
-    """
-    rMAPPO Policy class - 策略包装器
-    职责：管理网络和优化器，提供推理接口
-    """
+    """rMAPPO Policy class - manages networks and optimizers."""
 
     def __init__(self, obs_space_desc, cent_obs_space_desc, act_space_desc, device, args):
         self.device = device
         self.args = args
         
-        # Extract learning rates and optimizer settings (with explicit type conversion)
+        # Extract learning rates and optimizer settings
         self.actor_lr = float(args.get('actor_lr', 3e-4))
         self.critic_lr = float(args.get('critic_lr', 3e-4)) 
         self.opt_eps = float(args.get('opt_eps', 1e-5))
@@ -214,19 +302,8 @@ class RMAPPOPolicy:
 
 
 # =============================================================================
-# ALGORITHM TRAINER (RENAMED)
+# ALGORITHM TRAINER
 # =============================================================================
-
-def get_grad_norm(parameters):
-    """Calculate gradient norm."""
-    total_norm = 0
-    for p in parameters:
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1. / 2)
-    return total_norm
-
 
 def huber_loss(e, d):
     """Huber loss function."""
@@ -241,7 +318,7 @@ def mse_loss(e):
 
 
 class ValueNorm:
-    """Simple value normalization (placeholder implementation)."""
+    """Simple value normalization."""
     def __init__(self, input_shape, device=torch.device("cpu")):
         self.device = device
         self.mean = 0.0
@@ -277,10 +354,7 @@ class ValueNorm:
 
 
 class RMAPPOAlgorithm:
-    """
-    rMAPPO Algorithm Trainer (renamed from RMAPPOTrainer)
-    职责：执行PPO算法更新，包括loss计算、梯度更新等
-    """
+    """rMAPPO Algorithm Trainer - executes PPO updates with 12-core gradient monitoring."""
 
     def __init__(self, args, policy, device=torch.device("cpu")):
         self.device = device
@@ -296,11 +370,13 @@ class RMAPPOAlgorithm:
         self.max_grad_norm = args.get('max_grad_norm', 0.5)
         self.huber_delta = args.get('huber_delta', 1.0)
 
-        # Keep these options but simplify others
-        self._use_max_grad_norm = True  # Always use grad norm clipping
         self._use_clipped_value_loss = args.get('use_clipped_value_loss', False)
         self._use_popart = args.get('use_popart', False)
         self._use_valuenorm = args.get('use_valuenorm', False)
+
+        # Gradient monitoring system
+        self.log_fn = args.get('log_fn', lambda d, step=None: None)
+        self.global_step = 0
 
         assert (self._use_popart and self._use_valuenorm) == False, (
             "use_popart and use_valuenorm cannot be both True")
@@ -313,7 +389,7 @@ class RMAPPOAlgorithm:
             self.value_normalizer = None
 
     def cal_value_loss(self, values, value_preds_batch, return_batch):
-        """Calculate value function loss. Always use Huber loss."""
+        """Calculate value function loss using Huber loss."""
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.clip_param, self.clip_param)
         
         if self._use_popart or self._use_valuenorm:
@@ -324,7 +400,7 @@ class RMAPPOAlgorithm:
             error_clipped = return_batch - value_pred_clipped
             error_original = return_batch - values
 
-        # Always use Huber loss (removed switch)
+        # Always use Huber loss
         value_loss_clipped = huber_loss(error_clipped, self.huber_delta)
         value_loss_original = huber_loss(error_original, self.huber_delta)
 
@@ -338,74 +414,96 @@ class RMAPPOAlgorithm:
         return value_loss
 
     def ppo_update(self, sample, update_actor=True):
-        """
-        Single PPO update step. Modified to use dict access and shape validation.
-        FIXED: Added comprehensive shape guards to prevent batch mismatch errors.
-        """
-        # Use dict access - keep original 3D format for validation
-        share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)  # [L, B, share_obs_dim]
-        obs_batch = check(sample["obs"]).to(**self.tpdv)  # [L, B, obs_dim]
-        rnn_states_batch = check(sample["rnn_states_actor"]).to(**self.tpdv)  # [B, H]
-        rnn_states_critic_batch = check(sample["rnn_states_critic"]).to(**self.tpdv)  # [B, H]
-        actions_batch = check(sample["actions"]).to(**self.tpdv)  # [L, B, act_dim]
-        value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)  # [L, B, 1]
-        return_batch = check(sample["returns"]).to(**self.tpdv)  # [L, B, 1]
-        masks_batch = check(sample["masks"]).to(**self.tpdv)  # [L, B, 1]
-        old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)  # [L, B, 1]
-        adv_targ = check(sample["advantages"]).to(**self.tpdv)  # [L, B, 1]
+        """Single PPO update step with 12-core gradient monitoring and dump mechanism."""
+        # Input data validation
+        share_obs_batch = check(sample["share_obs"]).to(**self.tpdv)
+        obs_batch = check(sample["obs"]).to(**self.tpdv)
+        rnn_states_batch = check(sample["rnn_states_actor"]).to(**self.tpdv)
+        rnn_states_critic_batch = check(sample["rnn_states_critic"]).to(**self.tpdv)
+        actions_batch = check(sample["actions"]).to(**self.tpdv)
+        value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)
+        return_batch = check(sample["returns"]).to(**self.tpdv)
+        masks_batch = check(sample["masks"]).to(**self.tpdv)
+        old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)
+        adv_targ = check(sample["advantages"]).to(**self.tpdv)
 
-        # FIXED: Shape validation guards to catch dimension mismatches early
+        # Input data integrity checks - fail immediately on bad data
+        finite_check("ppo_obs_batch", obs_batch)
+        finite_check("ppo_share_obs_batch", share_obs_batch)
+        finite_check("ppo_actions_batch", actions_batch)
+        finite_check("ppo_returns", return_batch)
+        finite_check("ppo_advantages", adv_targ)
+        finite_check("ppo_value_preds", value_preds_batch)
+        finite_check("ppo_old_log_probs", old_action_log_probs_batch)
+
+        # Shape validation
         L, B = obs_batch.shape[:2]
         
         assert actions_batch.shape[:2] == (L, B), \
-            f"[ppo_update] actions {actions_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"actions {actions_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert masks_batch.shape[:2] == (L, B), \
-            f"[ppo_update] masks {masks_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"masks {masks_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert share_obs_batch.shape[:2] == (L, B), \
-            f"[ppo_update] share_obs {share_obs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"share_obs {share_obs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert value_preds_batch.shape[:2] == (L, B), \
-            f"[ppo_update] value_preds {value_preds_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"value_preds {value_preds_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert return_batch.shape[:2] == (L, B), \
-            f"[ppo_update] returns {return_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"returns {return_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert old_action_log_probs_batch.shape[:2] == (L, B), \
-            f"[ppo_update] old_action_log_probs {old_action_log_probs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"old_action_log_probs {old_action_log_probs_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         assert adv_targ.shape[:2] == (L, B), \
-            f"[ppo_update] advantages {adv_targ.shape[:2]} != obs {obs_batch.shape[:2]}"
+            f"advantages {adv_targ.shape[:2]} != obs {obs_batch.shape[:2]}"
         
         # Flatten for network processing
-        share_obs_flat = share_obs_batch.view(L * B, -1)  # [L*B, share_obs_dim]
-        obs_flat = obs_batch.view(L * B, -1)  # [L*B, obs_dim]
-        actions_flat = actions_batch.view(L * B, -1)  # [L*B, act_dim]
-        masks_flat = masks_batch.view(L * B, -1)  # [L*B, 1]
+        share_obs_flat = share_obs_batch.view(L * B, -1)
+        obs_flat = obs_batch.view(L * B, -1)
+        actions_flat = actions_batch.view(L * B, -1)
+        masks_flat = masks_batch.view(L * B, -1)
 
-        # FIXED: Post-flatten validation to ensure strict consistency
-        assert actions_flat.size(0) == obs_flat.size(0), \
-            f"[ppo_update] flatten mismatch: actions {actions_flat.size(0)} vs obs {obs_flat.size(0)}"
-        assert masks_flat.size(0) == obs_flat.size(0), \
-            f"[ppo_update] flatten mismatch: masks {masks_flat.size(0)} vs obs {obs_flat.size(0)}"
-        assert share_obs_flat.size(0) == obs_flat.size(0), \
-            f"[ppo_update] flatten mismatch: share_obs {share_obs_flat.size(0)} vs obs {obs_flat.size(0)}"
-
-        # Forward pass through networks with flattened inputs
+        # Forward pass through networks
         values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
             share_obs_flat, obs_flat, rnn_states_batch, rnn_states_critic_batch,
             actions_flat, masks_flat
         )
         
-        # FIXED: Additional validation after forward pass
-        assert action_log_probs.size(0) == actions_flat.size(0), \
-            f"[ppo_update] forward pass mismatch: action_log_probs {action_log_probs.size(0)} vs actions {actions_flat.size(0)}"
-        assert values.size(0) == actions_flat.size(0), \
-            f"[ppo_update] forward pass mismatch: values {values.size(0)} vs actions {actions_flat.size(0)}"
+        # Post-forward pass validation
+        finite_check("ppo_forward_values", values)
+        finite_check("ppo_forward_action_log_probs", action_log_probs)
         
         # Flatten target tensors for loss computation
-        value_preds_batch = value_preds_batch.view(L * B, -1)  # [L*B, 1]
-        return_batch = return_batch.view(L * B, -1)  # [L*B, 1]
-        old_action_log_probs_batch = old_action_log_probs_batch.view(L * B, -1)  # [L*B, 1]
-        adv_targ = adv_targ.view(L * B, -1)  # [L*B, 1]
+        value_preds_batch = value_preds_batch.view(L * B, -1)
+        return_batch = return_batch.view(L * B, -1)
+        old_action_log_probs_batch = old_action_log_probs_batch.view(L * B, -1)
+        adv_targ = adv_targ.view(L * B, -1)
         
+        # ===== 12-CORE MONITORING SYSTEM (UPDATED KEYS) =====
+        # Calculate all monitoring metrics before backprop
+        ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
+        approx_kl = (old_action_log_probs_batch - action_log_probs)
+        act_used = _flat(actions_batch)
+
+        # Log 12 core monitoring metrics with NEW 7-prefix structure
+        self.log_fn({
+            "ppo/ratio_mean": float(ratio.mean().detach()),
+            "ppo/ratio_max":  float(ratio.max().detach()),
+            "ppo/kl_mean":    float(approx_kl.mean().detach()),
+            "ppo/clip_fraction":  float(((ratio > 1+self.clip_param) | (ratio < 1-self.clip_param)).float().mean().detach()),
+
+            "value/adv_std":      float(adv_targ.std().detach()),
+            "value/ret_absmax":   float(return_batch.abs().max().detach()),
+            "value/v_absmax":     float(values.abs().max().detach()),
+
+            "policy/saturation": float((act_used.abs() > 0.98).float().mean().detach()),
+            "policy/logstd_mean": float(self.policy.actor.act.logstd_mean() if hasattr(self.policy.actor.act,"logstd_mean") else 0.0),
+            "policy/entropy":     float(dist_entropy.detach()),
+
+            "rnn/actor_h_norm":  float(_h_mean_norm(rnn_states_batch).detach()),
+            "rnn/critic_h_norm": float(_h_mean_norm(rnn_states_critic_batch).detach()),
+        }, step=self.global_step)
+
         # Actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
+        finite_check("ppo_importance_weights", imp_weights)
 
         surr1 = imp_weights * adv_targ
         surr2 = torch.clamp(imp_weights, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv_targ
@@ -413,25 +511,67 @@ class RMAPPOAlgorithm:
         policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
         policy_loss = policy_action_loss
 
+        # Loss validation before backward pass
+        finite_check("ppo_policy_loss", policy_loss.unsqueeze(0))
+        finite_check("ppo_dist_entropy", dist_entropy.unsqueeze(0))
+
         self.policy.actor_optimizer.zero_grad()
 
         if update_actor:
             (policy_loss - dist_entropy * self.entropy_coef).backward()
 
-        # Always use gradient clipping
-        actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+        # Gradient checking and explosion detection with dump mechanism
+        actor_grad_norm = grad_norm_and_check(self.policy.actor.named_parameters(), "actor")
+        
+        # Record actor gradient norm (NEW KEY)
+        self.log_fn({"grad/actor_total": actor_grad_norm}, step=self.global_step)
+
+        # Dump batch before raising on gradient explosion
+        if actor_grad_norm > self.max_grad_norm:
+            dump_path = _dump_batch(
+                prefix=f"spike_step{self.global_step}",
+                tensors=dict(
+                    share_obs_batch=share_obs_batch, obs_batch=obs_batch,
+                    actions_batch=actions_batch, old_action_log_probs_batch=old_action_log_probs_batch,
+                    action_log_probs=action_log_probs, values=values,
+                    value_preds_batch=value_preds_batch, return_batch=return_batch,
+                    adv_targ=adv_targ, masks_batch=masks_batch,
+                    rnn_states_actor=rnn_states_batch, rnn_states_critic=rnn_states_critic_batch,
+                )
+            )
+            self.log_fn({"debug/dump_path": dump_path}, step=self.global_step)
+            raise RuntimeError(f"Actor grad norm too large: {actor_grad_norm:.4f} > {self.max_grad_norm}")
 
         self.policy.actor_optimizer.step()
 
         # Critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch)
 
+        # Value loss validation
+        finite_check("ppo_value_loss", value_loss.unsqueeze(0))
+
         self.policy.critic_optimizer.zero_grad()
 
         (value_loss * self.value_loss_coef).backward()
 
-        # Always use gradient clipping
-        critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
+        # Critic gradient checking with dump mechanism
+        critic_grad_norm = grad_norm_and_check(self.policy.critic.named_parameters(), "critic")
+        
+        # Dump batch before raising on critic gradient explosion
+        if critic_grad_norm > self.max_grad_norm:
+            dump_path = _dump_batch(
+                prefix=f"critic_spike_step{self.global_step}",
+                tensors=dict(
+                    share_obs_batch=share_obs_batch, obs_batch=obs_batch,
+                    actions_batch=actions_batch, old_action_log_probs_batch=old_action_log_probs_batch,
+                    action_log_probs=action_log_probs, values=values,
+                    value_preds_batch=value_preds_batch, return_batch=return_batch,
+                    adv_targ=adv_targ, masks_batch=masks_batch,
+                    rnn_states_actor=rnn_states_batch, rnn_states_critic=rnn_states_critic_batch,
+                )
+            )
+            self.log_fn({"debug/dump_path": dump_path}, step=self.global_step)
+            raise RuntimeError(f"Critic grad norm too large: {critic_grad_norm:.4f} > {self.max_grad_norm}")
 
         self.policy.critic_optimizer.step()
 
@@ -444,22 +584,19 @@ class RMAPPOAlgorithm:
             # Approximate KL divergence
             approx_kl = (old_action_log_probs_batch - action_log_probs).mean().clamp_min(0)
 
-        # FIXED: Convert tensor grad norms to float to avoid serialization issues
         return {
             "value_loss": value_loss.item(),
-            "critic_grad_norm": float(critic_grad_norm.item()),
+            "critic_grad_norm": float(critic_grad_norm),
             "policy_loss": policy_loss.item(),
             "dist_entropy": dist_entropy.item(),
-            "actor_grad_norm": float(actor_grad_norm.item()),
+            "actor_grad_norm": float(actor_grad_norm),
             "imp_weights": imp_weights.mean().item(),
             "clipfrac": clipfrac.item(),
             "approx_kl": approx_kl.item(),
         }
 
     def train(self, buffer, update_actor=True):
-        """
-        Perform multi-epoch PPO training.
-        """
+        """Perform multi-epoch PPO training with global step increment."""
         train_info = {}
         train_info['value_loss'] = 0
         train_info['policy_loss'] = 0
@@ -471,7 +608,6 @@ class RMAPPOAlgorithm:
         train_info['approx_kl'] = 0
 
         for _ in range(self.ppo_epoch):
-            # Always use recurrent generator (simplified)
             data_generator = buffer.recurrent_generator(self.num_mini_batch, self.data_chunk_length)
 
             for sample in data_generator:
@@ -485,6 +621,9 @@ class RMAPPOAlgorithm:
                 train_info['ratio'] += update_info["imp_weights"]
                 train_info['clipfrac'] += update_info["clipfrac"]
                 train_info['approx_kl'] += update_info["approx_kl"]
+
+                # Increment global step after each mini-batch update
+                self.global_step += 1
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
