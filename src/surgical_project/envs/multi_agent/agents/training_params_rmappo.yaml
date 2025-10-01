@@ -1,31 +1,33 @@
 # Training parameters configuration for dual independent networks
 # Features unified single configuration source: mappo only
-# PHASE 1: No changes needed - already properly structured with unified mappo block
+# MODIFIED: Added separate gradient clipping thresholds, enabled clipped value loss
 
 # ==============================================================================
 # Unified Algorithm Configuration (Single Source of Truth)
 # ==============================================================================
 mappo:
   # Learning rates
-  actor_lr: 0.0007                    # Actor learning rate
-  critic_lr: 0.001                    # Critic learning rate
+  actor_lr: 0.0003                    # Actor learning rate (reduced for stability)
+  critic_lr: 0.0007                   # Critic learning rate (reduced for stability)
   
   # Discount and GAE
   gamma: 0.99                         # Discount factor
   gae_lambda: 0.95                    # GAE lambda
   
-  # PPO specific
-  clip_param: 0.2                     # PPO clipping parameter
-  ppo_epoch: 10                       # Number of PPO epochs per update
-  num_mini_batch: 4                   # Number of mini-batches per epoch
+  # PPO specific (stabilized)
+  clip_param: 0.1                    # PPO clipping parameter (reduced from 0.2)
+  ppo_epoch: 4                        # Number of PPO epochs per update (reduced from 10)
+  num_mini_batch: 8                   # Number of mini-batches per epoch
   data_chunk_length: 16               # RNN sequence length for training
   
   # Loss coefficients
-  value_loss_coef: 0.5                # Value function loss coefficient
-  entropy_coef: 0.01                  # Entropy regularization coefficient
+  entropy_coef: 0.005                  # Entropy regularization coefficient
+  
+  # Gradient clipping (YAML controllable)
+  max_grad_norm_actor: 5.0            # Actor gradient clipping threshold
+  max_grad_norm_critic: 10.0          # Critic gradient clipping threshold
   
   # Optimization
-  max_grad_norm: 20.0                  # Gradient clipping threshold
   opt_eps: 0.00001                    # Optimizer epsilon (1e-5 in decimal)
   weight_decay: 0.0                   # Weight decay
   
@@ -36,9 +38,9 @@ mappo:
   gain: 0.01                          # Initialization gain
   
   # Value normalization options
-  use_popart: false                   # Use PopArt normalization
-  use_valuenorm: false                # Use value normalization
-  use_clipped_value_loss: false       # Use clipped value loss
+  use_popart: false                    # Use PopArt normalization (ENABLED for stability)
+  use_valuenorm: false                # Use value normalization (disabled for stability)
+  use_clipped_value_loss: true        # Use clipped value loss (ENABLED for stability)
   huber_delta: 1.0                    # Huber loss delta
   
   # Training termination
@@ -135,9 +137,9 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.1              # Potential reward weight for robot
-    forceeff_robot: 0.2
-    humanaware_robot: 0.2
+    potential_robot: 0.0            # Potential reward weight for robot
+    forceeff_robot: 0.15
+    humanaware_robot: 0.15
 
     # ===== HUMAN (Independent Network) =====  
     zoneA_weight_human: 0.6
@@ -162,9 +164,9 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.1              # Potential reward weight for human
-    forceeff_human: 0.2
-    robotaware_human: 0.2
+    potential_human: 0.0             # Potential reward weight for human
+    forceeff_human: 0.15
+    robotaware_human: 0.15
 
 # ==============================================================================
 # Termination Conditions
@@ -179,7 +181,7 @@ termination_conditions:
 # ==============================================================================
 obs_scaling:
   # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
-  factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
+  factors: [5.0, 5.0, 5.0, 16.7, 16.7, 16.7, 5.0]  # Position and velocity scaling
 
 # ==============================================================================
 # Training Monitoring

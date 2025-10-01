@@ -3,8 +3,8 @@ Utility functions and base modules for rMAPPO.
 Contains: basic utilities, continuous action distributions, action layer, and PopArt.
 Simplified to support only continuous actions with RNN networks.
 MODIFIED: Added Tanh-Gaussian distribution for bounded action space.
-FAIL-FAST: Removed all NaN/Inf repair mechanisms, replaced with direct error raising.
-MODIFIED: Added logstd_mean() method to ACTLayer for gradient monitoring system.
+MODIFIED: Removed all finite_check functions, relying on PyTorch natural failure.
+STABLE: Core functionality remains, gradient monitoring support via logstd_mean().
 """
 
 import copy
@@ -14,47 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import TransformedDistribution, TanhTransform
-
-
-# ============================================================================
-# FAIL-FAST CHECKING FUNCTIONS
-# ============================================================================
-
-def finite_check(name: str, x: torch.Tensor, raise_on_fail: bool = True) -> bool:
-    """Check for NaN/Inf in tensor - fail fast, no repair"""
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"{name}: expected Tensor, got {type(x)}")
-    if not torch.is_floating_point(x):
-        return True
-    ok = torch.isfinite(x).all().item()
-    if ok:
-        return True
-    bad_ratio = (~torch.isfinite(x)).float().mean().item()
-    try:
-        min_v = torch.nanmin(x).item()
-        max_v = torch.nanmax(x).item()
-    except Exception:
-        min_v, max_v = float("nan"), float("nan")
-    msg = (f"[NUMERIC ERROR] {name}: non-finite values detected\n"
-           f"  - bad_ratio={bad_ratio*100:.2f}%\n"
-           f"  - range=[{min_v:.3e}, {max_v:.3e}]\n"
-           f"  - shape={tuple(x.shape)}, device={x.device}, dtype={x.dtype}")
-    if raise_on_fail:
-        raise ValueError(msg)
-    else:
-        print("[WARNING]", msg)
-        return False
-
-def grad_norm_and_check(named_params, module_name: str) -> float:
-    """Calculate gradient norm and check for NaN/Inf - no clipping"""
-    total = 0.0
-    for name, p in named_params:
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        finite_check(f"{module_name}.grad[{name}]", g)  # Fail if NaN/Inf found
-        total += g.pow(2).sum().item()
-    return total ** 0.5
 
 
 # ============================================================================
@@ -158,22 +117,16 @@ class TanhDiagGaussian(nn.Module):
             return m
         
         self.fc_mean = init_(nn.Linear(in_dim, out_dim))
-        self.logstd = AddBias(torch.zeros(out_dim))
+        self.logstd = AddBias(torch.full((out_dim,), -2.0))
 
     def base_dist(self, x):
         """Get base normal distribution before tanh transform."""
-        finite_check("tanh_gaussian_input_x", x)
-        
         mean = self.fc_mean(x)
         logstd = self.logstd(torch.zeros_like(mean))
         
-        finite_check("tanh_gaussian_mean", mean)
-        finite_check("tanh_gaussian_logstd", logstd)
-        
-        # Model constraint - allowed boundary clamping, not repair
-        logstd = torch.clamp(logstd, -5.0, 2.0)
+        # Model constraint - allowed boundary clamping
+        logstd = torch.clamp(logstd, -3.0 , -1.0)
         std = logstd.exp()
-        finite_check("tanh_gaussian_std", std)
         
         return FixedNormal(mean, std)
 
@@ -223,8 +176,6 @@ class ACTLayer(nn.Module):
     
     def forward(self, x, available_actions=None, deterministic=False):
         """Compute actions and action logprobs from given input."""
-        finite_check("act_layer_input_x", x)
-        
         if self.use_tanh:
             d = self._dist.dist(x)
             if deterministic:
@@ -234,24 +185,17 @@ class ACTLayer(nn.Module):
             else:
                 actions = d.sample()
             
-            finite_check("act_layer_actions", actions)
             action_log_probs = d.log_prob(actions).sum(-1, keepdim=True)
-            finite_check("act_layer_log_probs", action_log_probs)
             
         else:
             action_logit = self.action_out(x)
             actions = action_logit.mode() if deterministic else action_logit.sample()
             action_log_probs = action_logit.log_probs(actions)
             
-            finite_check("act_layer_actions_normal", actions)
-            finite_check("act_layer_log_probs_normal", action_log_probs)
-            
         return actions, action_log_probs
 
     def get_probs(self, x, available_actions=None):
         """Compute action probabilities from inputs."""
-        finite_check("act_layer_get_probs_input", x)
-        
         if self.use_tanh:
             # For tanh gaussian, return mean of transformed distribution
             d = self._dist.dist(x)
@@ -262,17 +206,12 @@ class ACTLayer(nn.Module):
 
     def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
         """Compute log probability and entropy of given actions."""
-        finite_check("act_layer_eval_input_x", x)
-        finite_check("act_layer_eval_input_action", action)
-        
         if self.use_tanh:
             d = self._dist.dist(x)
             action_log_probs = d.log_prob(action).sum(-1, keepdim=True)
-            finite_check("act_layer_eval_log_probs", action_log_probs)
             
             # For entropy, use base distribution entropy (more stable)
             base_entropy = self._dist.base_dist(x).entropy().sum(-1)
-            finite_check("act_layer_eval_base_entropy", base_entropy)
             
             if active_masks is not None:
                 if len(base_entropy.shape) == len(active_masks.shape):
@@ -281,8 +220,6 @@ class ACTLayer(nn.Module):
                     dist_entropy = (base_entropy * active_masks.squeeze(-1)).sum() / active_masks.sum()
             else:
                 dist_entropy = base_entropy.mean()
-                
-            finite_check("act_layer_eval_dist_entropy", dist_entropy.unsqueeze(0) if dist_entropy.dim() == 0 else dist_entropy)
             
         else:
             action_logit = self.action_out(x)

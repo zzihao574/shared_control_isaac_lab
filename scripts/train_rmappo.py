@@ -3,10 +3,8 @@
 """
 rMAPPO training script with dual independent networks integration.
 Features unified configuration source and enhanced error reporting.
-MODIFIED: Added Tanh-Gaussian action domain alignment and obs scaling support.
-FAIL-FAST: Removed all NaN/Inf repair mechanisms, emergency fallbacks, and skip logic.
-MODIFIED: Added unified WandB logging and 12-core monitoring system for gradient explosion forensics.
-MODIFIED: Updated WandB logging keys to 7-prefix structure (policy/ppo/value/rnn/grad/train/lifecycle).
+MODIFIED: Removed all finite_check functions, relying on PyTorch natural failure + wandb monitoring.
+STABLE: Gradient clipping with separate thresholds, unified WandB initialization.
 """
 
 import sys
@@ -42,36 +40,6 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
     print("[WARNING] WandB not available. Install with: pip install wandb")
-
-
-# ============================================================================
-# FAIL-FAST CHECKING FUNCTIONS
-# ============================================================================
-
-def finite_check(name: str, x: torch.Tensor, raise_on_fail: bool = True) -> bool:
-    """Check for NaN/Inf in tensor - fail fast, no repair"""
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"{name}: expected Tensor, got {type(x)}")
-    if not torch.is_floating_point(x):
-        return True
-    ok = torch.isfinite(x).all().item()
-    if ok:
-        return True
-    bad_ratio = (~torch.isfinite(x)).float().mean().item()
-    try:
-        min_v = torch.nanmin(x).item()
-        max_v = torch.nanmax(x).item()
-    except Exception:
-        min_v, max_v = float("nan"), float("nan")
-    msg = (f"[NUMERIC ERROR] {name}: non-finite values detected\n"
-           f"  - bad_ratio={bad_ratio*100:.2f}%\n"
-           f"  - range=[{min_v:.3e}, {max_v:.3e}]\n"
-           f"  - shape={tuple(x.shape)}, device={x.device}, dtype={x.dtype}")
-    if raise_on_fail:
-        raise ValueError(msg)
-    else:
-        print("[WARNING]", msg)
-        return False
 
 
 def setup_global_reproducibility(seed: int, strict_determinism: bool = False):
@@ -144,8 +112,8 @@ def _validate_mappo_args(args: dict, agent_id: str):
     """Validate required mappo arguments."""
     required = ["hidden_size", "recurrent_N", "actor_lr", "critic_lr",
                 "clip_param", "ppo_epoch", "num_mini_batch", "data_chunk_length",
-                "value_loss_coef", "entropy_coef", "max_grad_norm", "opt_eps",
-                "gamma", "gae_lambda", "max_global_steps"]
+                "entropy_coef", "max_grad_norm_actor", "max_grad_norm_critic",
+                "opt_eps", "gamma", "gae_lambda", "max_global_steps"]
     
     missing = [k for k in required if k not in args]
     if missing:
@@ -179,6 +147,7 @@ def load_dual_network_config(config_path: str):
     print(f"  Actor LR: {common.get('actor_lr')}")
     print(f"  Hidden size: {common.get('hidden_size')}")
     print(f"  Max steps: {common.get('max_global_steps')}")
+    print(f"  Gradient clipping: actor={common.get('max_grad_norm_actor')}, critic={common.get('max_grad_norm_critic')}")
     print(f"  Networks: independent human & robot (identical initialization)")
     
     return {
@@ -190,7 +159,7 @@ def load_dual_network_config(config_path: str):
 
 
 def make_wandb_logger():
-    """Create unified WandB logger function for gradient explosion forensics."""
+    """Create unified WandB logger function for gradient monitoring."""
     def _log_fn(d: dict, step: int = None):
         if step is not None:
             d = {"global_step": step, **d}
@@ -264,7 +233,7 @@ def inject_step_tracer(env, config, num_envs):
 
 
 class DualRMAPPOWrapper:
-    """Dual independent network rMAPPO wrapper - FAIL-FAST version with gradient monitoring."""
+    """Dual independent network rMAPPO wrapper with gradient clipping."""
     
     def __init__(self, dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, params, log_fn, args):
         # Import algorithm layer
@@ -383,8 +352,7 @@ class DualRMAPPOWrapper:
         print(f"  Initial weights: robot copied from human")
         print(f"  Force limits: robot={self.max_robot_force}, human={self.max_human_force}")
         print(f"  Action domain: Tanh-Gaussian [-1, 1] -> physical forces")
-        print(f"  FAIL-FAST: enabled - no NaN/Inf repairs")
-        print(f"  Gradient monitoring: enabled with 12-core forensics and 7-prefix WandB logging")
+        print(f"  Gradient clipping: actor={human_config.get('max_grad_norm_actor')}, critic={human_config.get('max_grad_norm_critic')}")
 
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode for both networks."""
@@ -400,11 +368,8 @@ class DualRMAPPOWrapper:
         obs_scaled = {}
         for aid in self.agent_ids:
             if aid in obs_raw:
-                finite_check(f"raw_obs_{aid}", obs_raw[aid])
-                
                 # Apply per-element scaling
                 obs_scaled[aid] = obs_raw[aid] * self.obs_scale_factors[aid].unsqueeze(0)
-                finite_check(f"scaled_obs_{aid}", obs_scaled[aid])
             else:
                 raise ValueError(f"Agent {aid} not found in obs_raw")
         return obs_scaled
@@ -412,18 +377,13 @@ class DualRMAPPOWrapper:
     def build_obs_tensors(self, obs_dict, agent_id: str):
         """Convert agent-specific obs dict to tensors."""
         obs = torch.as_tensor(obs_dict[agent_id], device=self.device, dtype=torch.float32)
-        finite_check(f"obs_tensor_{agent_id}", obs)
         
         # Build centralized observation (concatenate human and robot obs)
         if not hasattr(self, '_cached_share_obs') or self._cached_share_obs is None:
             human_obs = torch.as_tensor(obs_dict["human"], device=self.device, dtype=torch.float32)
             robot_obs = torch.as_tensor(obs_dict["robot"], device=self.device, dtype=torch.float32)
             
-            finite_check("human_obs_for_share", human_obs)
-            finite_check("robot_obs_for_share", robot_obs)
-            
             self._cached_share_obs = torch.cat([human_obs, robot_obs], dim=1)  # [E, 2*obs_dim]
-            finite_check("share_obs_tensor", self._cached_share_obs)
         
         return obs, self._cached_share_obs
     
@@ -437,11 +397,8 @@ class DualRMAPPOWrapper:
         force_limits = {"human": self.max_human_force, "robot": self.max_robot_force}
         
         for aid, actions_norm in actions_dict.items():
-            finite_check(f"normalized_actions_{aid}", actions_norm)
-            
             # Linear scaling from [-1, 1] to physical force range
             env_actions[aid] = actions_norm * force_limits[aid]
-            finite_check(f"env_actions_{aid}", env_actions[aid])
             
         return env_actions
 
@@ -471,13 +428,6 @@ class DualRMAPPOWrapper:
                     self.rnn_states[aid]["actor"], self.rnn_states[aid]["critic"],
                     masks, deterministic=deterministic
                 )
-            
-            # Action output validation
-            finite_check(f"action_output_{aid}", a)
-            finite_check(f"value_output_{aid}", v)
-            finite_check(f"log_prob_output_{aid}", lp)
-            finite_check(f"rnn_actor_new_{aid}", rnn_a_new)
-            finite_check(f"rnn_critic_new_{aid}", rnn_c_new)
             
             actions_norm[aid] = a  # Already in [-1, 1] from Tanh-Gaussian
             action_log_probs[aid] = lp
@@ -517,15 +467,6 @@ class DualRMAPPOWrapper:
             if not torch.allclose(obs, scaled, atol=0, rtol=0):
                 raise RuntimeError(f"[SCALING MISMATCH] buffer obs != scaled obs for {aid}")
             
-            # Data validation before storage
-            finite_check(f"store_obs_{aid}", obs)
-            finite_check(f"store_share_obs_{aid}", share_obs)
-            finite_check(f"store_actions_{aid}", actions_norm[aid])
-            finite_check(f"store_log_probs_{aid}", action_log_probs[aid])
-            finite_check(f"store_values_{aid}", values[aid])
-            finite_check(f"store_rnn_actor_{aid}", self.rnn_states[aid]["actor"])
-            finite_check(f"store_rnn_critic_{aid}", self.rnn_states[aid]["critic"])
-            
             # Use detach() to avoid gradient accumulation
             self._current_step_data[aid] = {
                 'obs': obs.detach(),
@@ -545,12 +486,8 @@ class DualRMAPPOWrapper:
             return
             
         for aid in self.agent_ids:
-            # Input validation
-            finite_check(f"buffer_reward_{aid}", rewards[aid])
-            
             # Prepare rewards
             reward_tensor = rewards[aid].unsqueeze(-1) if len(rewards[aid].shape) == 1 else rewards[aid]
-            finite_check(f"buffer_reward_tensor_{aid}", reward_tensor)
             
             # Generate proper term_masks based on termination reason
             mask_t = (1.0 - dones[aid].float()).view(-1, 1)
@@ -581,10 +518,6 @@ class DualRMAPPOWrapper:
                 else:
                     # Conservative fallback: assume all dones are time-limit
                     term_mask_t = torch.ones_like(mask_t)
-            
-            # Mask validation
-            finite_check(f"buffer_mask_{aid}", mask_t)
-            finite_check(f"buffer_term_mask_{aid}", term_mask_t)
             
             # Insert into agent's buffer
             self.buffers[aid].insert(
@@ -634,7 +567,6 @@ class DualRMAPPOWrapper:
                     last_values = self.policies[aid].get_values(
                         share_obs, self.rnn_states[aid]["critic"], masks
                     )
-                    finite_check(f"last_values_{aid}", last_values)
             else:
                 last_values = torch.zeros(self.num_envs, 1, device=self.device)
             
@@ -660,9 +592,6 @@ class DualRMAPPOWrapper:
         # Reset rollout step
         self.rollout_step = 0
         
-        # UPDATED: Removed train/policy_updates and train/value_updates (they were always 2, no useful information)
-        # These metrics provided no value since they were constant in dual network setup
-        
         return stats
 
     def store_next_obs(self, next_obs):
@@ -675,7 +604,7 @@ class TrainingOrchestrator:
     
     def __init__(self, args):
         self.args = args
-        print(f"[ORCHESTRATOR] Initializing Dual rMAPPO Training Orchestrator with gradient monitoring...")
+        print(f"[ORCHESTRATOR] Initializing Dual rMAPPO Training Orchestrator with gradient clipping...")
         
         self._setup_configuration()
         self._setup_wandb_logging()
@@ -697,7 +626,7 @@ class TrainingOrchestrator:
         self._apply_per_env_scaling()
 
     def _setup_wandb_logging(self):
-        """Setup WandB logging with 12-core gradient monitoring metrics and 7-prefix structure."""
+        """Setup WandB logging with comprehensive metrics and unified initialization."""
         if self.args.wandb and WANDB_AVAILABLE:
             try:
                 # Create wandb directory with proper permissions
@@ -708,47 +637,46 @@ class TrainingOrchestrator:
                 wandb.init(
                     project="surgical_robot_rmappo",
                     name=run_name,
-                    tags=["rmappo","rnn","surgical","gradient-monitoring","7-prefix-structure"],
+                    tags=["rmappo","rnn","surgical","gradient-clipping","stable"],
                     config=vars(self.args),
                     dir=wandb_dir,
                     reinit=True,
                     settings=wandb.Settings(
                         start_method="thread",
-                        _disable_service=True,  # Disable wandb service to avoid multiprocessing issues
+                        _disable_service=True,
                     )
                 )
                 
                 # Define global step as base metric
                 wandb.define_metric("global_step")
                 
-                # UPDATED: Define 12 core monitoring metrics with 7-prefix structure
+                # Define comprehensive monitoring metrics
                 for k in [
-                    # PPO metrics (4)
+                    # PPO metrics
                     "ppo/ratio_mean","ppo/ratio_max","ppo/kl_mean","ppo/clip_fraction",
-                    # Value metrics (3)
-                    "value/adv_std","value/ret_absmax","value/v_absmax",
-                    # Policy metrics (3)
+                    "ppo/adv_mean_norm","ppo/adv_std_norm",
+                    # Value metrics (with means)
+                    "value/ret_abs_mean","value/v_abs_mean","value/ret_absmax","value/v_absmax",
+                    # Policy metrics
                     "policy/saturation","policy/logstd_mean","policy/entropy",
-                    # RNN metrics (2)
+                    # RNN metrics
                     "rnn/actor_h_norm","rnn/critic_h_norm",
-                    # Gradient metrics (1 here, per-agent ones added by training_helpers)
-                    "grad/actor_total",
+                    # Gradient metrics
+                    "grad/actor","grad/critic",
                 ]:
                     wandb.define_metric(k, step_metric="global_step")
                 
                 # Define lifecycle markers
                 wandb.define_metric("lifecycle/eval_to_train", step_metric="global_step")
-                wandb.define_metric("debug/dump_path", step_metric="global_step")
                 
                 self.log_fn = make_wandb_logger()
-                print(f"[SETUP] WandB initialized with 12-core gradient monitoring and 7-prefix structure")
+                print(f"[SETUP] WandB initialized with comprehensive gradient monitoring")
                 
             except Exception as e:
                 print(f"[ERROR] WandB initialization failed: {e}")
                 print("[INFO] Python environment may be corrupted. Falling back to dummy logger.")
-                print("[INFO] To fix: Consider recreating your conda environment")
                 self.log_fn = lambda d, step=None: None
-                self.args.wandb = False  # Disable wandb for this run
+                self.args.wandb = False
         else:
             self.log_fn = lambda d, step=None: None
             if self.args.wandb and not WANDB_AVAILABLE:
@@ -784,7 +712,7 @@ class TrainingOrchestrator:
 
     def _setup_training_components(self):
         """Initialize training components with logging support."""
-        print(f"[SETUP] Setting up dual rMAPPO training components with gradient monitoring...")
+        print(f"[SETUP] Setting up dual rMAPPO training components with gradient clipping...")
         
         self.metrics_hub = MetricsHub()
         
@@ -797,7 +725,7 @@ class TrainingOrchestrator:
                 run_name = f"rmappo_dual_{self.args.num_envs}envs_{time.strftime('%Y%m%d_%H%M%S')}"
                 self.wandb_logger.initialize_run(run_config, run_name)
                 self.wandb_logger.attach_metrics_hub(self.metrics_hub)
-                print(f"[SETUP] WandB attached to MetricsHub with 7-prefix structure")
+                print(f"[SETUP] WandB attached to MetricsHub")
             except Exception as e:
                 print(f"[WARNING] WandB logger setup failed: {e}")
                 print(f"[INFO] Continuing with dummy logger")
@@ -890,14 +818,12 @@ class TrainingOrchestrator:
             self.max_milestone_triggered = candidate
 
     def train(self):
-        """Main training loop with gradient explosion monitoring and 7-prefix logging."""
-        print(f"[TRAIN] Starting dual rMAPPO training with gradient monitoring and 7-prefix WandB logging:")
+        """Main training loop with gradient clipping and comprehensive monitoring."""
+        print(f"[TRAIN] Starting dual rMAPPO training with gradient clipping:")
         print(f"  Max collection steps: {self.max_global_steps}")
         print(f"  Rollout horizon: {self.rmappo.T}")
         print(f"  Milestone episodes: {self.milestone_episodes}")
-        print(f"  FAIL-FAST: enabled - no NaN/Inf repairs")
-        print(f"  Gradient monitoring: 12-core forensics enabled")
-        print(f"  WandB logging: 7-prefix structure (policy/ppo/value/rnn/grad/train/lifecycle)")
+        print(f"  Gradient clipping: enabled with separate thresholds")
         
         # Initialize metrics
         if self.args.wandb and WANDB_AVAILABLE and wandb.run is not None:
@@ -949,9 +875,9 @@ class TrainingOrchestrator:
 
 
 def main():
-    """Main entry point for dual rMAPPO training with gradient monitoring and 7-prefix WandB logging."""
+    """Main entry point for dual rMAPPO training with gradient clipping."""
     print("="*80)
-    print("Dual rMAPPO Training with FAIL-FAST NaN/Inf Detection + Gradient Monitoring + 7-Prefix WandB Logging")
+    print("Dual rMAPPO Training with Gradient Clipping and Comprehensive Monitoring")
     print("="*80)
     
     # Parse arguments
@@ -964,9 +890,7 @@ def main():
     print(f"  Environments: {args_cli.num_envs}")
     print(f"  Max collection steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
     print(f"  WandB: {args_cli.wandb}")
-    print(f"  FAIL-FAST: enabled - no NaN/Inf repairs")
-    print(f"  Gradient monitoring: 12-core forensics system")
-    print(f"  WandB logging: 7-prefix structure (policy/ppo/value/rnn/grad/train/lifecycle)")
+    print(f"  Gradient clipping: enabled with separate thresholds")
     
     # Launch Isaac Sim
     print(f"[MAIN] Launching Isaac Sim...")

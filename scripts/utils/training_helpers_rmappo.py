@@ -3,11 +3,8 @@
 """
 Training helper utilities for dual-network rMAPPO multi-environment parallel training.
 Features unified training execution, milestone evaluation, and optimized WandB logging.
-Adapted for independent human and robot networks with synchronized training.
-MODIFIED: Added obs scaling support and term_masks generation for proper GAE bootstrap.
-FAIL-FAST: Removed all NaN/Inf repair mechanisms, emergency fallbacks, and skip logic.
-MODIFIED: Added lifecycle markers for eval->train transitions in gradient monitoring system.
-MODIFIED: Updated WandB logging keys to 7-prefix structure (policy/ppo/value/rnn/grad/train/lifecycle).
+MODIFIED: Removed all finite_check functions, relying on PyTorch natural failure + wandb monitoring.
+STABLE: Unified WandB initialization, gradient clipping with separate thresholds.
 """
 
 import argparse
@@ -30,36 +27,6 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
     print("[WARNING] WandB not available. Install with: pip install wandb")
-
-
-# ============================================================================
-# FAIL-FAST CHECKING FUNCTIONS
-# ============================================================================
-
-def finite_check(name: str, x: torch.Tensor, raise_on_fail: bool = True) -> bool:
-    """Check for NaN/Inf in tensor - fail fast, no repair"""
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"{name}: expected Tensor, got {type(x)}")
-    if not torch.is_floating_point(x):
-        return True
-    ok = torch.isfinite(x).all().item()
-    if ok:
-        return True
-    bad_ratio = (~torch.isfinite(x)).float().mean().item()
-    try:
-        min_v = torch.nanmin(x).item()
-        max_v = torch.nanmax(x).item()
-    except Exception:
-        min_v, max_v = float("nan"), float("nan")
-    msg = (f"[NUMERIC ERROR] {name}: non-finite values detected\n"
-           f"  - bad_ratio={bad_ratio*100:.2f}%\n"
-           f"  - range=[{min_v:.3e}, {max_v:.3e}]\n"
-           f"  - shape={tuple(x.shape)}, device={x.device}, dtype={x.dtype}")
-    if raise_on_fail:
-        raise ValueError(msg)
-    else:
-        print("[WARNING]", msg)
-        return False
 
 
 class RMAPPOTrainingRunner:
@@ -99,8 +66,6 @@ class RMAPPOTrainingRunner:
         print(f"  Max collection steps: {self.max_global_steps}")
         print(f"  Step counting: global_step (collection) + train_updates (training rounds)")
         print(f"  Networks: independent human & robot")
-        print(f"  FAIL-FAST: enabled - no emergency fallbacks")
-        print(f"  Gradient monitoring: enabled with lifecycle markers")
 
     def set_eval_mode(self, flag: bool):
         """Set evaluation mode flag."""
@@ -116,11 +81,6 @@ class RMAPPOTrainingRunner:
             else:
                 current_obs, _ = self.env.reset()
             self._current_obs = current_obs
-        
-        # Initial observation validation - fail immediately on bad data
-        for agent_id in self.agent_ids:
-            if agent_id in current_obs:
-                finite_check(f"initial_obs_{agent_id}", current_obs[agent_id])
             
         episode_count = 0
         
@@ -135,33 +95,16 @@ class RMAPPOTrainingRunner:
                 for aid in self.agent_ids:
                     self.rmappo.trainers[aid].global_step = self.global_step
             
-            # Pre-action observation validation
-            for agent_id in self.agent_ids:
-                if agent_id in current_obs:
-                    finite_check(f"pre_action_obs_{agent_id}_step_{rollout_step}", current_obs[agent_id])
-
             # select_actions handles obs scaling internally
             actions, detail = self.rmappo.select_actions(
                 current_obs, 
                 add_noise=(not self.is_eval_mode),
                 deterministic=self.is_eval_mode
             )
-            
-            # Action validation
-            for agent_id in self.agent_ids:
-                if agent_id in actions:
-                    finite_check(f"action_{agent_id}_step_{rollout_step}", actions[agent_id])
 
             # Environment interaction
             self.env.unwrapped.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
-            
-            # Environment output validation
-            for agent_id in self.agent_ids:
-                if agent_id in next_obs:
-                    finite_check(f"next_obs_{agent_id}_step_{rollout_step}", next_obs[agent_id])
-                if agent_id in rewards:
-                    finite_check(f"reward_{agent_id}_step_{rollout_step}", rewards[agent_id])
 
             # Only store transitions during training, not evaluation
             if not self.is_eval_mode:
@@ -212,20 +155,20 @@ class RMAPPOTrainingRunner:
             self.train_updates += 1
             self.global_episodes += episode_count
 
-            # Dual network logging - separate loss tracking per agent (UPDATED KEYS)
+            # Dual network logging - separate loss tracking per agent
             if stats:
                 payload = {
-                    # Per-agent metrics from dual networks (UPDATED KEYS)
+                    # Per-agent metrics from dual networks
                     "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.agent_ids},
                     "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.agent_ids},
                     "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
                     "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
                     
-                    # Shared metrics (averaged from both networks where applicable) - REMOVED model/ prefix
+                    # Shared metrics (averaged from both networks where applicable)
                     "policy/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
                     "ppo/ratio_mean": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
                     
-                    # Clear separation of step types in logging (UPDATED KEYS)
+                    # Clear separation of step types in logging
                     "train/collection_steps": self.global_step,
                     "train/training_rounds": self.train_updates,
                     "train/global_episodes": self.global_episodes,
@@ -268,8 +211,6 @@ class RMAPPOTrainingRunner:
             if aid in detail["mean_actions"]:
                 forces = detail["mean_actions"][aid]  # [num_envs, 3]
                 
-                # Force validation
-                finite_check(f"force_stats_{aid}", forces)
                 mean_forces = forces.mean(dim=0)  # [3] - cross-environment mean
                 force_payload.update({
                     f"forces/{aid}_fx_mean": float(mean_forces[0].item()),
@@ -380,22 +321,12 @@ class RMAPPOMilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # Observation validation during evaluation
-                for agent_id in self.agent_ids:
-                    if agent_id in current_obs:
-                        finite_check(f"eval_obs_{agent_id}_step_{eval_step_counter}", current_obs[agent_id])
-
                 # Use rmappo.select_actions which handles obs scaling internally
                 actions_dict, detail_info = self.rmappo.select_actions(
                     current_obs,
                     add_noise=False,
                     deterministic=True
                 )
-                
-                # Action validation during evaluation
-                for agent_id in self.agent_ids:
-                    if agent_id in actions_dict:
-                        finite_check(f"eval_action_{agent_id}_step_{eval_step_counter}", actions_dict[agent_id])
                 
                 # Apply complete action masking - only env0 executes real actions
                 for aid, act in actions_dict.items():
@@ -412,11 +343,6 @@ class RMAPPOMilestoneEvaluator:
                 env.set_detail_actor_info(detail_info)
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions_dict)
-                
-                # Environment output validation during evaluation
-                for agent_id in self.agent_ids:
-                    if agent_id in rewards:
-                        finite_check(f"eval_reward_{agent_id}_step_{eval_step_counter}", rewards[agent_id])
                 
                 # StepTracer with forced console logging every 10 steps
                 if (eval_step_counter % 10 == 0 and hasattr(env, 'step_tracer') and 
@@ -518,23 +444,23 @@ class MetricsHub:
 
 
 class WandBLogger:
-    """Optimized WandB logger adapted for dual-network rMAPPO metrics with 7-prefix structure."""
+    """Optimized WandB logger adapted for dual-network rMAPPO metrics."""
     
-    # UPDATED: Dual network agent metrics mapping with new prefix structure
+    # Dual network agent metrics mapping
     AGENT_METRICS_MAP = {
-        'loss/actor': 'train/actor_loss_{}',      # Updated key format
-        'loss/critic': 'train/critic_loss_{}',    # Updated key format
-        'grad_norm/actor': 'grad/{}_actor',       # Updated prefix
-        'grad_norm/critic': 'grad/{}_critic',     # Updated prefix
+        'loss/actor': 'train/actor_loss_{}',
+        'loss/critic': 'train/critic_loss_{}',
+        'grad_norm/actor': 'grad/{}_actor',
+        'grad_norm/critic': 'grad/{}_critic',
     }
     
-    # UPDATED: Global metrics with new 7-prefix structure
+    # Global metrics
     GLOBAL_METRICS_MAP = {
-        "policy/entropy": "policy/entropy",              # Updated prefix
-        "ppo/ratio_mean": "ppo/ratio_mean",              # Already correct
-        "train/collection_steps": "train/collection_steps",  # Already correct
-        "train/training_rounds": "train/training_rounds",    # Already correct
-        "train/global_episodes": "train/global_episodes",    # Already correct
+        "policy/entropy": "policy/entropy",
+        "ppo/ratio_mean": "ppo/ratio_mean",
+        "train/collection_steps": "train/collection_steps",
+        "train/training_rounds": "train/training_rounds",
+        "train/global_episodes": "train/global_episodes",
         "eval/return_mean": "milestone/actor_return",
         "milestone/topk_best_score": "milestone/topk_best_return",
         "milestone/latest_completed": "milestone/latest_completed",
@@ -560,13 +486,20 @@ class WandBLogger:
         if not self.enabled:
             return
         
+        # Prevent duplicate initialization
+        if wandb.run is not None:
+            print("[WANDB] Run already initialized, updating config instead")
+            wandb.config.update(config, allow_val_change=True)
+            self.run = wandb.run
+            return
+        
         # Direct initialization
         self.run = wandb.init(
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network", "tanh-gaussian", "obs-scaling", "fail-fast", "gradient-monitoring", "7-prefix-structure"],
-            notes="Multi-environment parallel dual-network rMAPPO training with Tanh-Gaussian action domain, obs scaling, term_masks GAE support, FAIL-FAST NaN/Inf detection, 12-core gradient monitoring system, and unified 7-prefix WandB logging structure",
+            tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "on-policy", "dual-network", "tanh-gaussian", "obs-scaling", "gradient-clipping", "stable"],
+            notes="Multi-environment parallel dual-network rMAPPO training with Tanh-Gaussian action domain, obs scaling, term_masks GAE support, gradient clipping with separate thresholds, and unified WandB logging",
             settings=wandb.Settings(start_method="thread")
         )
         
@@ -578,7 +511,6 @@ class WandBLogger:
             "ppo_epoch": mappo_cfg.get("ppo_epoch", 10),
             "num_mini_batch": mappo_cfg.get("num_mini_batch", 4),
             "clip_param": mappo_cfg.get("clip_param", 0.2),
-            "value_loss_coef": mappo_cfg.get("value_loss_coef", 0.5),
             "entropy_coef": mappo_cfg.get("entropy_coef", 0.01),
             "reward_scale": 0.01,
             "agent_mode": "robot_human_dual_network",
@@ -594,6 +526,9 @@ class WandBLogger:
             "use_popart": mappo_cfg.get("use_popart", False),
             "use_valuenorm": mappo_cfg.get("use_valuenorm", False),
             "use_clipped_value_loss": mappo_cfg.get("use_clipped_value_loss", False),
+            # Gradient clipping
+            "max_grad_norm_actor": mappo_cfg.get("max_grad_norm_actor", 5.0),
+            "max_grad_norm_critic": mappo_cfg.get("max_grad_norm_critic", 10.0),
             # Dual network info
             "network_architecture": "dual_independent",
             "network_init": "robot_copy_from_human",
@@ -606,14 +541,11 @@ class WandBLogger:
             "gae_term_masks_enabled": True,
             "step_counting_method": "collection_steps_separate_from_training_rounds",
             "evaluation_mode": "read_only_deterministic_with_masking",
-            "fail_fast_enabled": True,  # Document FAIL-FAST mode
-            "gradient_clipping_disabled": True,  # Document no clipping
-            "gradient_monitoring_enabled": True,  # Document 12-core monitoring
+            "gradient_clipping_enabled": True,  # Document gradient clipping
             "lifecycle_markers_enabled": True,  # Document eval->train markers
-            "wandb_logging_structure": "7_prefix_unified",  # Document new structure
         })
         
-        print(f"[WANDB] Successfully initialized with 7-prefix structure: {self.run.name}")
+        print(f"[WANDB] Successfully initialized: {self.run.name}")
 
     def attach_metrics_hub(self, hub: "MetricsHub"):
         """Attach to MetricsHub for unified data pipeline."""
@@ -638,10 +570,10 @@ class WandBLogger:
                 self.log_metrics(payload_to_log, step)
 
         hub.subscribe("milestone_summary", _on_ms)
-        print("[WANDB] Attached to MetricsHub with 7-prefix dual-network rMAPPO metric mapping, FAIL-FAST feature tracking, and gradient monitoring system.")
+        print("[WANDB] Attached to MetricsHub with dual-network rMAPPO metric mapping")
 
     def log_metrics(self, metrics_data: Dict[str, Any], step: int) -> None:
-        """Log metrics with dual-network rMAPPO-specific mapping using 7-prefix structure."""
+        """Log metrics with dual-network rMAPPO-specific mapping."""
         if not self.enabled or not metrics_data:
             return
 
@@ -659,14 +591,14 @@ class WandBLogger:
                     break
             
             if agent_ids:
-                # Apply per-agent mapping with updated key format
+                # Apply per-agent mapping
                 for source_key, target_pattern in self.AGENT_METRICS_MAP.items():
                     if source_key in metrics_data and isinstance(metrics_data[source_key], dict):
                         for agent_id in agent_ids:
                             if agent_id in metrics_data[source_key]:
                                 log_data[target_pattern.format(agent_id)] = metrics_data[source_key][agent_id]
 
-        # Handle global metrics with 7-prefix structure
+        # Handle global metrics
         for src_key, dest_key in self.GLOBAL_METRICS_MAP.items():
             if src_key in metrics_data and metrics_data[src_key] is not None:
                 log_data[dest_key] = metrics_data[src_key]
@@ -733,9 +665,7 @@ class TopKModelManager:
             'rnn_state_format': 'external_2d_internal_3d',
             'action_distribution': 'tanh_gaussian',
             'obs_scaling_enabled': True,
-            'fail_fast_enabled': True,  # Document FAIL-FAST mode
-            'gradient_monitoring_enabled': True,  # Document gradient monitoring
-            'wandb_logging_structure': '7_prefix_unified',  # Document new structure
+            'gradient_clipping_enabled': True,  # Document gradient clipping
             'step_counting_method': 'collection_steps_separate_from_training_rounds',
             'top_k_count': len(self.top_models),
             'top_k_models': []
@@ -772,9 +702,7 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
         'rnn_state_format': 'external_2d_internal_3d',
         'action_distribution': 'tanh_gaussian',
         'obs_scaling_enabled': bool(rmappo_wrapper.params.get('obs_scaling', {}).get('factors')),
-        'fail_fast_enabled': True,  # Document FAIL-FAST mode
-        'gradient_monitoring_enabled': True,  # Document gradient monitoring
-        'wandb_logging_structure': '7_prefix_unified',  # Document new structure
+        'gradient_clipping_enabled': True,  # Document gradient clipping
         'step_counting_method': 'collection_steps_separate_from_training_rounds',
         'global_steps_total': global_step,
         'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),
@@ -796,7 +724,7 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
     torch.save(final_checkpoint, final_path)
     print(f"[CHECKPOINT] Final dual rMAPPO networks saved: {final_path}")
     print(f"[CHECKPOINT] Final stats: collection_steps={global_step}, episodes={global_episodes}")
-    print(f"[CHECKPOINT] Gradient monitoring: enabled with dump mechanism")
+    print(f"[CHECKPOINT] Gradient clipping: enabled with separate thresholds")
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
@@ -806,7 +734,7 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_rmappo.yaml')
 
-    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training with FAIL-FAST NaN/Inf detection, 12-core gradient monitoring, and unified 7-prefix WandB logging")
+    parser = argparse.ArgumentParser(description="Dual rMAPPO multi-environment parallel training with gradient clipping and comprehensive monitoring")
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
@@ -826,6 +754,6 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     parser.add_argument("--top_k_models", type=int, default=10)
     
     # Logging
-    parser.add_argument("--wandb", action="store_true", default=False, help="Enable WandB logging with gradient monitoring and 7-prefix structure")
+    parser.add_argument("--wandb", action="store_true", default=False, help="Enable WandB logging with gradient monitoring")
     
     return parser
