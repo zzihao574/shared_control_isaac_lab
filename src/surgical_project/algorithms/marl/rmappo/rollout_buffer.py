@@ -1,7 +1,7 @@
 """
 On-policy rollout buffer with RNN support for rMAPPO.
 Complete implementation with GAE term_masks support for time-limit bootstrap.
-MODIFIED: Removed all finite_check functions, relying on PyTorch natural failure.
+MODIFIED: Added generator parameter support for external RNG control.
 STABLE: Core assertions for shape validation remain.
 """
 
@@ -12,7 +12,7 @@ class SharedRolloutBuffer:
     """
     On-policy rollout buffer with RNN support.
     Shapes use (T, N, ...), where N = num_envs * num_agents.
-    STABLE: Shape assertions remain, all finite_check removed.
+    STABLE: Shape assertions remain, supports external generator for reproducibility.
     """
     def __init__(self, T, N, obs_dim, share_obs_dim, act_dim, rnn_hidden_dim, device):
         self.T, self.N = T, N
@@ -117,8 +117,15 @@ class SharedRolloutBuffer:
         else:
             raise ValueError("No valid advantages to normalize (all masks are zero).")
 
-    def recurrent_generator(self, num_mini_batch, data_chunk_length):
-        """Yield mini-batches - hard assertions, no auto-downgrade."""
+    def recurrent_generator(self, num_mini_batch, data_chunk_length, generator=None):
+        """
+        Yield mini-batches with external generator support for reproducibility.
+        
+        Args:
+            num_mini_batch: Number of mini-batches to create
+            data_chunk_length: Length of each RNN sequence chunk
+            generator: Optional torch.Generator for reproducible shuffling
+        """
         T, N = self.T, self.N
         L = data_chunk_length
         assert T % L == 0, "T must be divisible by data_chunk_length"
@@ -131,7 +138,12 @@ class SharedRolloutBuffer:
             f"num_mini_batch={num_mini_batch} exceeds total_chunks={total_chunks}"
         
         mb_size = max(1, total_chunks // num_mini_batch)
-        perm = torch.randperm(total_chunks)
+        
+        # Use external generator if provided for reproducibility
+        if generator is not None:
+            perm = torch.randperm(total_chunks, device=torch.device("cpu"), generator=generator)
+        else:
+            perm = torch.randperm(total_chunks, device=torch.device("cpu"))
         
         for mb in range(num_mini_batch):
             start = mb * mb_size

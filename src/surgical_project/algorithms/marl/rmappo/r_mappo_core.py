@@ -1,14 +1,14 @@
 """
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
 Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
-MODIFIED: Removed all finite_check, implemented gradient clipping with separate thresholds,
-          added mean value monitoring (ret_abs_mean, v_abs_mean).
+MODIFIED: Strong action dimension assertions, cosine LR decay implementation.
 STABLE: Relies on PyTorch natural failure + wandb monitoring instead of manual checks.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 import os
 from .mappo_utils import init, check, get_shape_from_obs_space, ACTLayer, PopArt
 from .rnn import RNNLayer
@@ -151,6 +151,19 @@ class RMAPPOPolicy:
         self.opt_eps = float(args.get('opt_eps', 1e-5))
         self.weight_decay = float(args.get('weight_decay', 0.0))
 
+        # Strong assertion for action dimension
+        if isinstance(act_space_desc, dict):
+            act_dim = act_space_desc.get('shape', (None,))[0]
+        else:
+            act_dim = act_space_desc[0] if isinstance(act_space_desc, (tuple, list)) else None
+        
+        if act_dim is None:
+            raise RuntimeError("[RMAPPO POLICY] Cannot infer action dimension from act_space_desc. "
+                             "Please provide valid action space description.")
+        
+        self.act_dim = act_dim
+        print(f"[RMAPPO POLICY] Action dimension: {self.act_dim}")
+
         # Create mock space objects for compatibility
         self.obs_space = self._create_mock_space(obs_space_desc)
         self.cent_obs_space = self._create_mock_space(cent_obs_space_desc)
@@ -272,7 +285,7 @@ class ValueNorm:
 
 
 class RMAPPOAlgorithm:
-    """rMAPPO Algorithm Trainer - executes PPO updates with gradient clipping and monitoring."""
+    """rMAPPO Algorithm Trainer - executes PPO updates with gradient clipping and LR decay."""
 
     def __init__(self, args, policy, device=torch.device("cpu")):
         self.device = device
@@ -295,8 +308,8 @@ class RMAPPOAlgorithm:
         self._use_popart = args.get('use_popart', False)
         self._use_valuenorm = args.get('use_valuenorm', False)
 
-        # Gradient monitoring system
-        self.log_fn = args.get('log_fn', lambda d, step=None: None)
+        # MetricsHub for logging (preferred over log_fn)
+        self.metrics_hub = args.get('metrics_hub', None)
         self.global_step = 0
 
         assert (self._use_popart and self._use_valuenorm) == False, (
@@ -308,6 +321,60 @@ class RMAPPOAlgorithm:
             self.value_normalizer = ValueNorm(1, device=self.device)
         else:
             self.value_normalizer = None
+
+        # Learning rate decay setup
+        self.global_update_step = 0
+        self.actor_lr_init = self.policy.actor_optimizer.param_groups[0]["lr"]
+        self.critic_lr_init = self.policy.critic_optimizer.param_groups[0]["lr"]
+        
+        # Load LR decay config from args (passed from YAML via training section)
+        if 'args' in args and hasattr(args['args'], 'config'):
+            # Try to load from file
+            import yaml
+            try:
+                with open(args['args'].config, 'r') as f:
+                    full_cfg = yaml.safe_load(f)
+                    decay_cfg = full_cfg.get('training', {}).get('lr_decay', {})
+            except Exception:
+                decay_cfg = {}
+        else:
+            decay_cfg = {}
+        
+        self._lr_decay_enabled = bool(decay_cfg.get('enabled', False))
+        self._lr_final_factor = float(decay_cfg.get('final_factor', 0.1))
+        
+        if self._lr_decay_enabled:
+            print(f"[LR DECAY] Enabled: final_factor={self._lr_final_factor}")
+            print(f"[LR DECAY] Initial LR: actor={self.actor_lr_init:.6f}, critic={self.critic_lr_init:.6f}")
+
+    def _maybe_decay_lr(self, now_update_idx: int):
+        """Apply cosine learning rate decay if enabled."""
+        if not self._lr_decay_enabled:
+            return
+        
+        actor_min = self.actor_lr_init * self._lr_final_factor
+        critic_min = self.critic_lr_init * self._lr_final_factor
+        
+        # Cosine decay with ~1000 updates as the decay horizon
+        # You can adjust this to use actual total_updates if known
+        progress = min(1.0, now_update_idx / 1000.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        actor_lr = actor_min + (self.actor_lr_init - actor_min) * cosine
+        critic_lr = critic_min + (self.critic_lr_init - critic_min) * cosine
+        
+        # Update optimizer learning rates
+        for pg in self.policy.actor_optimizer.param_groups:
+            pg["lr"] = actor_lr
+        for pg in self.policy.critic_optimizer.param_groups:
+            pg["lr"] = critic_lr
+        
+        # Log to MetricsHub using global_step for axis alignment
+        if self.metrics_hub is not None:
+            self.metrics_hub.push_scalars(
+                {"lr/actor": actor_lr, "lr/critic": critic_lr},
+                step=self.global_step
+            )
 
     def cal_value_loss(self, values, value_preds_batch, return_batch):
         """Calculate value function loss using Huber loss."""
@@ -385,33 +452,34 @@ class RMAPPOAlgorithm:
         vals = values.view(-1)[valid]
         rets = return_batch.view(-1)[valid]
 
-        # Log comprehensive monitoring metrics
-        self.log_fn({
-            # PPO metrics
-            "ppo/ratio_mean": float(ratio.mean().detach()),
-            "ppo/ratio_max":  float(ratio.max().detach()),
-            "ppo/kl_mean":    float(approx_kl.mean().detach()),
-            "ppo/clip_fraction": float(((ratio > 1+self.clip_param) | (ratio < 1-self.clip_param)).float().mean().detach()),
-            
-            # Advantage normalization check (should be ~0 mean, ~1 std)
-            "ppo/adv_mean_norm": float(adv_targ.view(-1)[valid].mean().detach()),
-            "ppo/adv_std_norm": float(adv_targ.view(-1)[valid].std(unbiased=False).detach()),
+        # Log comprehensive monitoring metrics through MetricsHub
+        if self.metrics_hub is not None:
+            self.metrics_hub.push_scalars({
+                # PPO metrics
+                "ppo/ratio_mean": float(ratio.mean().detach()),
+                "ppo/ratio_max":  float(ratio.max().detach()),
+                "ppo/kl_mean":    float(approx_kl.mean().detach()),
+                "ppo/clip_fraction": float(((ratio > 1+self.clip_param) | (ratio < 1-self.clip_param)).float().mean().detach()),
+                
+                # Advantage normalization check (should be ~0 mean, ~1 std)
+                "ppo/adv_mean_norm": float(adv_targ.view(-1)[valid].mean().detach()),
+                "ppo/adv_std_norm": float(adv_targ.view(-1)[valid].std(unbiased=False).detach()),
 
-            # Value metrics (with means)
-            "value/ret_abs_mean": float(rets.abs().mean().detach()),
-            "value/v_abs_mean": float(vals.abs().mean().detach()),
-            "value/ret_absmax": float(rets.abs().max().detach()),
-            "value/v_absmax": float(vals.abs().max().detach()),
+                # Value metrics (with means)
+                "value/ret_abs_mean": float(rets.abs().mean().detach()),
+                "value/v_abs_mean": float(vals.abs().mean().detach()),
+                "value/ret_absmax": float(rets.abs().max().detach()),
+                "value/v_absmax": float(vals.abs().max().detach()),
 
-            # Policy metrics
-            "policy/saturation": float((act_used.abs() > 0.98).float().mean().detach()),
-            "policy/logstd_mean": float(self.policy.actor.act.logstd_mean() if hasattr(self.policy.actor.act, "logstd_mean") else 0.0),
-            "policy/entropy": float(dist_entropy.detach()),
+                # Policy metrics
+                "policy/saturation": float((act_used.abs() > 0.98).float().mean().detach()),
+                "policy/logstd_mean": float(self.policy.actor.act.logstd_mean() if hasattr(self.policy.actor.act, "logstd_mean") else 0.0),
+                "policy/entropy": float(dist_entropy.detach()),
 
-            # RNN metrics
-            "rnn/actor_h_norm": float(_h_mean_norm(rnn_states_batch).detach()),
-            "rnn/critic_h_norm": float(_h_mean_norm(rnn_states_critic_batch).detach()),
-        }, step=self.global_step)
+                # RNN metrics
+                "rnn/actor_h_norm": float(_h_mean_norm(rnn_states_batch).detach()),
+                "rnn/critic_h_norm": float(_h_mean_norm(rnn_states_critic_batch).detach()),
+            }, step=self.global_step)
 
         # Actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
@@ -435,8 +503,9 @@ class RMAPPOAlgorithm:
         
         self.policy.actor_optimizer.step()
 
-        # Log actor gradient norm
-        self.log_fn({"grad/actor": gn_actor}, step=self.global_step)
+        # Log actor gradient norm through MetricsHub
+        if self.metrics_hub is not None:
+            self.metrics_hub.push_scalars({"grad/actor": gn_actor}, step=self.global_step)
 
         # Critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch)
@@ -453,8 +522,9 @@ class RMAPPOAlgorithm:
 
         self.policy.critic_optimizer.step()
 
-        # Log critic gradient norm
-        self.log_fn({"grad/critic": gn_critic}, step=self.global_step)
+        # Log critic gradient norm through MetricsHub
+        if self.metrics_hub is not None:
+            self.metrics_hub.push_scalars({"grad/critic": gn_critic}, step=self.global_step)
 
         # Calculate PPO monitoring metrics
         with torch.no_grad():
@@ -476,8 +546,8 @@ class RMAPPOAlgorithm:
             "approx_kl": approx_kl.item(),
         }
 
-    def train(self, buffer, update_actor=True):
-        """Perform multi-epoch PPO training with global step increment."""
+    def train(self, buffer, update_actor=True, generator=None):
+        """Perform multi-epoch PPO training with LR decay at the end."""
         train_info = {}
         train_info['value_loss'] = 0
         train_info['policy_loss'] = 0
@@ -489,7 +559,9 @@ class RMAPPOAlgorithm:
         train_info['approx_kl'] = 0
 
         for _ in range(self.ppo_epoch):
-            data_generator = buffer.recurrent_generator(self.num_mini_batch, self.data_chunk_length)
+            data_generator = buffer.recurrent_generator(
+                self.num_mini_batch, self.data_chunk_length, generator=generator
+            )
 
             for sample in data_generator:
                 update_info = self.ppo_update(sample, update_actor)
@@ -510,6 +582,10 @@ class RMAPPOAlgorithm:
 
         for k in train_info.keys():
             train_info[k] /= num_updates
+
+        # Apply LR decay after completing full PPO update
+        self._maybe_decay_lr(self.global_update_step)
+        self.global_update_step += 1
 
         return train_info
 

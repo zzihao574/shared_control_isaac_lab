@@ -1,6 +1,15 @@
 # Training parameters configuration for dual independent networks
 # Features unified single configuration source: mappo only
-# MODIFIED: Added separate gradient clipping thresholds, enabled clipped value loss
+# MODIFIED: Simplified lr_decay to only use enabled and final_factor
+
+# ==============================================================================
+# Global Settings
+# ==============================================================================
+training:
+  seed: 42
+  lr_decay:
+    enabled: true         # Enable cosine learning rate decay
+    final_factor: 0.1     # Final learning rate = initial learning rate * 0.1
 
 # ==============================================================================
 # Unified Algorithm Configuration (Single Source of Truth)
@@ -15,13 +24,13 @@ mappo:
   gae_lambda: 0.95                    # GAE lambda
   
   # PPO specific (stabilized)
-  clip_param: 0.1                    # PPO clipping parameter (reduced from 0.2)
+  clip_param: 0.1                     # PPO clipping parameter (reduced from 0.2)
   ppo_epoch: 4                        # Number of PPO epochs per update (reduced from 10)
   num_mini_batch: 8                   # Number of mini-batches per epoch
   data_chunk_length: 16               # RNN sequence length for training
   
   # Loss coefficients
-  entropy_coef: 0.005                  # Entropy regularization coefficient
+  entropy_coef: 0.005                 # Entropy regularization coefficient
   
   # Gradient clipping (YAML controllable)
   max_grad_norm_actor: 5.0            # Actor gradient clipping threshold
@@ -38,18 +47,13 @@ mappo:
   gain: 0.01                          # Initialization gain
   
   # Value normalization options
-  use_popart: false                    # Use PopArt normalization (ENABLED for stability)
-  use_valuenorm: false                # Use value normalization (disabled for stability)
+  use_popart: false                   # Use PopArt normalization
+  use_valuenorm: false                # Use value normalization
   use_clipped_value_loss: true        # Use clipped value loss (ENABLED for stability)
   huber_delta: 1.0                    # Huber loss delta
   
   # Training termination
   max_global_steps: 200000            # Primary termination condition
-
-# ==============================================================================
-# Global Settings
-# ==============================================================================
-seed: 42
 
 # ==============================================================================
 # Rollout Configuration
@@ -88,7 +92,7 @@ initial_conditions:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: false  # Enable detailed console logging for debugging
+  enable_console_logging: false       # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -101,10 +105,10 @@ trajectory:
 # Constraint Geometry
 # ==============================================================================
 constraint_geometry:
-  center: [0.14, 0.0, 0.0]           # Constraint center position (meters)
+  center: [0.14, 0.0, 0.0]            # Constraint center position (meters)
   collision_threshold: 0.0005         # Collision detection threshold (meters)
-  y_range_positive: [0.038, 0.048]   # Positive Y constraint boundaries
-  y_range_negative: [-0.048, -0.038] # Negative Y constraint boundaries
+  y_range_positive: [0.038, 0.048]    # Positive Y constraint boundaries
+  y_range_negative: [-0.048, -0.038]  # Negative Y constraint boundaries
 
 # ==============================================================================
 # Reward Parameters - Four-Zone System (Flat Structure)
@@ -137,7 +141,7 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.0            # Potential reward weight for robot
+    potential_robot: 0.0              # Potential reward weight for robot
     forceeff_robot: 0.15
     humanaware_robot: 0.15
 
@@ -164,7 +168,7 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.0             # Potential reward weight for human
+    potential_human: 0.0              # Potential reward weight for human
     forceeff_human: 0.15
     robotaware_human: 0.15
 
@@ -174,7 +178,7 @@ reward_parameters:
 termination_conditions:
   z_below_zero: false                 # Disable Z termination for now
   edge_collision: false               # Enable direct termination on obstacle entry
-  safety_distance_threshold: 0.0     # Direct termination when entering obstacle
+  safety_distance_threshold: 0.0      # Direct termination when entering obstacle
 
 # ==============================================================================
 # State Normalization Configuration

@@ -2,8 +2,7 @@
 Utility functions and base modules for rMAPPO.
 Contains: basic utilities, continuous action distributions, action layer, and PopArt.
 Simplified to support only continuous actions with RNN networks.
-MODIFIED: Added Tanh-Gaussian distribution for bounded action space.
-MODIFIED: Removed all finite_check functions, relying on PyTorch natural failure.
+MODIFIED: Clean deterministic branch, confirmed logstd_mean() method for monitoring.
 STABLE: Core functionality remains, gradient monitoring support via logstd_mean().
 """
 
@@ -95,12 +94,7 @@ class DiagGaussian(nn.Module):
 
     def forward(self, x):
         action_mean = self.fc_mean(x)
-
-        # Handle CUDA tensors
-        zeros = torch.zeros(action_mean.size())
-        if x.is_cuda:
-            zeros = zeros.cuda()
-
+        zeros = torch.zeros_like(action_mean)
         action_logstd = self.logstd(zeros)
         return FixedNormal(action_mean, action_logstd.exp())
 
@@ -125,7 +119,7 @@ class TanhDiagGaussian(nn.Module):
         logstd = self.logstd(torch.zeros_like(mean))
         
         # Model constraint - allowed boundary clamping
-        logstd = torch.clamp(logstd, -3.0 , -1.0)
+        logstd = torch.clamp(logstd, -3.0, -1.0)
         std = logstd.exp()
         
         return FixedNormal(mean, std)
@@ -177,14 +171,17 @@ class ACTLayer(nn.Module):
     def forward(self, x, available_actions=None, deterministic=False):
         """Compute actions and action logprobs from given input."""
         if self.use_tanh:
-            d = self._dist.dist(x)
             if deterministic:
                 # For deterministic actions, use mean of base distribution then tanh
                 base_mean = self._dist.base_dist(x).mean
                 actions = torch.tanh(base_mean)
             else:
+                # For stochastic actions, sample from transformed distribution
+                d = self._dist.dist(x)
                 actions = d.sample()
             
+            # Compute log probability for sampled/deterministic actions
+            d = self._dist.dist(x)
             action_log_probs = d.log_prob(actions).sum(-1, keepdim=True)
             
         else:
@@ -197,9 +194,9 @@ class ACTLayer(nn.Module):
     def get_probs(self, x, available_actions=None):
         """Compute action probabilities from inputs."""
         if self.use_tanh:
-            # For tanh gaussian, return mean of transformed distribution
-            d = self._dist.dist(x)
-            return d.mean
+            # Return deterministic policy action: tanh(base mean)
+            base_mean = self._dist.base_dist(x).mean
+            return torch.tanh(base_mean)
         else:
             action_logits = self.action_out(x)
             return action_logits.probs
