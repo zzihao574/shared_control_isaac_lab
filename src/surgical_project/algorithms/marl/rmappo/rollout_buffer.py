@@ -1,18 +1,18 @@
 """
 On-policy rollout buffer with RNN support for rMAPPO.
 Complete implementation with GAE term_masks support for time-limit bootstrap.
-MODIFIED: Added generator parameter support for external RNG control.
-STABLE: Core assertions for shape validation remain.
+MODIFIED: Removed structural config assertions, fixed mb_size with ceil, supports external RNG.
 """
 
 import torch
+import math
 
 
 class SharedRolloutBuffer:
     """
     On-policy rollout buffer with RNN support.
     Shapes use (T, N, ...), where N = num_envs * num_agents.
-    STABLE: Shape assertions remain, supports external generator for reproducibility.
+    MODIFIED: Removed config assertions (moved to startup), fixed mb_size calculation.
     """
     def __init__(self, T, N, obs_dim, share_obs_dim, act_dim, rnn_hidden_dim, device):
         self.T, self.N = T, N
@@ -120,6 +120,7 @@ class SharedRolloutBuffer:
     def recurrent_generator(self, num_mini_batch, data_chunk_length, generator=None):
         """
         Yield mini-batches with external generator support for reproducibility.
+        MODIFIED: Removed config assertions (T % L, mini_batch bounds), fixed mb_size with ceil.
         
         Args:
             num_mini_batch: Number of mini-batches to create
@@ -128,16 +129,13 @@ class SharedRolloutBuffer:
         """
         T, N = self.T, self.N
         L = data_chunk_length
-        assert T % L == 0, "T must be divisible by data_chunk_length"
-        chunks_per_slot = T // L
-        total_chunks = N * chunks_per_slot
-
-        # Hard assertions
-        assert total_chunks > 0, "Total chunks must be > 0"
-        assert 1 <= num_mini_batch <= total_chunks, \
-            f"num_mini_batch={num_mini_batch} exceeds total_chunks={total_chunks}"
         
-        mb_size = max(1, total_chunks // num_mini_batch)
+        # Config assertions removed - these are checked at startup in train_rmappo.py
+        chunks_per_slot = T // L  # Startup guarantees T % L == 0
+        total_chunks = N * chunks_per_slot
+        
+        # Fixed: Use ceil to avoid dropping tail data
+        mb_size = math.ceil(total_chunks / num_mini_batch)
         
         # Use external generator if provided for reproducibility
         if generator is not None:
@@ -149,7 +147,7 @@ class SharedRolloutBuffer:
             start = mb * mb_size
             end = min((mb + 1) * mb_size, total_chunks)
             
-            # Hard assertion - no empty slices
+            # Runtime data validity assertions (kept)
             assert end > start, f"Empty slice detected: start={start}, end={end}"
             idx = perm[start:end]
             assert idx.numel() > 0, "Empty index tensor"

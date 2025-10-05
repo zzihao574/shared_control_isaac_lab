@@ -1,8 +1,7 @@
 """
 rMAPPO core components: Actor-Critic networks, Policy wrapper, and Algorithm trainer.
 Naming clarification: RMAPPOPolicy (policy) + RMAPPOAlgorithm (algorithm trainer).
-MODIFIED: Strong action dimension assertions, cosine LR decay implementation.
-STABLE: Relies on PyTorch natural failure + wandb monitoring instead of manual checks.
+MODIFIED: Removed ValueNorm class and all valuenorm branches, keeping only PopArt.
 """
 
 import numpy as np
@@ -248,42 +247,6 @@ def mse_loss(e):
     return e ** 2 / 2
 
 
-class ValueNorm:
-    """Simple value normalization."""
-    def __init__(self, input_shape, device=torch.device("cpu")):
-        self.device = device
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = 0
-        
-    def update(self, values):
-        """Update normalization statistics."""
-        batch_mean = values.mean()
-        batch_var = values.var()
-        batch_count = values.numel()
-        
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-        
-        new_mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + (delta ** 2) * self.count * batch_count / tot_count
-        new_var = M2 / tot_count
-        
-        self.mean = new_mean
-        self.var = new_var
-        self.count = tot_count
-        
-    def normalize(self, values):
-        """Normalize values."""
-        return (values - self.mean) / (torch.sqrt(self.var) + 1e-8)
-        
-    def denormalize(self, values):
-        """Denormalize values."""
-        return values * torch.sqrt(self.var) + self.mean
-
-
 class RMAPPOAlgorithm:
     """rMAPPO Algorithm Trainer - executes PPO updates with gradient clipping and LR decay."""
 
@@ -306,19 +269,14 @@ class RMAPPOAlgorithm:
 
         self._use_clipped_value_loss = args.get('use_clipped_value_loss', False)
         self._use_popart = args.get('use_popart', False)
-        self._use_valuenorm = args.get('use_valuenorm', False)
 
-        # MetricsHub for logging (preferred over log_fn)
+        # MetricsHub for logging
         self.metrics_hub = args.get('metrics_hub', None)
         self.global_step = 0
 
-        assert (self._use_popart and self._use_valuenorm) == False, (
-            "use_popart and use_valuenorm cannot be both True")
-
+        # MODIFIED: Only PopArt is supported, ValueNorm removed
         if self._use_popart:
             self.value_normalizer = self.policy.critic.v_out
-        elif self._use_valuenorm:
-            self.value_normalizer = ValueNorm(1, device=self.device)
         else:
             self.value_normalizer = None
 
@@ -327,9 +285,8 @@ class RMAPPOAlgorithm:
         self.actor_lr_init = self.policy.actor_optimizer.param_groups[0]["lr"]
         self.critic_lr_init = self.policy.critic_optimizer.param_groups[0]["lr"]
         
-        # Load LR decay config from args (passed from YAML via training section)
+        # Load LR decay config from args
         if 'args' in args and hasattr(args['args'], 'config'):
-            # Try to load from file
             import yaml
             try:
                 with open(args['args'].config, 'r') as f:
@@ -356,7 +313,6 @@ class RMAPPOAlgorithm:
         critic_min = self.critic_lr_init * self._lr_final_factor
         
         # Cosine decay with ~1000 updates as the decay horizon
-        # You can adjust this to use actual total_updates if known
         progress = min(1.0, now_update_idx / 1000.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         
@@ -369,7 +325,7 @@ class RMAPPOAlgorithm:
         for pg in self.policy.critic_optimizer.param_groups:
             pg["lr"] = critic_lr
         
-        # Log to MetricsHub using global_step for axis alignment
+        # Log to MetricsHub
         if self.metrics_hub is not None:
             self.metrics_hub.push_scalars(
                 {"lr/actor": actor_lr, "lr/critic": critic_lr},
@@ -380,7 +336,8 @@ class RMAPPOAlgorithm:
         """Calculate value function loss using Huber loss."""
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.clip_param, self.clip_param)
         
-        if self._use_popart or self._use_valuenorm:
+        # MODIFIED: Only PopArt branch remains, ValueNorm removed
+        if self._use_popart:
             self.value_normalizer.update(return_batch)
             error_clipped = self.value_normalizer.normalize(return_batch) - value_pred_clipped
             error_original = self.value_normalizer.normalize(return_batch) - values
@@ -442,7 +399,6 @@ class RMAPPOAlgorithm:
         adv_targ = adv_targ.view(L * B, -1)
         
         # ===== MONITORING SYSTEM WITH MEAN VALUES =====
-        # Calculate monitoring metrics before backprop
         ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
         approx_kl = (old_action_log_probs_batch - action_log_probs)
         act_used = _flat(actions_batch)
@@ -452,7 +408,7 @@ class RMAPPOAlgorithm:
         vals = values.view(-1)[valid]
         rets = return_batch.view(-1)[valid]
 
-        # Log comprehensive monitoring metrics through MetricsHub
+        # Log comprehensive monitoring metrics
         if self.metrics_hub is not None:
             self.metrics_hub.push_scalars({
                 # PPO metrics
@@ -461,7 +417,7 @@ class RMAPPOAlgorithm:
                 "ppo/kl_mean":    float(approx_kl.mean().detach()),
                 "ppo/clip_fraction": float(((ratio > 1+self.clip_param) | (ratio < 1-self.clip_param)).float().mean().detach()),
                 
-                # Advantage normalization check (should be ~0 mean, ~1 std)
+                # Advantage normalization check
                 "ppo/adv_mean_norm": float(adv_targ.view(-1)[valid].mean().detach()),
                 "ppo/adv_std_norm": float(adv_targ.view(-1)[valid].std(unbiased=False).detach()),
 
@@ -495,7 +451,7 @@ class RMAPPOAlgorithm:
         if update_actor:
             (policy_loss - dist_entropy * self.entropy_coef).backward()
 
-        # Gradient clipping for actor (records clipped norm)
+        # Gradient clipping for actor
         gn_actor = torch.nn.utils.clip_grad_norm_(
             self.policy.actor.parameters(), 
             self.max_grad_norm_actor
@@ -503,7 +459,7 @@ class RMAPPOAlgorithm:
         
         self.policy.actor_optimizer.step()
 
-        # Log actor gradient norm through MetricsHub
+        # Log actor gradient norm
         if self.metrics_hub is not None:
             self.metrics_hub.push_scalars({"grad/actor": gn_actor}, step=self.global_step)
 
@@ -514,7 +470,7 @@ class RMAPPOAlgorithm:
 
         value_loss.backward()
 
-        # Gradient clipping for critic (records clipped norm)
+        # Gradient clipping for critic
         gn_critic = torch.nn.utils.clip_grad_norm_(
             self.policy.critic.parameters(),
             self.max_grad_norm_critic
@@ -522,7 +478,7 @@ class RMAPPOAlgorithm:
 
         self.policy.critic_optimizer.step()
 
-        # Log critic gradient norm through MetricsHub
+        # Log critic gradient norm
         if self.metrics_hub is not None:
             self.metrics_hub.push_scalars({"grad/critic": gn_critic}, step=self.global_step)
 

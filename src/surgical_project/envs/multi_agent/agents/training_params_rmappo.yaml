@@ -1,6 +1,6 @@
 # Training parameters configuration for dual independent networks
 # Features unified single configuration source: mappo only
-# MODIFIED: Simplified lr_decay to only use enabled and final_factor
+# MODIFIED: Removed use_valuenorm, simplified lr_decay
 
 # ==============================================================================
 # Global Settings
@@ -14,51 +14,49 @@ training:
 # ==============================================================================
 # Unified Algorithm Configuration (Single Source of Truth)
 # ==============================================================================
-mappo:
-  # Learning rates
-  actor_lr: 0.0003                    # Actor learning rate (reduced for stability)
-  critic_lr: 0.0007                   # Critic learning rate (reduced for stability)
-  
-  # Discount and GAE
-  gamma: 0.99                         # Discount factor
-  gae_lambda: 0.95                    # GAE lambda
-  
-  # PPO specific (stabilized)
-  clip_param: 0.1                     # PPO clipping parameter (reduced from 0.2)
-  ppo_epoch: 4                        # Number of PPO epochs per update (reduced from 10)
-  num_mini_batch: 8                   # Number of mini-batches per epoch
-  data_chunk_length: 16               # RNN sequence length for training
-  
-  # Loss coefficients
-  entropy_coef: 0.005                 # Entropy regularization coefficient
-  
-  # Gradient clipping (YAML controllable)
-  max_grad_norm_actor: 5.0            # Actor gradient clipping threshold
-  max_grad_norm_critic: 10.0          # Critic gradient clipping threshold
-  
-  # Optimization
-  opt_eps: 0.00001                    # Optimizer epsilon (1e-5 in decimal)
-  weight_decay: 0.0                   # Weight decay
-  
-  # Network architecture
-  hidden_size: 256                    # Hidden layer size
-  recurrent_N: 1                      # Number of RNN layers
-  use_orthogonal: true                # Use orthogonal initialization
-  gain: 0.01                          # Initialization gain
-  
-  # Value normalization options
-  use_popart: false                   # Use PopArt normalization
-  use_valuenorm: false                # Use value normalization
-  use_clipped_value_loss: true        # Use clipped value loss (ENABLED for stability)
-  huber_delta: 1.0                    # Huber loss delta
-  
-  # Training termination
-  max_global_steps: 200000            # Primary termination condition
-
-# ==============================================================================
-# Rollout Configuration
-# ==============================================================================
-rollout_horizon: 256                  # Number of steps per rollout
+algorithms:
+  rmappo:
+    # Rollout configuration
+    rollout_horizon: 256              # Number of steps per rollout
+    data_chunk_length: 16             # RNN sequence length for training
+    
+    # Learning rates
+    actor_lr: 0.0003                  # Actor learning rate
+    critic_lr: 0.0007                 # Critic learning rate
+    
+    # Discount and GAE
+    gamma: 0.99                       # Discount factor
+    gae_lambda: 0.95                  # GAE lambda
+    
+    # PPO specific
+    clip_param: 0.1                   # PPO clipping parameter
+    ppo_epoch: 4                      # Number of PPO epochs per update
+    num_mini_batch: 8                 # Number of mini-batches per epoch
+    
+    # Loss coefficients
+    entropy_coef: 0.005               # Entropy regularization coefficient
+    
+    # Gradient clipping (YAML controllable)
+    max_grad_norm_actor: 5.0          # Actor gradient clipping threshold
+    max_grad_norm_critic: 10.0        # Critic gradient clipping threshold
+    
+    # Optimization
+    opt_eps: 0.00001                  # Optimizer epsilon (1e-5)
+    weight_decay: 0.0                 # Weight decay
+    
+    # Network architecture
+    hidden_size: 256                  # Hidden layer size
+    recurrent_N: 1                    # Number of RNN layers
+    use_orthogonal: true              # Use orthogonal initialization
+    gain: 0.01                        # Initialization gain
+    
+    # Value normalization options (ValueNorm removed)
+    use_popart: false                 # Use PopArt normalization
+    use_clipped_value_loss: true      # Use clipped value loss
+    huber_delta: 1.0                  # Huber loss delta
+    
+    # Training termination
+    max_global_steps: 200000          # Primary termination condition
 
 # ==============================================================================
 # Physics Constraints (Runtime Constraints)
@@ -131,7 +129,7 @@ reward_parameters:
     zoneC_weight_robot: 1.0
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
-    zoneC_overlap_robot: 1.0          # Collision penalty weight
+    zoneC_overlap_robot: 1.0
 
     zoneD_weight_robot: 0.6
     zoneD_progress_robot: 1.0
@@ -141,9 +139,9 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.0              # Potential reward weight for robot
-    forceeff_robot: 0.15
-    humanaware_robot: 0.15
+    potential_robot: 0.1
+    forceeff_robot: 0.25
+    humanaware_robot: 0.25
 
     # ===== HUMAN (Independent Network) =====  
     zoneA_weight_human: 0.6
@@ -168,9 +166,9 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.0              # Potential reward weight for human
-    forceeff_human: 0.15
-    robotaware_human: 0.15
+    potential_human: 0.1
+    forceeff_human: 0.25
+    robotaware_human: 0.25
 
 # ==============================================================================
 # Termination Conditions
@@ -192,6 +190,4 @@ obs_scaling:
 # ==============================================================================
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
-  # Episodes are counted as sum of all environment completions
-  # These are per-env baselines and will be auto-scaled by --num_envs
   milestone_episodes: [3, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]

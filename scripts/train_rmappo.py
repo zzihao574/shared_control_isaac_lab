@@ -119,7 +119,14 @@ def load_dual_network_config(config_path: str):
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
 
-    common = _select_mappo_block(cfg)
+    # Support both old and new structures
+    if "algorithms" in cfg and "rmappo" in cfg["algorithms"]:
+        common = cfg["algorithms"]["rmappo"]
+    elif "mappo" in cfg:
+        common = cfg["mappo"]
+    else:
+        common = _select_mappo_block(cfg)
+    
     _validate_mappo_args(common, "mappo")
     
     import copy

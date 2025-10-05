@@ -3,8 +3,7 @@
 """
 Training helper utilities for dual-network rMAPPO multi-environment parallel training.
 Features unified training execution, milestone evaluation, and optimized WandB logging.
-MODIFIED: Global RNG for reproducibility, priority reading of applied_forces.
-STABLE: Unified WandB initialization, gradient clipping with separate thresholds.
+MODIFIED: Evaluation clears RNN states after completion to avoid training contamination.
 """
 
 import argparse
@@ -50,11 +49,11 @@ class RMAPPOTrainingRunner:
         
         # rMAPPO specific parameters
         self.T = rmappo_wrapper.T
-        self.num_mini_batch = rmappo_wrapper.params.get('mappo_args', {}).get('num_mini_batch', 4)
-        self.data_chunk_length = rmappo_wrapper.params.get('mappo_args', {}).get('data_chunk_length', 16)
+        self.num_mini_batch = rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}).get('num_mini_batch', 4)
+        self.data_chunk_length = rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}).get('data_chunk_length', 16)
         
         # Global RNG for training (CPU-based for reproducibility)
-        seed = int(rmappo_wrapper.params.get('seed', 42))
+        seed = int(rmappo_wrapper.params.get('training', {}).get('seed', 42))
         self._train_generator = torch.Generator(device="cpu")
         self._train_generator.manual_seed(seed + 424242)
         print(f"[RUNNER] Global training RNG initialized with seed: {seed + 424242}")
@@ -66,10 +65,10 @@ class RMAPPOTrainingRunner:
         if max_global_steps is not None and max_global_steps > 0:
             self.max_global_steps = int(max_global_steps)
         else:
-            mappo_args = rmappo_wrapper.params.get('mappo_args', {})
-            if not mappo_args:
-                raise ValueError("[CONFIG ERROR] 'mappo_args' is missing from params.")
-            self.max_global_steps = int(mappo_args.get('max_global_steps', 200000))
+            rmappo_args = rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {})
+            if not rmappo_args:
+                raise ValueError("[CONFIG ERROR] 'algorithms.rmappo' is missing from params.")
+            self.max_global_steps = int(rmappo_args.get('max_global_steps', 200000))
         
         print(f"[DUAL RMAPPO RUNNER] Configured:")
         print(f"  Rollout horizon: {self.T}")
@@ -249,9 +248,12 @@ class RMAPPOMilestoneEvaluator:
         
         print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
 
+        # MODIFIED: Clear RNN states after evaluation to avoid training contamination
         for aid in self.agent_ids:
             self.rmappo.rnn_states[aid]["actor"].zero_()
             self.rmappo.rnn_states[aid]["critic"].zero_()
+        
+        print(f"[EVAL] RNN states cleared after milestone {milestone}")
 
         return {"skip_episode_once": True}
 
@@ -271,8 +273,8 @@ class RMAPPOMilestoneEvaluator:
         completed_return_norms = []
         
         for aid in self.agent_ids:
-            mappo_args = self.rmappo.params.get('mappo_args', {})
-            H = mappo_args.get('hidden_size', 256)
+            rmappo_args = self.rmappo.params.get('algorithms', {}).get('rmappo', {})
+            H = rmappo_args.get('hidden_size', 256)
             self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
             self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
         
@@ -475,13 +477,13 @@ class WandBLogger:
             settings=wandb.Settings(start_method="thread")
         )
         
-        mappo_cfg = config.get("mappo_args", config.get("mappo", {}))
+        rmappo_cfg = config.get("algorithms", {}).get("rmappo", {})
         wandb.config.update({
-            "rollout_horizon": config.get("rollout_horizon", 256),
-            "ppo_epoch": mappo_cfg.get("ppo_epoch", 10),
-            "num_mini_batch": mappo_cfg.get("num_mini_batch", 4),
-            "clip_param": mappo_cfg.get("clip_param", 0.2),
-            "hidden_size": mappo_cfg.get("hidden_size", 256),
+            "rollout_horizon": rmappo_cfg.get("rollout_horizon", 256),
+            "ppo_epoch": rmappo_cfg.get("ppo_epoch", 10),
+            "num_mini_batch": rmappo_cfg.get("num_mini_batch", 4),
+            "clip_param": rmappo_cfg.get("clip_param", 0.2),
+            "hidden_size": rmappo_cfg.get("hidden_size", 256),
             "network_architecture": "dual_independent",
             "action_distribution": "tanh_gaussian",
             "reproducibility_mode": "global_rng_fixed_num_envs",
@@ -603,7 +605,6 @@ class TrainingConfiguration:
         self.config_path = config_path
         with open(self.config_path, 'r') as f:
             self.params = yaml.safe_load(f)
-        self.mappo_cfg = self.params.get('mappo', {})
     
     @classmethod
     def from_yaml(cls, config_path: str):
@@ -673,7 +674,7 @@ def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: 
         'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),
         'episodes_done_total': global_episodes,
         'max_milestone_triggered': max_milestone_triggered or 0,
-        'mappo_config': rmappo_wrapper.params.get('mappo_args', {}),
+        'rmappo_config': rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}),
     }
     
     for aid in rmappo_wrapper.agent_ids:
