@@ -342,11 +342,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Compute observations for all agents and update state cache."""
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
-        
+
         # Ensure constraint checker has robot reference for coordinate transformations
         if hasattr(self, 'constraint_checker') and hasattr(self, '_omni_robot'):
             self.constraint_checker._omni_robot = self._omni_robot
-        
+
         current_base_positions = self._omni_robot.data.root_link_pos_w.clone()
         self.constraint_results_t1 = self.constraint_checker.analyze_constraint_state_batch(
             self.stylus_pos_t1, current_base_positions
@@ -355,18 +355,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
         self.normal_t1 = self.constraint_results_t1['normal_vectors']
 
-        constraint_distances = self.safety_distances_t1.unsqueeze(-1)
+        constraint_distances = self.safety_distances_t1.unsqueeze(-1)     # [N,1]
 
-        obs = torch.cat([
-            self.stylus_pos_t1,       # End-effector position (3)
-            self.stylus_vel_t1,       # End-effector velocity (3) 
-            constraint_distances,     # Distance measurements (1)
-        ], dim=-1)
-        
-        observations = {}
-        for agent in self.cfg.possible_agents:
-            observations[agent] = obs
-            
+        # ★ deviation 一维（Tuple 返回：deviations, closest_points）
+        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)  # [N]
+        deviations = deviations.unsqueeze(-1)                                     # [N,1]
+
+        # ★ 新观测 = [ deviation(1) , vel(3) , dist(1) ] → 5D
+        obs_5d = torch.cat([deviations, self.stylus_vel_t1, constraint_distances], dim=-1)  # [N,5]
+
+        observations = {agent: obs_5d for agent in self.cfg.possible_agents}
         return observations
 
     def _build_zone_masks(self):

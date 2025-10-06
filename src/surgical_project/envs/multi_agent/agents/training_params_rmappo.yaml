@@ -34,7 +34,7 @@ algorithms:
     num_mini_batch: 8                 # Number of mini-batches per epoch
     
     # Loss coefficients
-    entropy_coef: 0.005               # Entropy regularization coefficient
+    entropy_coef: 0.01               # Entropy regularization coefficient
     
     # Gradient clipping (YAML controllable)
     max_grad_norm_actor: 5.0          # Actor gradient clipping threshold
@@ -119,7 +119,7 @@ reward_parameters:
     # ===== ROBOT (Active Agent) =====
     zoneA_weight_robot: 0.6
     zoneA_progress_robot: 3.0
-    zoneA_deviation_robot: 1.5
+    zoneA_deviation_robot: 1.0
 
     zoneB_weight_robot: 0.6
     zoneB_gap_robot: 1.0
@@ -139,14 +139,14 @@ reward_parameters:
     zpenalty_robot: 0.0
     completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.1
-    forceeff_robot: 0.25
-    humanaware_robot: 0.25
+    potential_robot: 0.2
+    forceeff_robot: 0.2
+    humanaware_robot: 0.2
 
     # ===== HUMAN (Independent Network) =====  
     zoneA_weight_human: 0.6
     zoneA_progress_human: 3.0
-    zoneA_deviation_human: 1.5
+    zoneA_deviation_human: 1.0
 
     zoneB_weight_human: 0.6
     zoneB_gap_human: 1.0
@@ -166,9 +166,9 @@ reward_parameters:
     zpenalty_human: 0.0
     completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.1
-    forceeff_human: 0.25
-    robotaware_human: 0.25
+    potential_human: 0.2
+    forceeff_human: 0.2
+    robotaware_human: 0.2
 
 # ==============================================================================
 # Termination Conditions
@@ -183,11 +183,11 @@ termination_conditions:
 # ==============================================================================
 obs_scaling:
   # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
-  factors: [5.0, 5.0, 5.0, 16.7, 16.7, 16.7, 5.0]  # Position and velocity scaling
+  factors: [5.0, 16.7, 16.7, 16.7, 5.0]  # Position and velocity scaling
 
 # ==============================================================================
 # Training Monitoring
 # ==============================================================================
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
-  milestone_episodes: [3, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]
+  milestone_episodes: [3, 10, 15, 20, 25, 30, 45, 60, 75, 90, 100, 150, 200, 300, 400, 500]

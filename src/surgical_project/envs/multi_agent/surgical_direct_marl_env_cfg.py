@@ -46,8 +46,8 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     }
     
     observation_spaces = {
-        "human": 7, # Corrected to actual dimensions
-        "robot": 7, # Corrected to actual dimensions
+        "human": 5, # Corrected to actual dimensions
+        "robot": 5, # Corrected to actual dimensions
     }
     
     state_space = 38

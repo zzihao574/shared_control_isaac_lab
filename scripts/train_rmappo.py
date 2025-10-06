@@ -228,7 +228,9 @@ class DualRMAPPOWrapper:
         else:
             self.obs_scale_factors['human'] = torch.ones(obs_dim, device=device, dtype=torch.float32)
             self.obs_scale_factors['robot'] = torch.ones(obs_dim, device=device, dtype=torch.float32)
-        
+
+        print(f"[WRAPPER] obs_scaling factors length={len(self.obs_scale_factors['human'])} (obs_dim={obs_dim})")
+
         obs_space_desc = {'shape': (obs_dim,)}
         cent_obs_space_desc = {'shape': (share_obs_dim,)}
         act_space_desc = {'shape': (act_dim,)}
@@ -340,11 +342,11 @@ class DualRMAPPOWrapper:
         values = {}
         
         if deterministic is None:
-            deterministic = self._is_eval_mode or not add_noise
+            deterministic = self._is_eval_mode or not add_noise #优化？
         
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
-            masks = torch.ones(obs.shape[0], 1, device=self.device)
+            masks = torch.ones(obs.shape[0], 1, device=self.device) #？
             
             with torch.no_grad():
                 v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
