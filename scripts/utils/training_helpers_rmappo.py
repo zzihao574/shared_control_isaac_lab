@@ -3,7 +3,8 @@
 """
 Training helper utilities for dual-network rMAPPO multi-environment parallel training.
 Features unified training execution, milestone evaluation, and optimized WandB logging.
-MODIFIED: Evaluation clears RNN states after completion to avoid training contamination.
+MODIFIED: Added mid-rollout evaluation trigger with override bootstrap mechanism.
+OPTIMIZED: Removed TopK redundancy, fixed evaluation bugs, optimizer path compatibility.
 """
 
 import argparse
@@ -11,6 +12,7 @@ import os
 import yaml
 import torch
 import numpy as np
+import random
 import pickle
 import math
 import traceback
@@ -28,14 +30,43 @@ except ImportError:
     print("[WARNING] WandB not available. Install with: pip install wandb")
 
 
-class RMAPPOTrainingRunner:
-    """Unified training loop executor for dual-network rMAPPO with rollout collection."""
+# ============================================================================
+# UTILITY: Multi-path attribute accessor for optimizer compatibility
+# ============================================================================
+
+def _get_attr_chain(obj, *paths):
+    """
+    Try to get attribute from obj using multiple dot-separated paths.
+    Returns first existing non-None attribute, or None if all fail.
     
-    def __init__(self, env, rmappo_wrapper, metrics_hub, agent_ids, max_global_steps=None):
+    Example:
+        _get_attr_chain(rmappo, "policies.human.actor_optimizer", 
+                               "trainers.human.optimizer_actor")
+    
+    This handles different optimizer storage patterns across implementations.
+    """
+    for p in paths:
+        cur = obj
+        ok = True
+        for name in p.split('.'):
+            if not hasattr(cur, name):
+                ok = False
+                break
+            cur = getattr(cur, name)
+        if ok and cur is not None:
+            return cur
+    return None
+
+
+class RMAPPOTrainingRunner:
+    """Unified training loop executor for dual-network rMAPPO with mid-rollout evaluation support."""
+    
+    def __init__(self, env, rmappo_wrapper, metrics_hub, agent_ids, max_global_steps=None, evaluator=None):
         self.env = env
         self.rmappo = rmappo_wrapper
         self.metrics = metrics_hub
         self.agent_ids = agent_ids
+        self.evaluator = evaluator  # NEW: evaluator reference for mid-rollout eval
         
         # Clear separation of step counting
         self.global_step = 0
@@ -46,6 +77,14 @@ class RMAPPOTrainingRunner:
         
         # Evaluation mode control
         self.is_eval_mode = False
+        
+        # ============ NEW: Milestone tracking for mid-rollout evaluation ============
+        self.milestone_episodes = rmappo_wrapper.params.get('training_monitor', {}).get('milestone_episodes', [])
+        self.max_milestone_triggered = 0
+        self._pending_eval_milestone = None
+        self._has_eval_this_window = False  # Prevent multiple evals in same window
+        print(f"[RUNNER] Milestone episodes: {self.milestone_episodes}")
+        # ===========================================================================
         
         # rMAPPO specific parameters
         self.T = rmappo_wrapper.T
@@ -76,13 +115,109 @@ class RMAPPOTrainingRunner:
         print(f"  Step counting: global_step (collection) + train_updates (training rounds)")
         print(f"  Networks: independent human & robot")
         print(f"  Reproducibility: Global CPU RNG for minibatch shuffling")
+        print(f"  Mid-rollout evaluation: ENABLED")
 
     def set_eval_mode(self, flag: bool):
         """Set evaluation mode flag."""
         self.is_eval_mode = bool(flag)
 
+    def _check_milestone_crossed(self, future_episodes: int) -> Optional[int]:
+        """Check if any milestone is crossed by future episode count."""
+        if not self.milestone_episodes:
+            return None
+        
+        for milestone in sorted(self.milestone_episodes):
+            if future_episodes >= milestone > self.max_milestone_triggered:
+                return milestone
+        return None
+
+    def _handle_mid_rollout_evaluation(self, rollout_step: int, current_obs, next_obs, milestone: int):
+        """
+        Handle artificial truncation and bootstrap override for mid-rollout evaluation.
+        
+        Key steps:
+        1. Identify ongoing environments (not naturally done)
+        2. Apply artificial truncation: masks[t]=0, term_masks[t]=1 (truncated semantics)
+        3. Compute V(s_{t+1}) using CORRECT RNN state (BEFORE masking)
+        4. Store override bootstrap values
+        
+        CRITICAL FIX: Do NOT multiply critic hidden state by masks[t] before computing V(s_{t+1}).
+        We want V from the "pre-evaluation" context, not a zeroed state.
+        """
+        t = rollout_step
+        
+        print(f"\n[MID-ROLLOUT EVAL] Handling evaluation trigger at t={t}, milestone={milestone}")
+        
+        for aid in self.agent_ids:
+            buf = self.rmappo.buffers[aid]
+            
+            # ============ KEY POINT 1: Strict ongoing identification ============
+            # ongoing = environments where:
+            #   - masks[t] > 0.5 (not done by environment)
+            #   - term_masks[t] > 0.5 (not terminated, could continue)
+            ongoing = (buf.masks[t] > 0.5) & (buf.term_masks[t] > 0.5)
+            # ====================================================================
+            
+            if not ongoing.any():
+                print(f"[TRUNCATE] Agent {aid}: No ongoing envs at t={t}")
+                continue
+            
+            ongoing_count = ongoing.sum().item()
+            print(f"[TRUNCATE] Agent {aid}: {ongoing_count} ongoing envs at t={t}")
+            
+            # ============ KEY POINT 2: Compute V(s_{t+1}) BEFORE masking ============
+            # CRITICAL: Use the ORIGINAL critic hidden state, not masked by masks[t]
+            # We want the value estimate from the "pre-evaluation" RNN context
+            obs_scaled = self.rmappo.build_obs_scaled(next_obs)
+            _, share_obs = self.rmappo.build_obs_tensors(obs_scaled, aid)
+            
+            # ✅ FIXED: Clone but do NOT multiply by masks[t]
+            # The RNN state should reflect the "pre-evaluation" trajectory
+            critic_h = self.rmappo.rnn_states[aid]["critic"].clone()
+            # ❌ OLD BUGGY CODE: critic_h = critic_h * buf.masks[t].squeeze(-1).unsqueeze(-1)
+            
+            # FIXED: Explicit dtype for critic mask
+            masks_for_critic = torch.ones(
+                share_obs.shape[0], 1, 
+                device=self.rmappo.device, 
+                dtype=torch.float32
+            )
+            
+            with torch.no_grad():
+                v_next_pre_eval = self.rmappo.policies[aid].get_values(
+                    share_obs,
+                    critic_h,  # Use unmasked critic state
+                    masks_for_critic
+                )
+            # ==========================================================================
+            
+            # ============ Apply artificial truncation AFTER computing V ============
+            # Break advantage recursion but allow bootstrap
+            buf.masks[t][ongoing] = 0.0  # Break GAE recursion
+            
+            # FIXED: Explicitly set term_masks to allow bootstrap (truncated semantics)
+            buf.term_masks[t][ongoing] = 1.0  # Allow bootstrap, prevent treating as terminal
+            # =======================================================================
+            
+            # Store override bootstrap values
+            buf.override_bootstrap_values[t][ongoing] = v_next_pre_eval[ongoing]
+            buf.override_bootstrap_mask[t][ongoing] = True
+            
+            print(f"[OVERRIDE] Agent {aid}: Stored V(s_{{t+1}}) for {ongoing_count} envs at t={t}")
+            
+            # FIXED: Proper sample index extraction
+            if ongoing_count > 0:
+                # Get env indices where ongoing is True
+                env_ids = torch.nonzero(ongoing.view(-1), as_tuple=True)[0]
+                sample_idx = int(env_ids[0])
+                sample_value = v_next_pre_eval[sample_idx, 0].item()
+                print(f"  Sample env {sample_idx}: V(s_{{t+1}}) = {sample_value:.4f}")
+
     def execute_training_step(self):
-        """Execute one complete rollout and training update for both networks."""
+        """
+        Execute one complete rollout and training update for both networks.
+        MODIFIED: Added mid-rollout evaluation trigger.
+        """
         current_obs = self._current_obs
         if current_obs is None:
             if hasattr(self.env, "_get_observations"):
@@ -90,7 +225,18 @@ class RMAPPOTrainingRunner:
             else:
                 current_obs, _ = self.env.reset()
             self._current_obs = current_obs
-            
+        
+        # ============ NEW: Buffer double-check cleanup ============
+        # Ensure override fields are clean before starting new rollout
+        for aid in self.agent_ids:
+            self.rmappo.buffers[aid].override_bootstrap_values.zero_()
+            self.rmappo.buffers[aid].override_bootstrap_mask.zero_()
+        # ==========================================================
+        
+        # Reset window-level flags
+        self._has_eval_this_window = False
+        self._pending_eval_milestone = None
+        
         episode_count = 0
         
         # Collect complete rollout
@@ -111,9 +257,84 @@ class RMAPPOTrainingRunner:
             self.env.unwrapped.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
-            if not self.is_eval_mode:
-                done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+            # Calculate done status
+            done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
+            done_any = None
+            for aid in self.agent_ids:
+                d = done_any_dict[aid].to(torch.bool)
+                done_any = d if done_any is None else (done_any | d)
+            
+            episode_increment = int(done_any.sum().item())
+            
+            # ============ NEW: Mid-rollout evaluation trigger ============
+            if not self.is_eval_mode and episode_increment > 0 and not self._has_eval_this_window:
+                # Check if we've crossed a milestone
+                future_episode_count = self.global_episodes + episode_count + episode_increment
+                crossed_milestone = self._check_milestone_crossed(future_episode_count)
                 
+                if crossed_milestone is not None:
+                    print(f"\n{'='*80}")
+                    print(f"[MID-ROLLOUT EVAL] Milestone {crossed_milestone} triggered at rollout_step={rollout_step}")
+                    print(f"  Current episodes: {self.global_episodes}")
+                    print(f"  Episodes this window: {episode_count}")
+                    print(f"  Future episodes: {future_episode_count}")
+                    print(f"{'='*80}\n")
+                    
+                    # First, add current experience to buffer (before evaluation)
+                    if not self.is_eval_mode:
+                        self.rmappo.add_experience_to_buffer(
+                            obs=current_obs,
+                            actions=actions,
+                            rewards=rewards,
+                            next_obs=next_obs,
+                            dones=done_any_dict,
+                            terminated=terminated,
+                            truncated=truncated,
+                            infos=infos
+                        )
+                    
+                    # Handle artificial truncation and bootstrap override
+                    self._handle_mid_rollout_evaluation(
+                        rollout_step=rollout_step,
+                        current_obs=current_obs,
+                        next_obs=next_obs,
+                        milestone=crossed_milestone
+                    )
+                    
+                    # Mark that we've handled eval this window
+                    self._has_eval_this_window = True
+                    self._pending_eval_milestone = crossed_milestone
+                    
+                    # Update episode count BEFORE evaluation
+                    episode_count += episode_increment
+                    
+                    # Set eval mode and trigger evaluation
+                    if self.evaluator is not None:
+                        print(f"[MID-ROLLOUT EVAL] Switching to eval mode...")
+                        self.set_eval_mode(True)
+                        
+                        eval_result = self.evaluator.run_evaluation(
+                            crossed_milestone, 
+                            self.global_step
+                        )
+                        
+                        self.set_eval_mode(False)
+                        print(f"[MID-ROLLOUT EVAL] Returned to training mode")
+                        
+                        # Update max milestone
+                        self.max_milestone_triggered = crossed_milestone
+                        
+                        # Mark to skip episode counting once after eval
+                        if eval_result.get("skip_episode_once", False):
+                            self._skip_episode_once = True
+                    
+                    # Continue to next rollout step after evaluation
+                    current_obs = next_obs
+                    continue
+            # =============================================================
+            
+            # Normal buffer insertion (if not in eval mode and not just handled above)
+            if not self.is_eval_mode:
                 self.rmappo.add_experience_to_buffer(
                     obs=current_obs,
                     actions=actions,
@@ -124,15 +345,8 @@ class RMAPPOTrainingRunner:
                     truncated=truncated,
                     infos=infos
                 )
-
-            done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
-            done_any = None
-            for aid in self.agent_ids:
-                d = done_any_dict[aid].to(torch.bool)
-                done_any = d if done_any is None else (done_any | d)
             
-            episode_increment = int(done_any.sum().item())
-            
+            # Episode counting
             if self.is_eval_mode or self._skip_episode_once:
                 episode_increment = 0
                 if self._skip_episode_once:
@@ -172,7 +386,9 @@ class RMAPPOTrainingRunner:
             stats = {}
 
         self._current_obs = next_obs
-        return next_obs
+        
+        # Return pending milestone if any
+        return self._pending_eval_milestone
 
     def mark_skip_episode_once(self):
         """Mark to skip episode counting once for milestone evaluation."""
@@ -215,32 +431,72 @@ class RMAPPOTrainingRunner:
 
 
 class RMAPPOMilestoneEvaluator:
-    """Milestone evaluator for dual-network rMAPPO."""
+    """Milestone evaluator for dual-network rMAPPO with checkpoint saving."""
     
-    def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids):
+    def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids, runner=None):
         self.env = env
         self.rmappo = rmappo_wrapper
         self.topk = topk_mgr
         self.metrics = metrics_hub
         self.log_dir = log_dir
         self.agent_ids = agent_ids
+        self.runner = runner  # NEW: runner reference for checkpoint saving
 
     def run_evaluation(self, milestone: int, global_step: int) -> dict:
-        """Handle milestone evaluation and model saving for dual networks."""
-        return_norm, num_eps = self._run_single_evaluation_episode()
+        """
+        Handle milestone evaluation and model saving for dual networks.
+        
+        STRICT EVALUATION ISOLATION:
+        - torch.no_grad() context
+        - networks in .eval() mode
+        - deterministic actions only
+        - no buffer writes
+        - no step/episode counting
+        
+        OPTIMIZED: Removed TopK redundancy, score tracked via WandB milestone metrics.
+        """
+        # ============ EVALUATION MODE: Strict isolation ============
+        # Set networks to eval mode
+        for aid in self.agent_ids:
+            self.rmappo.policies[aid].actor.eval()
+            self.rmappo.policies[aid].critic.eval()
+        
+        # Run evaluation with torch.no_grad()
+        with torch.no_grad():
+            return_norm, num_eps = self._run_single_evaluation_episode()
+        
+        # Restore training mode
+        for aid in self.agent_ids:
+            self.rmappo.policies[aid].actor.train()
+            self.rmappo.policies[aid].critic.train()
+        # ===========================================================
+        
         milestone_return = return_norm * 1000
         
         print(f"[EVAL] Milestone {milestone}: return_norm={return_norm:.4f}, scaled={milestone_return:.2f}")
 
-        model_state = self._extract_dual_model_state()
-        self.topk.update(milestone_return, model_state, milestone)
-        ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
-        self.topk.save_checkpoint(ckpt_path, self.agent_ids)
+        # ============ NEW: Save milestone checkpoint ============
+        if self.runner is not None:
+            ckpt_dir = os.path.join(self.log_dir, "checkpoints")
+            ckpt_path = save_milestone_checkpoint(
+                ckpt_dir=ckpt_dir,
+                rmappo=self.rmappo,
+                runner=self.runner,
+                score=milestone_return,
+                milestone=milestone
+            )
+            print(f"[EVAL] Checkpoint saved: {ckpt_path}")
+        # ========================================================
 
+        # ============ OPTIMIZED: Removed TopK update ============
+        # TopK is no longer used - each milestone gets its own checkpoint
+        # Score is tracked via WandB metrics below
+        # ========================================================
+
+        # Push metrics to WandB
         payload = {
-            "eval/return_mean": float(milestone_return),
+            "eval/return_mean": float(milestone_return),      # Maps to milestone/actor_return
             "eval/num_episodes": int(num_eps),
-            "milestone/topk_best_score": float(milestone_return),
             "milestone/latest_completed": int(milestone),
             "eval/return_norm": float(return_norm),
         }
@@ -248,7 +504,7 @@ class RMAPPOMilestoneEvaluator:
         
         print(f"[EVAL] Uploaded milestone metrics: scaled_return={milestone_return:.2f}")
 
-        # MODIFIED: Clear RNN states after evaluation to avoid training contamination
+        # Clear RNN states after evaluation to avoid training contamination
         for aid in self.agent_ids:
             self.rmappo.rnn_states[aid]["actor"].zero_()
             self.rmappo.rnn_states[aid]["critic"].zero_()
@@ -421,10 +677,10 @@ class WandBLogger:
         "train/collection_steps": "train/collection_steps",
         "train/training_rounds": "train/training_rounds",
         "train/global_episodes": "train/global_episodes",
-        "eval/return_mean": "milestone/actor_return",
-        "milestone/topk_best_score": "milestone/topk_best_return",
+        "eval/return_mean": "milestone/actor_return",  # Milestone scores via this mapping
         "milestone/latest_completed": "milestone/latest_completed",
         "eval/num_episodes": "eval/num_episodes",
+        # REMOVED: "milestone/topk_best_score" - redundant with eval/return_mean
         "forces/robot_fx_mean": "forces/robot_fx_mean",
         "forces/robot_fy_mean": "forces/robot_fy_mean",
         "forces/robot_fz_mean": "forces/robot_fz_mean",
@@ -505,12 +761,18 @@ class WandBLogger:
             
             step = ms.get("step", 0)
             payload_to_log = {}
+            
+            # Log milestone score via eval/return_mean (maps to milestone/actor_return)
             if "eval/return_mean" in ms:
                 payload_to_log["eval/return_mean"] = ms["eval/return_mean"]
-            if "milestone/topk_best_score" in ms:
-                payload_to_log["milestone/topk_best_score"] = ms["milestone/topk_best_score"]
+            
+            # REMOVED: milestone/topk_best_score - redundant with eval/return_mean
+            
+            # Log milestone completion
             if "milestone" in ms:
                 payload_to_log["milestone/latest_completed"] = ms["milestone"]
+            
+            # Log episode count
             if "eval/num_episodes" in ms:
                 payload_to_log["eval/num_episodes"] = ms["eval/num_episodes"]
 
@@ -662,45 +924,221 @@ class TopKModelManager:
             print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: {scores[0]:.2f} ~ {scores[-1]:.2f}")
 
 
-def save_final_rmappo_networks(log_directory: str, rmappo_wrapper, global_step: int, global_episodes: int, max_milestone_triggered: Optional[int]) -> None:
-    """Save final dual rMAPPO networks."""
-    final_path = os.path.join(log_directory, "final_rmappo_dual_networks.pth")
+def build_flat_dual_checkpoint(rmappo, runner, score: float, milestone: int) -> Dict[str, Any]:
+    """
+    Build flat checkpoint with dual networks for milestone saving and resume.
     
-    final_checkpoint = {
-        'params': rmappo_wrapper.params,
-        'agent_ids': rmappo_wrapper.agent_ids,
-        'algorithm': 'rmappo_dual',
-        'global_steps_total': global_step,
-        'training_rounds_total': getattr(rmappo_wrapper, 'train_updates', 0),
-        'episodes_done_total': global_episodes,
-        'max_milestone_triggered': max_milestone_triggered or 0,
-        'rmappo_config': rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}),
+    Contains:
+    - Four network state_dicts (human/robot x actor/critic)
+    - Optimizer states for training resume (multi-path compatible)
+    - RNG states for reproducibility
+    - Counters (steps/episodes/updates) for continuous training
+    """
+    checkpoint = {
+        "algorithm": "rmappo_dual",
+        "agent_ids": rmappo.agent_ids,
+        "score": float(score),
+        "milestone": int(milestone),
+        
+        # Counters: ensure LR schedule and evaluation continuity
+        "global_steps_total": int(runner.global_step),
+        "training_rounds_total": int(rmappo.train_updates),
+        "episodes_done_total": int(runner.global_episodes),
+        
+        # Four networks (flat keys)
+        "human_actor": rmappo.policies["human"].actor.state_dict(),
+        "human_critic": rmappo.policies["human"].critic.state_dict(),
+        "robot_actor": rmappo.policies["robot"].actor.state_dict(),
+        "robot_critic": rmappo.policies["robot"].critic.state_dict(),
     }
     
-    for aid in rmappo_wrapper.agent_ids:
-        policy = rmappo_wrapper.policies[aid]
-        final_checkpoint.update({
-            f'{aid}_actor': policy.actor.state_dict(),
-            f'{aid}_critic': policy.critic.state_dict(),
-        })
+    # ============ OPTIMIZED: Multi-path optimizer state extraction ============
+    # Support different optimizer storage patterns:
+    #   - policies[aid].actor_optimizer / critic_optimizer
+    #   - trainers[aid].actor_optimizer / critic_optimizer  
+    #   - trainers[aid].optimizer_actor / optimizer_critic
+    #   - trainers[aid].optimizer (fallback: single optimizer)
+    optim_state = {}
+    for aid in rmappo.agent_ids:
+        opt_actor = _get_attr_chain(
+            rmappo,
+            f"policies.{aid}.actor_optimizer",
+            f"trainers.{aid}.actor_optimizer",
+            f"trainers.{aid}.optimizer_actor",
+            f"trainers.{aid}.optimizer",  # fallback
+        )
+        opt_critic = _get_attr_chain(
+            rmappo,
+            f"policies.{aid}.critic_optimizer",
+            f"trainers.{aid}.critic_optimizer",
+            f"trainers.{aid}.optimizer_critic",
+            f"trainers.{aid}.optimizer",  # fallback
+        )
+        
+        if opt_actor is not None:
+            optim_state[f"{aid}_actor"] = opt_actor.state_dict()
+        if opt_critic is not None:
+            optim_state[f"{aid}_critic"] = opt_critic.state_dict()
     
-    torch.save(final_checkpoint, final_path)
-    print(f"[CHECKPOINT] Final networks saved: {final_path}")
+    checkpoint["optim_state"] = optim_state
+    # ===========================================================================
+    
+    # RNG states: ensure reproducibility
+    checkpoint["rng_state"] = {
+        "py": random.getstate(),
+        "np": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    
+    return checkpoint
+
+
+def save_milestone_checkpoint(ckpt_dir: str, rmappo, runner, score: float, milestone: int) -> str:
+    """
+    Save milestone checkpoint and append to index file.
+    
+    Each milestone gets its own file with naming:
+        ckpt_milestone_{milestone:06d}_score_{score:.6f}.pth
+    
+    Index file (milestones_index.txt) is appended with:
+        timestamp    milestone=X    score=Y.YYY    path=filename.pth
+    
+    Returns:
+        Path to saved checkpoint file
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    fname = f"ckpt_milestone_{milestone:06d}_score_{score:.6f}.pth"
+    fpath = os.path.join(ckpt_dir, fname)
+    
+    # Build checkpoint
+    ckpt = build_flat_dual_checkpoint(rmappo, runner, score, milestone)
+    
+    # Atomic write: .tmp -> replace
+    tmp_path = fpath + ".tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, fpath)
+    
+    # Append to index file
+    index_path = os.path.join(ckpt_dir, "milestones_index.txt")
+    with open(index_path, "a", encoding="utf-8") as f:
+        timestamp = datetime.now().isoformat()
+        f.write(f"{timestamp}\tmilestone={milestone}\tscore={score:.6f}\tpath={fname}\n")
+    
+    print(f"[CKPT] Saved milestone {milestone} (score={score:.4f}) -> {fname}")
+    
+    return fpath
+
+
+def resume_from_checkpoint(path: str, rmappo, runner, device=None) -> None:
+    """
+    Resume training from checkpoint with full state restoration.
+    
+    Restores:
+    - Network weights (4 networks)
+    - Optimizer states (4 optimizers, multi-path compatible)
+    - RNG states (Python/NumPy/PyTorch/CUDA)
+    - Counters (steps/episodes/updates)
+    """
+    print(f"[RESUME] Loading checkpoint: {path}")
+    
+    # FIXED: PyTorch 2.6+ requires weights_only=False for non-weight data (RNG states, etc.)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    
+    # 1) Load network weights
+    for aid in rmappo.agent_ids:
+        rmappo.policies[aid].actor.load_state_dict(ckpt[f"{aid}_actor"])
+        rmappo.policies[aid].critic.load_state_dict(ckpt[f"{aid}_critic"])
+        print(f"[RESUME] Loaded {aid} actor/critic weights")
+    
+    # 2) Move to target device
+    if device is not None:
+        for aid in rmappo.agent_ids:
+            rmappo.policies[aid].actor.to(device)
+            rmappo.policies[aid].critic.to(device)
+    
+    # 3) Load optimizer states (multi-path compatible)
+    if "optim_state" in ckpt:
+        for aid in rmappo.agent_ids:
+            # ============ OPTIMIZED: Multi-path optimizer restoration ============
+            opt_actor = _get_attr_chain(
+                rmappo,
+                f"policies.{aid}.actor_optimizer",
+                f"trainers.{aid}.actor_optimizer",
+                f"trainers.{aid}.optimizer_actor",
+                f"trainers.{aid}.optimizer",
+            )
+            opt_critic = _get_attr_chain(
+                rmappo,
+                f"policies.{aid}.critic_optimizer",
+                f"trainers.{aid}.critic_optimizer",
+                f"trainers.{aid}.optimizer_critic",
+                f"trainers.{aid}.optimizer",
+            )
+            
+            if opt_actor is not None and f"{aid}_actor" in ckpt["optim_state"]:
+                opt_actor.load_state_dict(ckpt["optim_state"][f"{aid}_actor"])
+            if opt_critic is not None and f"{aid}_critic" in ckpt["optim_state"]:
+                opt_critic.load_state_dict(ckpt["optim_state"][f"{aid}_critic"])
+            # ======================================================================
+        print(f"[RESUME] Loaded optimizer states")
+    
+    # 4) Restore counters (critical for LR schedule and evaluation)
+    runner.global_step = int(ckpt.get("global_steps_total", runner.global_step))
+    rmappo.train_updates = int(ckpt.get("training_rounds_total", rmappo.train_updates))
+    runner.global_episodes = int(ckpt.get("episodes_done_total", runner.global_episodes))
+    
+    # Also update trainer counters for LR decay
+    for aid in rmappo.agent_ids:
+        rmappo.trainers[aid].global_update_step = rmappo.train_updates
+    
+    print(f"[RESUME] Restored counters:")
+    print(f"  global_step: {runner.global_step}")
+    print(f"  train_updates: {rmappo.train_updates}")
+    print(f"  global_episodes: {runner.global_episodes}")
+    
+    # 5) Restore RNG states
+    if "rng_state" in ckpt:
+        random.setstate(ckpt["rng_state"]["py"])
+        np.random.set_state(ckpt["rng_state"]["np"])
+        torch.set_rng_state(ckpt["rng_state"]["torch"])
+        
+        if torch.cuda.is_available() and ckpt["rng_state"]["cuda"] is not None:
+            torch.cuda.set_rng_state_all(ckpt["rng_state"]["cuda"])
+        
+        print(f"[RESUME] Restored RNG states")
+    
+    # 6) Optional: restore milestone tracking
+    if "milestone" in ckpt:
+        runner.max_milestone_triggered = int(ckpt["milestone"])
+        print(f"[RESUME] Last milestone: {runner.max_milestone_triggered}")
+    
+    print(f"[RESUME] Checkpoint restoration complete\n")
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
-    """Create argument parser."""
+    """Create argument parser with unified checkpoint interface."""
     if config_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, '../../src/surgical_project/envs/multi_agent/agents/training_params_rmappo.yaml')
 
     parser = argparse.ArgumentParser(description="Dual rMAPPO training")
-    parser.add_argument("--config", type=str, default=config_path)
-    parser.add_argument("--num_envs", type=int, default=512)
-    parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_global_steps", type=int, default=0)
-    parser.add_argument("--top_k_models", type=int, default=10)
-    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--config", type=str, default=config_path,
+                       help="Path to training configuration YAML")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Path to checkpoint (.pth) for resume training or play")
+    parser.add_argument("--num_envs", type=int, default=512,
+                       help="Number of parallel environments")
+    parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0",
+                       help="Environment task name")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed for reproducibility")
+    parser.add_argument("--max_global_steps", type=int, default=0,
+                       help="Maximum global steps (0=use config value)")
+    parser.add_argument("--top_k_models", type=int, default=10,
+                       help="Number of top models to keep (deprecated)")
+    parser.add_argument("--wandb", action="store_true", default=False,
+                       help="Enable WandB logging")
     
     return parser

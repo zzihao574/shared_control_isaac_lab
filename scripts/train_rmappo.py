@@ -2,7 +2,8 @@
 
 """
 rMAPPO training script with dual independent networks.
-Features global reproducibility, unified WandB through helpers, direct reset after eval.
+Features global reproducibility, unified WandB through helpers, mid-rollout evaluation support.
+MODIFIED: Evaluation now handled within runner for mid-rollout trigger support.
 """
 
 import sys
@@ -27,7 +28,7 @@ from isaaclab.app import AppLauncher
 from utils.training_helpers_rmappo import (
     WandBLogger, TrainingConfiguration, create_argument_parser, 
     MetricsHub, TopKModelManager, RMAPPOTrainingRunner, RMAPPOMilestoneEvaluator, 
-    save_final_rmappo_networks
+    save_milestone_checkpoint, resume_from_checkpoint
 )
 
 
@@ -342,11 +343,11 @@ class DualRMAPPOWrapper:
         values = {}
         
         if deterministic is None:
-            deterministic = self._is_eval_mode or not add_noise #优化？
+            deterministic = self._is_eval_mode or not add_noise
         
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
-            masks = torch.ones(obs.shape[0], 1, device=self.device) #？
+            masks = torch.ones(obs.shape[0], 1, device=self.device)
             
             with torch.no_grad():
                 v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
@@ -482,7 +483,7 @@ class DualRMAPPOWrapper:
 
 
 class TrainingOrchestrator:
-    """Main rMAPPO trainer with dual network infrastructure."""
+    """Main rMAPPO trainer with dual network infrastructure and mid-rollout evaluation support."""
     
     def __init__(self, args):
         self.args = args
@@ -492,7 +493,6 @@ class TrainingOrchestrator:
         self._setup_environment()
         self._setup_training_components()
         self._setup_runners_and_evaluators()
-        self._setup_milestone_management()
         
         print(f"[ORCHESTRATOR] Initialization complete")
 
@@ -536,79 +536,69 @@ class TrainingOrchestrator:
             self.max_global_steps = self.args.max_global_steps
         else:
             self.max_global_steps = mappo_max_steps
-        
-        self.milestone_episodes = self.config.params.get('training_monitor', {}).get('milestone_episodes', [])
 
     def _setup_runners_and_evaluators(self):
-        """Initialize training runner and evaluator."""
+        """Initialize training runner and evaluator with cross-references."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = f"logs/rmappo_dual/{timestamp}"
         os.makedirs(self.log_dir, exist_ok=True)
         
+        # Create checkpoints directory
+        self.ckpt_dir = os.path.join(self.log_dir, "checkpoints")
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        
+        # ============ MODIFIED: Create runner first ============
         self.runner = RMAPPOTrainingRunner(
             env=self.env,
             rmappo_wrapper=self.rmappo,
             metrics_hub=self.metrics_hub,
             agent_ids=self.rmappo.agent_ids,
-            max_global_steps=self.max_global_steps
+            max_global_steps=self.max_global_steps,
+            evaluator=None  # Will be set after evaluator creation
         )
         
+        # Create evaluator with runner reference
         self.evaluator = RMAPPOMilestoneEvaluator(
             env=self.env,
             rmappo_wrapper=self.rmappo,
             topk_mgr=self.top_k_manager,
             metrics_hub=self.metrics_hub,
             log_dir=self.log_dir,
-            agent_ids=self.rmappo.agent_ids
+            agent_ids=self.rmappo.agent_ids,
+            runner=self.runner  # NEW: Pass runner for checkpoint saving
         )
-
-    def _setup_milestone_management(self):
-        """Initialize milestone tracking."""
-        self.max_milestone_triggered = 0
+        
+        # Set evaluator reference in runner
+        self.runner.evaluator = self.evaluator
+        # =======================================================
+        
+        # ============ NEW: Resume from checkpoint if provided ============
+        if self.args.checkpoint:
+            resume_from_checkpoint(
+                self.args.checkpoint, 
+                self.rmappo, 
+                self.runner, 
+                device=self.config.get_compute_device()
+            )
+            print(f"[SETUP] Resumed from checkpoint: {self.args.checkpoint}")
+        # ==================================================================
 
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode."""
         self.runner.set_eval_mode(is_eval)
         self.rmappo.set_eval_mode(is_eval)
 
-    def evaluate_milestone_if_due(self):
-        """Check and trigger milestone evaluation."""
-        if not self.milestone_episodes:
-            return
-            
-        candidate = 0
-        for milestone in sorted(self.milestone_episodes):
-            if self.runner.global_episodes >= milestone:
-                candidate = milestone
-            else:
-                break
-                
-        if candidate > self.max_milestone_triggered:
-            print(f"[MILESTONE] Crossed threshold: episodes {self.runner.global_episodes} >= milestone {candidate}")
-            
-            self.set_eval_mode(True)
-            result = self.evaluator.run_evaluation(candidate, self.runner.global_step)
-            if result.get("skip_episode_once", False):
-                self.runner.mark_skip_episode_once()
-            
-            self.set_eval_mode(False)
-            self.metrics_hub.push_scalars({"lifecycle/eval_to_train": 1}, step=self.runner.global_step)
-            
-            obs_dict, _ = self.env.reset()
-            self.runner._current_obs = obs_dict
-            
-            self.max_milestone_triggered = candidate
-
     def train(self):
-        """Main training loop."""
-        print(f"[TRAIN] Starting dual rMAPPO training")
+        """Main training loop - simplified as evaluation is now handled in runner."""
+        print(f"[TRAIN] Starting dual rMAPPO training with mid-rollout evaluation support")
         
         obs_dict, _ = self.env.reset()
         self.runner._current_obs = obs_dict
         
         while self.runner.global_step < self.max_global_steps:
+            # ============ SIMPLIFIED: Runner handles evaluation internally ============
             self.runner.execute_training_step()
-            self.evaluate_milestone_if_due()
+            # ==========================================================================
             
             if self.runner.global_step > 0 and self.runner.global_step % 2000 == 0:
                 print(f"[Step {self.runner.global_step}] Episodes: {self.runner.global_episodes}")
@@ -617,14 +607,12 @@ class TrainingOrchestrator:
                 break
         
         print(f"\n[TRAINING COMPLETE]")
-        
-        save_final_rmappo_networks(
-            log_directory=self.log_dir,
-            rmappo_wrapper=self.rmappo,
-            global_step=self.runner.global_step,
-            global_episodes=self.runner.global_episodes,
-            max_milestone_triggered=self.max_milestone_triggered
-        )
+        print(f"  Final steps: {self.runner.global_step}")
+        print(f"  Final episodes: {self.runner.global_episodes}")
+        print(f"  Training updates: {self.rmappo.train_updates}")
+        print(f"  Last milestone: {self.runner.max_milestone_triggered}")
+        print(f"\n[INFO] All checkpoints saved to: {self.ckpt_dir}")
+        print(f"[INFO] Check milestones_index.txt for saved checkpoints list")
         
         if hasattr(self, 'env'):
             self.env.close()
@@ -635,7 +623,7 @@ class TrainingOrchestrator:
 def main():
     """Main entry point."""
     print("="*80)
-    print("Dual rMAPPO Training")
+    print("Dual rMAPPO Training with Mid-Rollout Evaluation")
     print("="*80)
     
     parser = create_argument_parser()

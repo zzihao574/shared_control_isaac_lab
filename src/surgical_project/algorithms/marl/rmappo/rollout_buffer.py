@@ -1,7 +1,7 @@
 """
 On-policy rollout buffer with RNN support for rMAPPO.
 Complete implementation with GAE term_masks support for time-limit bootstrap.
-MODIFIED: Removed structural config assertions, fixed mb_size with ceil, supports external RNG.
+MODIFIED: Added override_bootstrap mechanism for mid-rollout evaluation.
 """
 
 import torch
@@ -12,7 +12,7 @@ class SharedRolloutBuffer:
     """
     On-policy rollout buffer with RNN support.
     Shapes use (T, N, ...), where N = num_envs * num_agents.
-    MODIFIED: Removed config assertions (moved to startup), fixed mb_size calculation.
+    MODIFIED: Added override_bootstrap_values and override_bootstrap_mask for mid-rollout eval.
     """
     def __init__(self, T, N, obs_dim, share_obs_dim, act_dim, rnn_hidden_dim, device):
         self.T, self.N = T, N
@@ -35,6 +35,14 @@ class SharedRolloutBuffer:
         # After GAE
         self.returns = torch.zeros(T, N, 1, device=device)
         self.advantages = torch.zeros(T, N, 1, device=device)
+        
+        # ============ NEW: Override bootstrap mechanism for mid-rollout evaluation ============
+        # When evaluation triggers at step t, we need to use V(s_{t+1}) BEFORE reset
+        # instead of the default value_preds[t+1] which would be from the new episode
+        self.override_bootstrap_values = torch.zeros(T, N, 1, device=device)
+        self.override_bootstrap_mask = torch.zeros(T, N, 1, dtype=torch.bool, device=device)
+        # =====================================================================================
+        
         self.step = 0
 
     def insert(self, t, *, obs, share_obs, actions, action_log_probs,
@@ -64,7 +72,7 @@ class SharedRolloutBuffer:
 
     @torch.no_grad()
     def compute_returns_and_adv(self, last_values, gamma, gae_lambda):
-        """Compute returns and advantages using GAE."""
+        """Compute returns and advantages using GAE with override bootstrap support."""
         T, N = self.T, self.N
         assert self.step == T, "buffer not full when computing returns"
         
@@ -81,8 +89,17 @@ class SharedRolloutBuffer:
             mask = self.masks[t]  # 0 at episode boundary, 1 otherwise
             term_mask = self.term_masks[t]  # 0 for terminal, 1 for time-limit
             
+            # ============ MODIFIED: Override bootstrap mechanism ============
+            # If override_bootstrap_mask[t] is True, use override_bootstrap_values[t]
+            # Otherwise, use last_values (which is either value_preds[t+1] or final last_values)
+            bootstrap_value = torch.where(
+                self.override_bootstrap_mask[t],
+                self.override_bootstrap_values[t],
+                last_values
+            )
             # Time-limit bootstrap correction
-            next_v_bootstrap = term_mask * last_values
+            next_v_bootstrap = term_mask * bootstrap_value
+            # =================================================================
             
             # GAE delta with corrected bootstrap
             delta = self.rewards[t] + gamma * next_v_bootstrap - self.value_preds[t]
@@ -120,7 +137,6 @@ class SharedRolloutBuffer:
     def recurrent_generator(self, num_mini_batch, data_chunk_length, generator=None):
         """
         Yield mini-batches with external generator support for reproducibility.
-        MODIFIED: Removed config assertions (T % L, mini_batch bounds), fixed mb_size with ceil.
         
         Args:
             num_mini_batch: Number of mini-batches to create
@@ -130,8 +146,7 @@ class SharedRolloutBuffer:
         T, N = self.T, self.N
         L = data_chunk_length
         
-        # Config assertions removed - these are checked at startup in train_rmappo.py
-        chunks_per_slot = T // L  # Startup guarantees T % L == 0
+        chunks_per_slot = T // L
         total_chunks = N * chunks_per_slot
         
         # Fixed: Use ceil to avoid dropping tail data
@@ -147,7 +162,6 @@ class SharedRolloutBuffer:
             start = mb * mb_size
             end = min((mb + 1) * mb_size, total_chunks)
             
-            # Runtime data validity assertions (kept)
             assert end > start, f"Empty slice detected: start={start}, end={end}"
             idx = perm[start:end]
             assert idx.numel() > 0, "Empty index tensor"
@@ -202,3 +216,8 @@ class SharedRolloutBuffer:
     def after_update(self):
         """Reset buffer after training update."""
         self.step = 0
+        
+        # ============ NEW: Clear override bootstrap fields ============
+        self.override_bootstrap_values.zero_()
+        self.override_bootstrap_mask.zero_()
+        # ==============================================================
