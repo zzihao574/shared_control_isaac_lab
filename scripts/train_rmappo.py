@@ -4,6 +4,7 @@
 rMAPPO training script with dual independent networks.
 Features global reproducibility, unified WandB through helpers, mid-rollout evaluation support.
 MODIFIED: Evaluation now handled within runner for mid-rollout trigger support.
+FIXED: Simplified action selection interface, removed TopKManager, optimized config loading.
 """
 
 import sys
@@ -27,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 from isaaclab.app import AppLauncher
 from utils.training_helpers_rmappo import (
     WandBLogger, TrainingConfiguration, create_argument_parser, 
-    MetricsHub, TopKModelManager, RMAPPOTrainingRunner, RMAPPOMilestoneEvaluator, 
+    MetricsHub, RMAPPOTrainingRunner, RMAPPOMilestoneEvaluator, 
     save_milestone_checkpoint, resume_from_checkpoint
 )
 
@@ -66,37 +67,6 @@ def setup_environment(args, config):
     return env, env_cfg
 
 
-def _select_mappo_block(cfg: dict) -> dict:
-    """Select and validate mappo configuration block."""
-    has_mappo = "mappo" in cfg and isinstance(cfg["mappo"], dict)
-    has_ppo = "ppo" in cfg and isinstance(cfg["ppo"], dict)
-    has_algo = "algo" in cfg and isinstance(cfg["algo"], dict)
-    has_agents = "agents" in cfg and isinstance(cfg["agents"], dict)
-    has_networks = "networks" in cfg and isinstance(cfg["networks"], dict)
-
-    conflicting_blocks = []
-    if has_ppo:
-        conflicting_blocks.append("ppo")
-    if has_algo:
-        conflicting_blocks.append("algo")
-    if has_agents:
-        conflicting_blocks.append("agents")
-    if has_networks:
-        conflicting_blocks.append("networks")
-    
-    if has_mappo and conflicting_blocks:
-        raise ValueError(f"[CONFIG ERROR] Found 'mappo' together with {conflicting_blocks}. Keep ONLY 'mappo:'")
-    
-    if not has_mappo:
-        available_blocks = [k for k in ["ppo", "algo", "agents", "networks"] if k in cfg]
-        if available_blocks:
-            raise ValueError(f"[CONFIG ERROR] Found deprecated blocks {available_blocks} but missing 'mappo:'")
-        else:
-            raise ValueError("[CONFIG ERROR] Missing 'mappo:' block")
-
-    return cfg["mappo"]
-
-
 def _validate_mappo_args(args: dict, agent_id: str):
     """Validate required mappo arguments."""
     required = ["hidden_size", "recurrent_N", "actor_lr", "critic_lr",
@@ -115,18 +85,21 @@ def _validate_mappo_args(args: dict, agent_id: str):
         raise ValueError(f"[CONFIG ERROR] hidden_size must be > 0")
 
 
-def load_dual_network_config(config_path: str):
-    """Load YAML config with unified mappo block validation."""
-    with open(config_path, 'r') as f:
-        cfg = yaml.safe_load(f)
-
-    # Support both old and new structures
-    if "algorithms" in cfg and "rmappo" in cfg["algorithms"]:
-        common = cfg["algorithms"]["rmappo"]
-    elif "mappo" in cfg:
-        common = cfg["mappo"]
-    else:
-        common = _select_mappo_block(cfg)
+def build_dual_network_config_from_params(params: dict):
+    """
+    Build dual network configuration from already-loaded params dictionary.
+    Avoids redundant YAML file reading.
+    
+    Args:
+        params: Already-loaded configuration dictionary from TrainingConfiguration
+        
+    Returns:
+        Dictionary with human/robot/common configurations
+    """
+    try:
+        common = params["algorithms"]["rmappo"]
+    except Exception:
+        raise ValueError("[CONFIG ERROR] Missing 'algorithms.rmappo' in loaded params")
     
     _validate_mappo_args(common, "mappo")
     
@@ -134,13 +107,12 @@ def load_dual_network_config(config_path: str):
     human_config = copy.deepcopy(common)
     robot_config = copy.deepcopy(common)
     
-    print(f"[CONFIG] Successfully loaded unified mappo configuration")
+    print(f"[CONFIG] Successfully built dual network configuration from params")
     
     return {
         "human": human_config,
         "robot": robot_config,
-        "common": common,
-        "raw_config": cfg
+        "common": common
     }
 
 
@@ -167,8 +139,10 @@ def initialize_rmappo_algorithm(env, config, args, metrics_hub):
     print(f"  Environments: {num_envs}")
     print(f"  Obs dim: {obs_dim}, Share obs dim: {share_obs_dim}, Action dim: {act_dim}")
 
-    dual_config = load_dual_network_config(args.config)
+    # ============ FIXED: Use params-based config builder ============
+    dual_config = build_dual_network_config_from_params(config.params)
     config.params['mappo_args'] = dual_config['common']
+    # ================================================================
     
     rollout_horizon = config.params.get('rollout_horizon', 256)
     data_chunk_length = dual_config['common'].get('data_chunk_length', 16)
@@ -333,17 +307,32 @@ class DualRMAPPOWrapper:
             
         return env_actions
 
-    def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, deterministic: bool = None, noise_scale: float = 1.0):
-        """Generate actions from both networks."""
+    def select_actions(self, observations: Dict[str, torch.Tensor], deterministic: bool):
+        """
+        Generate actions from both networks.
+        
+        FIXED: Simplified interface - only deterministic parameter.
+        - deterministic=False: Sample from policy (training/exploration)
+        - deterministic=True: Use mean action (evaluation/greedy)
+        
+        Args:
+            observations: Dictionary of observations per agent
+            deterministic: Whether to use deterministic (mean) actions
+            
+        Returns:
+            env_actions: Dictionary of actions scaled to environment force limits
+            detail: Dictionary with action details for logging
+                - applied_forces: Actual forces applied
+                - mean_actions: Policy mean actions
+                - noise_actions: Always zero (kept for environment compatibility)
+                - deterministic: Whether deterministic mode was used
+        """
         obs_scaled = self.build_obs_scaled(observations)
         self._clear_obs_cache()
         
         actions_norm = {}
         action_log_probs = {}
         values = {}
-        
-        if deterministic is None:
-            deterministic = self._is_eval_mode or not add_noise
         
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
@@ -369,7 +358,8 @@ class DualRMAPPOWrapper:
         if not self._is_eval_mode:
             self._store_rollout_data(obs_scaled, actions_norm, action_log_probs, values)
         
-        # Ensure both applied_forces and mean_actions always exist
+        # Build detail dictionary for environment
+        # Note: noise_actions kept for environment compatibility (always zero now)
         detail = {
             "applied_forces": {k: v.detach().clone() for k, v in env_actions.items()},
             "mean_actions": {k: v.detach().clone() for k, v in env_actions.items()},
@@ -529,7 +519,6 @@ class TrainingOrchestrator:
         self.wandb_logger.attach_metrics_hub(self.metrics_hub)
         
         self.rmappo = initialize_rmappo_algorithm(self.env, self.config, self.args, self.metrics_hub)
-        self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
         mappo_max_steps = int(self.config.params.get('mappo_args', {}).get('max_global_steps', 200000))
         if self.args.max_global_steps > 0:
@@ -557,20 +546,19 @@ class TrainingOrchestrator:
             evaluator=None  # Will be set after evaluator creation
         )
         
-        # Create evaluator with runner reference
+        # ============ FIXED: Remove topk_mgr parameter ============
         self.evaluator = RMAPPOMilestoneEvaluator(
             env=self.env,
             rmappo_wrapper=self.rmappo,
-            topk_mgr=self.top_k_manager,
             metrics_hub=self.metrics_hub,
             log_dir=self.log_dir,
             agent_ids=self.rmappo.agent_ids,
-            runner=self.runner  # NEW: Pass runner for checkpoint saving
+            runner=self.runner  # Pass runner for checkpoint saving
         )
+        # ==========================================================
         
         # Set evaluator reference in runner
         self.runner.evaluator = self.evaluator
-        # =======================================================
         
         # ============ NEW: Resume from checkpoint if provided ============
         if self.args.checkpoint:

@@ -64,7 +64,7 @@ class CompleteConstraintChecker:
         for env_id in range(num_envs):
             # Convert to world coordinates for physics query (required by Isaac Sim)
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
-            constraint_path = f"/World/envs/env_{env_id}/Constraint/Torus"
+            constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
@@ -195,7 +195,6 @@ class TrajectoryManager:
         """Calculate progress along trajectory (0 to 1)."""
         vec_to_current = current_pos_local - self.start_pos_local.unsqueeze(0)
         progress_distance = torch.sum(vec_to_current * self.line_direction.unsqueeze(0), dim=-1)
-        progress_distance = torch.clamp(progress_distance, 0, self.total_distance)
         return progress_distance / self.total_distance
     
     def get_deviation(self, current_pos_local: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

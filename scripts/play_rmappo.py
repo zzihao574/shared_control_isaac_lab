@@ -4,6 +4,7 @@
 play_rmappo.py - Evaluation script for trained rMAPPO dual networks
 Compatible with unified --checkpoint interface for milestone checkpoints
 Features StepTracer integration for detailed console debugging
+FIXED: Simplified action selection interface (only deterministic parameter)
 """
 
 import os
@@ -197,12 +198,13 @@ def main():
 
     with torch.no_grad():
         while simulation_app.is_running() and (max_steps <= 0 or steps < max_steps):
-            # Select deterministic actions
+            # ============ FIXED: Simplified action selection ============
+            # Only pass deterministic parameter
             actions, detail = rmappo.select_actions(
                 obs,
-                add_noise=False,
                 deterministic=True
             )
+            # ============================================================
 
             # Set detail info for StepTracer
             if hasattr(actual_env, 'set_detail_actor_info'):

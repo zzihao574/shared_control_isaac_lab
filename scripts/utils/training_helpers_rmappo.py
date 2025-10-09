@@ -5,6 +5,7 @@ Training helper utilities for dual-network rMAPPO multi-environment parallel tra
 Features unified training execution, milestone evaluation, and optimized WandB logging.
 MODIFIED: Added mid-rollout evaluation trigger with override bootstrap mechanism.
 OPTIMIZED: Removed TopK redundancy, fixed evaluation bugs, optimizer path compatibility.
+FIXED: Evaluation returns with env.reset(), simplified action selection interface.
 """
 
 import argparse
@@ -217,6 +218,7 @@ class RMAPPOTrainingRunner:
         """
         Execute one complete rollout and training update for both networks.
         MODIFIED: Added mid-rollout evaluation trigger.
+        FIXED: Evaluation returns with env.reset() instead of reusing stale next_obs.
         """
         current_obs = self._current_obs
         if current_obs is None:
@@ -248,11 +250,12 @@ class RMAPPOTrainingRunner:
                 for aid in self.agent_ids:
                     self.rmappo.trainers[aid].global_step = self.global_step
             
+            # ============ FIXED: Simplified action selection interface ============
             actions, detail = self.rmappo.select_actions(
                 current_obs, 
-                add_noise=(not self.is_eval_mode),
                 deterministic=self.is_eval_mode
             )
+            # =======================================================================
 
             self.env.unwrapped.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
@@ -324,12 +327,14 @@ class RMAPPOTrainingRunner:
                         # Update max milestone
                         self.max_milestone_triggered = crossed_milestone
                         
-                        # Mark to skip episode counting once after eval
-                        if eval_result.get("skip_episode_once", False):
-                            self._skip_episode_once = True
+                        # ============ FIXED: Reset environment after evaluation ============
+                        # Use reset observation (t1) instead of stale next_obs (t1')
+                        obs_reset, _ = self.env.reset()
+                        current_obs = obs_reset
+                        self._skip_episode_once = True  # Evaluation后的第一步不计入上一段
+                        # ==================================================================
                     
                     # Continue to next rollout step after evaluation
-                    current_obs = next_obs
                     continue
             # =============================================================
             
@@ -379,7 +384,7 @@ class RMAPPOTrainingRunner:
 
             self._push_current_rollout_force_statistics(detail)
             
-            if self.train_updates % 10 == 0:
+            if self.train_updates % 50 == 0:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         else:
@@ -431,16 +436,29 @@ class RMAPPOTrainingRunner:
 
 
 class RMAPPOMilestoneEvaluator:
-    """Milestone evaluator for dual-network rMAPPO with checkpoint saving."""
+    """
+    Milestone evaluator for dual-network rMAPPO with checkpoint saving.
+    MODIFIED: Removed topk_mgr parameter (TopKManager deleted).
+    """
     
-    def __init__(self, env, rmappo_wrapper, topk_mgr, metrics_hub, log_dir, agent_ids, runner=None):
+    def __init__(self, env, rmappo_wrapper, metrics_hub, log_dir, agent_ids, runner=None):
+        """
+        Initialize milestone evaluator.
+        
+        Args:
+            env: Environment instance
+            rmappo_wrapper: RMAPPO wrapper
+            metrics_hub: Metrics hub for logging
+            log_dir: Log directory
+            agent_ids: List of agent IDs
+            runner: Training runner reference (for checkpoint saving)
+        """
         self.env = env
         self.rmappo = rmappo_wrapper
-        self.topk = topk_mgr
         self.metrics = metrics_hub
         self.log_dir = log_dir
         self.agent_ids = agent_ids
-        self.runner = runner  # NEW: runner reference for checkpoint saving
+        self.runner = runner
 
     def run_evaluation(self, milestone: int, global_step: int) -> dict:
         """
@@ -548,9 +566,11 @@ class RMAPPOMilestoneEvaluator:
                 else:
                     current_obs = obs
                 
+                # ============ FIXED: Simplified action selection ============
                 actions_dict, detail_info = self.rmappo.select_actions(
-                    current_obs, add_noise=False, deterministic=True
+                    current_obs, deterministic=True
                 )
+                # ============================================================
                 
                 for aid, act in actions_dict.items():
                     if act.ndim == 2:
@@ -558,10 +578,12 @@ class RMAPPOMilestoneEvaluator:
                         masked_actions[active_env] = act[active_env]
                         actions_dict[aid] = masked_actions
                 
+                # Build detail info for environment (with noise_actions for compatibility)
                 detail_info = {
                     "applied_forces": {aid: actions_dict[aid].clone() for aid in self.agent_ids},
                     "mean_actions": {aid: actions_dict[aid].clone() for aid in self.agent_ids},
-                    "noise_actions": {aid: torch.zeros_like(actions_dict[aid]) for aid in self.agent_ids}
+                    "noise_actions": {aid: torch.zeros_like(actions_dict[aid]) for aid in self.agent_ids},
+                    "deterministic": True
                 }
                 env.set_detail_actor_info(detail_info)
                 
@@ -680,7 +702,6 @@ class WandBLogger:
         "eval/return_mean": "milestone/actor_return",  # Milestone scores via this mapping
         "milestone/latest_completed": "milestone/latest_completed",
         "eval/num_episodes": "eval/num_episodes",
-        # REMOVED: "milestone/topk_best_score" - redundant with eval/return_mean
         "forces/robot_fx_mean": "forces/robot_fx_mean",
         "forces/robot_fy_mean": "forces/robot_fy_mean",
         "forces/robot_fz_mean": "forces/robot_fz_mean",
@@ -765,8 +786,6 @@ class WandBLogger:
             # Log milestone score via eval/return_mean (maps to milestone/actor_return)
             if "eval/return_mean" in ms:
                 payload_to_log["eval/return_mean"] = ms["eval/return_mean"]
-            
-            # REMOVED: milestone/topk_best_score - redundant with eval/return_mean
             
             # Log milestone completion
             if "milestone" in ms:
@@ -876,52 +895,6 @@ class TrainingConfiguration:
     def get_compute_device(self) -> str:
         """Get compute device."""
         return 'cuda' if torch.cuda.is_available() else 'cpu'
-
-
-class TopKModelManager:
-    """Manages top-K model collection."""
-    
-    def __init__(self, k: int = 10, mode: str = "max"):
-        self.k = k
-        self.mode = mode
-        self.top_models: List[Tuple[float, Dict, int]] = []
-    
-    def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
-        """Update top-K models."""
-        if len(self.top_models) < self.k:
-            self.top_models.append((performance, model_state, milestone))
-        elif performance > self.top_models[-1][0]:
-            self.top_models[-1] = (performance, model_state, milestone)
-        self.top_models.sort(key=lambda x: x[0], reverse=True)
-    
-    def get_top_models(self) -> List[Tuple[float, Dict, int]]:
-        """Get list of top-K models."""
-        return self.top_models
-    
-    def save_checkpoint(self, filepath: str, agent_ids: List[str]) -> None:
-        """Save checkpoint with top-K models."""
-        checkpoint = {
-            'agent_ids': agent_ids,
-            'algorithm': 'rmappo_dual',
-            'top_k_count': len(self.top_models),
-            'top_k_models': []
-        }
-        
-        for i, (performance, model_state, milestone) in enumerate(self.top_models):
-            model_info = {
-                'rank': i + 1,
-                'performance': performance,
-                'milestone': milestone
-            }
-            checkpoint['top_k_models'].append(model_info)
-            
-            for key, value in model_state.items():
-                checkpoint[f'rank_{i+1}_{key}'] = value
-        
-        torch.save(checkpoint, filepath)
-        if self.top_models:
-            scores = [m[0] for m in self.top_models]
-            print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: {scores[0]:.2f} ~ {scores[-1]:.2f}")
 
 
 def build_flat_dual_checkpoint(rmappo, runner, score: float, milestone: int) -> Dict[str, Any]:

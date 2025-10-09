@@ -90,7 +90,7 @@ initial_conditions:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true       # Enable detailed console logging for debugging
+  enable_console_logging: false      # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)
@@ -132,16 +132,16 @@ reward_parameters:
     zoneC_overlap_robot: 1.0
 
     zoneD_weight_robot: 0.6
-    zoneD_progress_robot: 1.0
+    zoneD_progress_robot: 0.8
     zoneD_deviation_robot: 2.0
     zoneD_inward_robot: 1.0
 
     zpenalty_robot: 0.0
     completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.19
-    forceeff_robot: 0.26
-    humanaware_robot: 0.26
+    potential_robot: 0.2
+    forceeff_robot: 0.27
+    humanaware_robot: 0.27
 
     # ===== HUMAN (Independent Network) =====  
     zoneA_weight_human: 0.6
@@ -159,16 +159,16 @@ reward_parameters:
     zoneC_overlap_human: 1.0 
 
     zoneD_weight_human: 0.6
-    zoneD_progress_human: 1.0
+    zoneD_progress_human: 0.8
     zoneD_deviation_human: 2.0
     zoneD_inward_human: 1.0
 
     zpenalty_human: 0.0
     completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.19
-    forceeff_human: 0.26
-    robotaware_human: 0.26
+    potential_human: 0.2
+    forceeff_human: 0.27
+    robotaware_human: 0.27
 
 # ==============================================================================
 # Termination Conditions
@@ -182,7 +182,6 @@ termination_conditions:
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
-  # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
   factors: [5.0, 16.7, 16.7, 16.7, 5.0]  # Position and velocity scaling
 
 # ==============================================================================

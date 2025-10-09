@@ -161,7 +161,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/torus.usd",
+            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/sphere.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,   # Kinematic object (doesn't respond to forces)
                 disable_gravity=True,     # No gravity effect

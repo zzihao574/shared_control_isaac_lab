@@ -258,23 +258,23 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return self._get_weight(f'zone{zone_letter}_{comp}_{agent}', 0.0)
 
     def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
-        """Calculate velocity-based progress reward with adaptive magnitude."""
         t = self.trajectory_manager.line_direction
         v = self.stylus_vel_t1
         v_along = (v * t.unsqueeze(0)).sum(dim=-1)
 
-        p = self.trajectory_manager.get_progress(self.stylus_pos_t1).clamp(0.0, 1.0)
+        p = self.trajectory_manager.get_progress(self.stylus_pos_t1)
 
-        MIN_REWARD = 0.1
-        MAX_REWARD = 0.2
-        EPS_V = 1e-4
-
+        MIN_REWARD, MAX_REWARD, EPS_V = 0.1, 0.2, 1e-4
         reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p
 
         pos = (v_along >  EPS_V).float()
         neg = (v_along < -EPS_V).float()
-        
-        return (pos - neg) * reward_magnitude
+        base = (pos - neg) * reward_magnitude
+
+        overrun = p > 1.0
+
+        return torch.where(overrun, -reward_magnitude, base)
+
         
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing with action validation and force application."""
@@ -383,7 +383,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         else:
             g = t.unsqueeze(0).expand_as(self.stylus_pos_t1)
         
-        c1, c2 = 0.90, 0.60
+        c1, c2 = 0.90, 0.866
         align_goal = (g * t.unsqueeze(0)).sum(dim=-1) >= c1
         oppose_norm = (self.normal_t1 * t.unsqueeze(0)).sum(dim=-1) <= -c2
         rejoin_geom = surface & align_goal & oppose_norm
