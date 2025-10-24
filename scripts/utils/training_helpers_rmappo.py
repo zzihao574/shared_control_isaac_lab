@@ -121,6 +121,7 @@ class RMAPPOTrainingRunner:
     def set_eval_mode(self, flag: bool):
         """Set evaluation mode flag."""
         self.is_eval_mode = bool(flag)
+        self.rmappo.set_eval_mode(bool(flag))
 
     def _check_milestone_crossed(self, future_episodes: int) -> Optional[int]:
         """Check if any milestone is crossed by future episode count."""

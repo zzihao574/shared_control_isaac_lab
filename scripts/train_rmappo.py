@@ -349,9 +349,8 @@ class DualRMAPPOWrapper:
             action_log_probs[aid] = lp
             values[aid] = v
             
-            if not self._is_eval_mode:
-                self.rnn_states[aid]["actor"] = rnn_a_new
-                self.rnn_states[aid]["critic"] = rnn_c_new
+            self.rnn_states[aid]["actor"] = rnn_a_new
+            self.rnn_states[aid]["critic"] = rnn_c_new
         
         env_actions = self.actions_to_env_format(actions_norm)
         

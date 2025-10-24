@@ -182,7 +182,7 @@ termination_conditions:
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
-  factors: [5.0, 16.7, 16.7, 16.7, 5.0]  # Position and velocity scaling
+  factors: [5.0, 16.7, 16.7, 16.7, 5.0, 1.0]  # Position and velocity scaling
 
 # ==============================================================================
 # Training Monitoring

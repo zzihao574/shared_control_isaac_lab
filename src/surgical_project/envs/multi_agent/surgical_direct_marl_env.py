@@ -360,11 +360,16 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         # ★ deviation 一维（Tuple 返回：deviations, closest_points）
         deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)  # [N]
         deviations = deviations.unsqueeze(-1)                                     # [N,1]
+        
+        progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+        progress_ratio = progress_ratio.unsqueeze(-1) 
 
-        # ★ 新观测 = [ deviation(1) , vel(3) , dist(1) ] → 5D
-        obs_5d = torch.cat([deviations, self.stylus_vel_t1, constraint_distances], dim=-1)  # [N,5]
+        obs_6d = torch.cat([deviations,
+                            self.stylus_vel_t1,
+                            constraint_distances,
+                            progress_ratio], dim=-1)  # [N,6]
 
-        observations = {agent: obs_5d for agent in self.cfg.possible_agents}
+        observations = {agent: obs_6d for agent in self.cfg.possible_agents}
         return observations
 
     def _build_zone_masks(self):
