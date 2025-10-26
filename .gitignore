@@ -12,11 +12,14 @@
 !/scripts/train_surgical.py
 !/scripts/train_maddpg.py
 !/scripts/train_rmappo.py
+!/scripts/train_epigraph.py
 !/scripts/play_rmappo.py
+!/scripts/play_epigraph.py
 !/scripts/utils/
 /scripts/utils/*
 !/scripts/utils/training_helpers_maddpg.py
 !/scripts/utils/training_helpers_rmappo.py
+!/scripts/utils/training_helpers_epigraph.py
 !/src/
 
 # 忽略缓存
