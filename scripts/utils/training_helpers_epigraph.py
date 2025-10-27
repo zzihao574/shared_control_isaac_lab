@@ -6,9 +6,9 @@ Includes: Configuration management, metrics tracking, and WandB logging.
 import os
 import yaml
 import torch
-from typing import Dict, Any, Optional
+import numpy as np
+from typing import Dict, Any, Optional, List
 from collections import defaultdict
-from dataclasses import dataclass, field
 
 
 # ============================================================================
@@ -38,12 +38,12 @@ class TrainingConfiguration:
         
         Args:
             yaml_path: Path to YAML configuration file
-        
+            
         Returns:
             TrainingConfiguration instance
         """
         if not os.path.exists(yaml_path):
-            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+            raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
         
         with open(yaml_path, 'r') as f:
             params = yaml.safe_load(f)
@@ -51,152 +51,187 @@ class TrainingConfiguration:
         return cls(params)
     
     def _validate_config(self):
-        """Validate that required configuration sections exist."""
+        """Validate that all required configuration sections exist."""
         required_sections = [
-            "algorithms.rmappo",
+            "training",
+            "logging", 
+            "algorithms",
             "epigraph",
+            "epigraph_env",
             "constraints",
+            "trajectory",
             "reward_parameters",
         ]
         
         for section in required_sections:
-            parts = section.split('.')
-            current = self.params
-            
-            for part in parts:
-                if part not in current:
-                    raise ValueError(f"Missing required config section: {section}")
-                current = current[part]
+            if section not in self.params:
+                raise ValueError(f"Missing required config section: {section}")
         
-        print("[CONFIG] Validation passed")
+        # Validate algorithms.rmappo
+        if "rmappo" not in self.params["algorithms"]:
+            raise ValueError("Missing algorithms.rmappo configuration")
+        
+        print("[CONFIG] Configuration validated successfully")
     
-    def get(self, key: str, default: Any = None) -> Any:
-        """
-        Get configuration value by dot-separated key.
-        
-        Args:
-            key: Dot-separated key (e.g., "algorithms.rmappo.gamma")
-            default: Default value if key not found
-        
-        Returns:
-            Configuration value
-        """
-        parts = key.split('.')
-        current = self.params
-        
-        for part in parts:
-            if isinstance(current, dict) and part in current:
-                current = current[part]
+    def get(self, key: str, default=None):
+        """Get configuration value by key path (e.g., 'training.seed')."""
+        keys = key.split('.')
+        value = self.params
+        for k in keys:
+            if isinstance(value, dict):
+                value = value.get(k, default)
             else:
                 return default
-        
-        return current
+        return value
 
 
 # ============================================================================
-# Metrics Tracking
+# Rollout Statistics (Required by Modification Plan)
 # ============================================================================
 
-@dataclass
-class MetricsHub:
+def summarize_rollout_stats(
+    r_task: torch.Tensor,
+    r_safe_cost: torch.Tensor,
+    z: torch.Tensor,
+    dones: torch.Tensor,
+    info: Dict[str, Any],
+) -> Dict[str, float]:
     """
-    Central metrics tracking hub for Epigraph training.
-    Tracks rollout, update, and evaluation metrics.
-    """
+    Compute statistics from rollout data for logging.
     
-    # Rollout metrics
-    rollout_return_task: list = field(default_factory=list)
-    rollout_return_safe: list = field(default_factory=list)
-    rollout_return_total: list = field(default_factory=list)
-    rollout_episode_length: list = field(default_factory=list)
+    This is the key function required by the modification plan for trainer logging.
     
-    # Update metrics
-    update_loss_policy: list = field(default_factory=list)
-    update_loss_value_vl: list = field(default_factory=list)
-    update_loss_value_vh: list = field(default_factory=list)
-    update_loss_entropy: list = field(default_factory=list)
-    update_entropy: list = field(default_factory=list)
-    update_approx_kl: list = field(default_factory=list)
-    update_clip_fraction: list = field(default_factory=list)
-    
-    # Z statistics
-    z_mean: list = field(default_factory=list)
-    z_std: list = field(default_factory=list)
-    z_min: list = field(default_factory=list)
-    z_max: list = field(default_factory=list)
-    
-    # Evaluation metrics
-    eval_return_mean: list = field(default_factory=list)
-    eval_return_std: list = field(default_factory=list)
-    eval_success_rate: list = field(default_factory=list)
-    eval_episode_length: list = field(default_factory=list)
-    eval_z_global_mean: list = field(default_factory=list)
-    eval_z_global_std: list = field(default_factory=list)
-    
-    def record_rollout(self, info: Dict[str, Any]):
-        """Record rollout metrics."""
-        self.rollout_return_task.append(info.get("return_task_mean", 0.0))
-        self.rollout_return_safe.append(info.get("return_safe_mean", 0.0))
-        self.rollout_return_total.append(info.get("return_total_mean", 0.0))
-        self.rollout_episode_length.append(info.get("episode_length_mean", 0.0))
-    
-    def record_update(self, info: Dict[str, Any]):
-        """Record update metrics."""
-        self.update_loss_policy.append(info.get("loss_policy", 0.0))
-        self.update_loss_value_vl.append(info.get("loss_value_vl", 0.0))
-        self.update_loss_value_vh.append(info.get("loss_value_vh", 0.0))
-        self.update_loss_entropy.append(info.get("loss_entropy", 0.0))
-        self.update_entropy.append(info.get("entropy", 0.0))
-        self.update_approx_kl.append(info.get("approx_kl", 0.0))
-        self.update_clip_fraction.append(info.get("clip_fraction", 0.0))
+    Args:
+        r_task: [T, N, num_agents] - Task rewards collected during rollout
+        r_safe_cost: [T, N, num_agents] - Safety costs (>=0) collected during rollout
+        z: [T, N, num_agents] - Risk budget values during rollout
+        dones: [T, N] - Episode termination flags
+        info: Additional information dictionary from rollout
         
-        # Z statistics
-        self.z_mean.append(info.get("z_mean", 0.0))
-        self.z_std.append(info.get("z_std", 0.0))
-        self.z_min.append(info.get("z_min", 0.0))
-        self.z_max.append(info.get("z_max", 0.0))
+    Returns:
+        stats: Dictionary of statistics including:
+            - avg_episode_task_return: Average task return per episode
+            - avg_episode_safe_cost_sum: Average safety cost sum per episode
+            - unsafe_step_ratio: Ratio of unsafe steps
+            - avg_progress_ratio: Average task progress
+            - avg_z_robot, avg_z_human: Average z values per agent
+    """
+    T, N, num_agents = r_task.shape
     
-    def record_eval(self, info: Dict[str, Any]):
-        """Record evaluation metrics."""
-        self.eval_return_mean.append(info.get("return_mean", 0.0))
-        self.eval_return_std.append(info.get("return_std", 0.0))
-        self.eval_success_rate.append(info.get("success_rate", 0.0))
-        self.eval_episode_length.append(info.get("episode_length", 0.0))
-        self.eval_z_global_mean.append(info.get("z_global_mean", 0.0))
-        self.eval_z_global_std.append(info.get("z_global_std", 0.0))
+    stats = {}
     
-    def get_summary(self) -> Dict[str, Any]:
-        """Get summary statistics of tracked metrics."""
-        summary = {
-            "rollout": {
-                "return_task_mean": self._mean(self.rollout_return_task),
-                "return_safe_mean": self._mean(self.rollout_return_safe),
-                "return_total_mean": self._mean(self.rollout_return_total),
-                "episode_length_mean": self._mean(self.rollout_episode_length),
-            },
-            "update": {
-                "loss_policy_mean": self._mean(self.update_loss_policy),
-                "loss_value_vl_mean": self._mean(self.update_loss_value_vl),
-                "loss_value_vh_mean": self._mean(self.update_loss_value_vh),
-                "entropy_mean": self._mean(self.update_entropy),
-                "clip_fraction_mean": self._mean(self.update_clip_fraction),
-            },
-            "z": {
-                "mean": self._mean(self.z_mean),
-                "std": self._mean(self.z_std),
-            },
-            "eval": {
-                "return_mean": self._mean(self.eval_return_mean),
-                "success_rate": self._mean(self.eval_success_rate),
-                "z_global_mean": self._mean(self.eval_z_global_mean),
-            },
-        }
-        return summary
+    # ========== Task Return Statistics ==========
+    # Total task rewards (sum over time)
+    task_return_total = r_task.sum(dim=0)  # [N, num_agents]
+    stats['avg_episode_task_return'] = float(task_return_total.mean().item())
+    stats['r_task_mean_per_step'] = float(r_task.mean().item())
+    stats['r_task_robot_mean'] = float(r_task[:, :, 0].mean().item())
+    stats['r_task_human_mean'] = float(r_task[:, :, 1].mean().item())
     
-    @staticmethod
-    def _mean(values: list) -> float:
-        """Compute mean of list, handling empty lists."""
-        return sum(values) / len(values) if values else 0.0
+    # ========== Safety Cost Statistics ==========
+    # Total safety costs (sum over time)
+    safe_cost_total = r_safe_cost.sum(dim=0)  # [N, num_agents]
+    stats['avg_episode_safe_cost_sum'] = float(safe_cost_total.mean().item())
+    stats['r_safe_cost_mean_per_step'] = float(r_safe_cost.mean().item())
+    stats['r_safe_cost_robot_mean'] = float(r_safe_cost[:, :, 0].mean().item())
+    stats['r_safe_cost_human_mean'] = float(r_safe_cost[:, :, 1].mean().item())
+    
+    # ========== Z Statistics (Per Agent) ==========
+    stats['avg_z_robot'] = float(z[:, :, 0].mean().item())
+    stats['avg_z_human'] = float(z[:, :, 1].mean().item())
+    stats['z_mean'] = float(z.mean().item())
+    stats['z_std'] = float(z.std().item())
+    stats['z_min'] = float(z.min().item())
+    stats['z_max'] = float(z.max().item())
+    
+    # ========== Episode Statistics ==========
+    episodes_finished = int(dones.sum().item())
+    stats['episodes_finished'] = episodes_finished
+    
+    # ========== Safety Violation Statistics ==========
+    # From info dictionary (if available)
+    if 'is_violating' in info and info['is_violating'] is not None:
+        violations = info['is_violating']  # Should be [T, N] bool
+        if isinstance(violations, torch.Tensor):
+            total_steps = T * N
+            unsafe_steps = violations.sum().item()
+            stats['unsafe_step_ratio'] = unsafe_steps / total_steps if total_steps > 0 else 0.0
+        else:
+            stats['unsafe_step_ratio'] = 0.0
+    else:
+        stats['unsafe_step_ratio'] = 0.0
+    
+    # ========== Progress Statistics ==========
+    # From info dictionary (if available)
+    if 'progress_ratio' in info and info['progress_ratio'] is not None:
+        progress = info['progress_ratio']
+        if isinstance(progress, torch.Tensor):
+            stats['avg_progress_ratio'] = float(progress.mean().item())
+        else:
+            stats['avg_progress_ratio'] = 0.0
+    else:
+        stats['avg_progress_ratio'] = 0.0
+    
+    # ========== Combined Return ==========
+    # Total return = task - safe_cost (for reference)
+    combined_return = task_return_total - safe_cost_total
+    stats['avg_episode_combined_return'] = float(combined_return.mean().item())
+    
+    return stats
+
+
+def summarize_eval_stats(
+    episode_returns: List[float],
+    episode_safe_costs: List[float],
+    episode_success: List[bool],
+    episode_lengths: List[int],
+    z_values: Optional[List[float]] = None,
+) -> Dict[str, float]:
+    """
+    Compute statistics from evaluation episodes.
+    
+    Args:
+        episode_returns: List of episode total task returns
+        episode_safe_costs: List of episode total safety costs
+        episode_success: List of episode success flags (bool)
+        episode_lengths: List of episode lengths
+        z_values: Optional list of z values used during evaluation
+        
+    Returns:
+        stats: Dictionary of evaluation statistics
+    """
+    stats = {}
+    
+    # Return statistics
+    if len(episode_returns) > 0:
+        stats['eval_return_mean'] = float(np.mean(episode_returns))
+        stats['eval_return_std'] = float(np.std(episode_returns))
+        stats['eval_return_min'] = float(np.min(episode_returns))
+        stats['eval_return_max'] = float(np.max(episode_returns))
+    
+    # Safety cost statistics
+    if len(episode_safe_costs) > 0:
+        stats['eval_safe_cost_mean'] = float(np.mean(episode_safe_costs))
+        stats['eval_safe_cost_std'] = float(np.std(episode_safe_costs))
+        stats['eval_safe_cost_sum'] = float(np.sum(episode_safe_costs))
+    
+    # Success rate
+    if len(episode_success) > 0:
+        stats['eval_success_rate'] = float(np.mean(episode_success))
+        stats['eval_num_success'] = int(np.sum(episode_success))
+        stats['eval_num_episodes'] = len(episode_success)
+    
+    # Episode length
+    if len(episode_lengths) > 0:
+        stats['eval_episode_length_mean'] = float(np.mean(episode_lengths))
+        stats['eval_episode_length_std'] = float(np.std(episode_lengths))
+    
+    # Z statistics (if provided)
+    if z_values is not None and len(z_values) > 0:
+        stats['eval_z_mean'] = float(np.mean(z_values))
+        stats['eval_z_std'] = float(np.std(z_values))
+    
+    return stats
 
 
 # ============================================================================
@@ -205,8 +240,7 @@ class MetricsHub:
 
 class WandBLogger:
     """
-    Weights & Biases logger for Epigraph training.
-    Logs rollout, update, and evaluation metrics with Epigraph-specific fields.
+    Weights & Biases logger for training metrics.
     """
     
     def __init__(
@@ -221,15 +255,16 @@ class WandBLogger:
         
         Args:
             project: WandB project name
-            run_name: Run name for this training session
+            run_name: Name for this run
             config: Configuration dictionary to log
-            entity: WandB entity (team name)
+            entity: WandB entity (username or team)
         """
         try:
             import wandb
             self.wandb = wandb
+            self.enabled = True
             
-            self.wandb.init(
+            self.run = wandb.init(
                 project=project,
                 name=run_name,
                 config=config,
@@ -237,149 +272,40 @@ class WandBLogger:
             )
             
             print(f"[WANDB] Initialized: {project}/{run_name}")
-            self.enabled = True
             
         except ImportError:
-            print("[WARNING] wandb not installed, logging disabled")
+            print("[WARNING] WandB not installed, logging disabled")
             self.enabled = False
         except Exception as e:
-            print(f"[WARNING] Failed to initialize wandb: {e}")
+            print(f"[WARNING] WandB initialization failed: {e}")
             self.enabled = False
     
-    def log_rollout(self, global_step: int, info: Dict[str, Any]):
-        """
-        Log rollout metrics.
-        
-        Args:
-            global_step: Current global training step
-            info: Dictionary of rollout metrics
-        """
+    def log_rollout(self, step: int, stats: Dict[str, float]):
+        """Log rollout statistics."""
         if not self.enabled:
             return
         
-        log_data = {
-            # Epigraph-specific: dual returns
-            "rollout/return_task_mean": info.get("return_task_mean", 0.0),
-            "rollout/return_safe_mean": info.get("return_safe_mean", 0.0),
-            "rollout/return_total_mean": info.get("return_total_mean", 0.0),
-            
-            # Standard rollout metrics
-            "rollout/episode_length_mean": info.get("episode_length_mean", 0.0),
-            "rollout/success_rate": info.get("success_rate", 0.0),
-            
-            # Per-agent returns (if available)
-            "rollout/return_human": info.get("return_human", 0.0),
-            "rollout/return_robot": info.get("return_robot", 0.0),
-        }
-        
-        self.wandb.log(log_data, step=global_step)
+        log_dict = {"rollout/" + k: v for k, v in stats.items()}
+        log_dict["global_step"] = step
+        self.wandb.log(log_dict, step=step)
     
-    def log_update(self, global_step: int, info: Dict[str, Any]):
-        """
-        Log update metrics.
-        
-        Args:
-            global_step: Current global training step
-            info: Dictionary of update metrics
-        """
+    def log_update(self, step: int, stats: Dict[str, float]):
+        """Log update statistics."""
         if not self.enabled:
             return
         
-        log_data = {
-            # Policy loss
-            "loss/policy": info.get("loss_policy", 0.0),
-            
-            # Epigraph-specific: dual value losses
-            "loss/value_vl": info.get("loss_value_vl", 0.0),
-            "loss/value_vh": info.get("loss_value_vh", 0.0),
-            "loss/value_total": info.get("loss_value_total", 0.0),
-            
-            # Entropy
-            "loss/entropy": info.get("loss_entropy", 0.0),
-            "policy/entropy": info.get("entropy", 0.0),
-            
-            # PPO metrics
-            "ppo/approx_kl": info.get("approx_kl", 0.0),
-            "ppo/clip_fraction": info.get("clip_fraction", 0.0),
-            
-            # Explained variance
-            "ppo/explained_var_vl": info.get("explained_var_vl", 0.0),
-            "ppo/explained_var_vh": info.get("explained_var_vh", 0.0),
-            
-            # Gradient norms
-            "grad/norm_actor": info.get("grad_norm_actor", 0.0),
-            "grad/norm_vl": info.get("grad_norm_vl", 0.0),
-            "grad/norm_vh": info.get("grad_norm_vh", 0.0),
-            
-            # Learning rates
-            "lr/actor": info.get("lr_actor", 0.0),
-            "lr/critic_vl": info.get("lr_vl", 0.0),
-            "lr/critic_vh": info.get("lr_vh", 0.0),
-            
-            # Epigraph-specific: z statistics
-            "epigraph/z_mean": info.get("z_mean", 0.0),
-            "epigraph/z_std": info.get("z_std", 0.0),
-            "epigraph/z_min": info.get("z_min", 0.0),
-            "epigraph/z_max": info.get("z_max", 0.0),
-            
-            # Advantage statistics
-            "advantage/mean_task": info.get("adv_task_mean", 0.0),
-            "advantage/std_task": info.get("adv_task_std", 0.0),
-            "advantage/mean_safe": info.get("adv_safe_mean", 0.0),
-            "advantage/std_safe": info.get("adv_safe_std", 0.0),
-            "advantage/mean_combined": info.get("adv_combined_mean", 0.0),
-            "advantage/std_combined": info.get("adv_combined_std", 0.0),
-        }
-        
-        self.wandb.log(log_data, step=global_step)
+        log_dict = {"train/" + k: v for k, v in stats.items()}
+        log_dict["global_step"] = step
+        self.wandb.log(log_dict, step=step)
     
-    def log_eval(self, global_step: int, info: Dict[str, Any]):
-        """
-        Log evaluation metrics.
-        
-        Args:
-            global_step: Current global training step
-            info: Dictionary of evaluation metrics
-        """
+    def log_eval(self, step: int, stats: Dict[str, float]):
+        """Log evaluation statistics."""
         if not self.enabled:
             return
         
-        log_data = {
-            # Standard eval metrics
-            "eval/return_mean": info.get("return_mean", 0.0),
-            "eval/return_std": info.get("return_std", 0.0),
-            "eval/success_rate": info.get("success_rate", 0.0),
-            "eval/episode_length": info.get("episode_length", 0.0),
-            
-            # Epigraph-specific: z_global statistics from RootFinder
-            "epigraph_eval/z_global_mean": info.get("z_global_mean", 0.0),
-            "epigraph_eval/z_global_std": info.get("z_global_std", 0.0),
-            "epigraph_eval/z_global_min": info.get("z_global_min", 0.0),
-            "epigraph_eval/z_global_max": info.get("z_global_max", 0.0),
-            
-            # Per-agent z* statistics
-            "epigraph_eval/z_human_mean": info.get("z_human_mean", 0.0),
-            "epigraph_eval/z_robot_mean": info.get("z_robot_mean", 0.0),
-            
-            # Safety metrics
-            "eval/collision_rate": info.get("collision_rate", 0.0),
-            "eval/safety_violation_rate": info.get("safety_violation_rate", 0.0),
-        }
-        
-        self.wandb.log(log_data, step=global_step)
-    
-    def log_custom(self, data: Dict[str, Any], step: int):
-        """
-        Log custom metrics.
-        
-        Args:
-            data: Dictionary of custom metrics
-            step: Step number for x-axis
-        """
-        if not self.enabled:
-            return
-        
-        self.wandb.log(data, step=step)
+        log_dict = {"eval/" + k: v for k, v in stats.items()}
+        log_dict["global_step"] = step
+        self.wandb.log(log_dict, step=step)
     
     def finish(self):
         """Finish WandB run."""
@@ -389,103 +315,54 @@ class WandBLogger:
 
 
 # ============================================================================
-# Checkpoint Manager
+# Metric Tracking
 # ============================================================================
 
-class CheckpointManager:
+class MetricTracker:
     """
-    Manager for saving and loading training checkpoints.
+    Track metrics over training with moving averages and history.
     """
     
-    def __init__(self, checkpoint_dir: str, keep_last_n: int = 5):
+    def __init__(self, window_size: int = 100):
         """
-        Initialize checkpoint manager.
+        Initialize metric tracker.
         
         Args:
-            checkpoint_dir: Directory to save checkpoints
-            keep_last_n: Number of most recent checkpoints to keep
+            window_size: Window size for moving averages
         """
-        self.checkpoint_dir = checkpoint_dir
-        self.keep_last_n = keep_last_n
-        self.checkpoint_history = []
-        
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        print(f"[CKPT] Checkpoint directory: {checkpoint_dir}")
+        self.window_size = window_size
+        self.metrics = defaultdict(list)
     
-    def save(
-        self,
-        state_dict: Dict[str, Any],
-        global_step: int,
-        filename: Optional[str] = None,
-    ) -> str:
+    def update(self, metrics: Dict[str, float]):
         """
-        Save checkpoint.
+        Update metrics with new values.
         
         Args:
-            state_dict: Dictionary containing model and optimizer states
-            global_step: Current global training step
-            filename: Custom filename (auto-generated if not provided)
-        
-        Returns:
-            path: Path to saved checkpoint
+            metrics: Dictionary of metric name -> value
         """
-        if filename is None:
-            filename = f"checkpoint_{global_step:08d}.pth"
-        
-        path = os.path.join(self.checkpoint_dir, filename)
-        
-        # Add metadata
-        state_dict["global_step"] = global_step
-        state_dict["checkpoint_path"] = path
-        
-        # Save
-        torch.save(state_dict, path)
-        
-        # Track checkpoint
-        self.checkpoint_history.append((global_step, path))
-        
-        # Clean up old checkpoints
-        self._cleanup_old_checkpoints()
-        
-        print(f"[CKPT] Saved checkpoint: {path}")
-        return path
+        for key, value in metrics.items():
+            self.metrics[key].append(value)
+            
+            # Keep only last window_size values
+            if len(self.metrics[key]) > self.window_size:
+                self.metrics[key] = self.metrics[key][-self.window_size:]
     
-    def load(self, path: str) -> Dict[str, Any]:
-        """
-        Load checkpoint.
-        
-        Args:
-            path: Path to checkpoint file
-        
-        Returns:
-            state_dict: Loaded checkpoint dictionary
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        
-        state_dict = torch.load(path, map_location="cpu", weights_only=False)
-        
-        print(f"[CKPT] Loaded checkpoint: {path}")
-        print(f"[CKPT] Global step: {state_dict.get('global_step', 'unknown')}")
-        
-        return state_dict
+    def get_mean(self, key: str) -> Optional[float]:
+        """Get moving average of a metric."""
+        if key not in self.metrics or len(self.metrics[key]) == 0:
+            return None
+        return sum(self.metrics[key]) / len(self.metrics[key])
     
-    def _cleanup_old_checkpoints(self):
-        """Remove old checkpoints, keeping only the most recent ones."""
-        if len(self.checkpoint_history) <= self.keep_last_n:
-            return
-        
-        # Sort by global step
-        self.checkpoint_history.sort(key=lambda x: x[0])
-        
-        # Remove oldest checkpoints
-        to_remove = self.checkpoint_history[:-self.keep_last_n]
-        self.checkpoint_history = self.checkpoint_history[-self.keep_last_n:]
-        
-        for step, path in to_remove:
-            if os.path.exists(path):
-                os.remove(path)
-                print(f"[CKPT] Removed old checkpoint: {path}")
+    def get_recent(self, key: str, n: int = 10) -> List[float]:
+        """Get n most recent values of a metric."""
+        if key not in self.metrics:
+            return []
+        return self.metrics[key][-n:]
+    
+    def summary(self) -> Dict[str, float]:
+        """Get summary of all metrics (moving averages)."""
+        return {key: self.get_mean(key) for key in self.metrics.keys() 
+                if self.get_mean(key) is not None}
 
 
 # ============================================================================
@@ -506,46 +383,47 @@ def format_time(seconds: float) -> str:
         return f"{secs}s"
 
 
-def print_training_stats(
+def print_training_progress(
     global_step: int,
     max_steps: int,
-    rollout_info: Dict[str, Any],
-    update_info: Dict[str, Any],
+    rollout_stats: Dict[str, float],
+    update_stats: Dict[str, float],
 ):
     """
-    Print training statistics to console.
+    Print training progress to console.
     
     Args:
         global_step: Current global step
         max_steps: Maximum training steps
-        rollout_info: Rollout metrics
-        update_info: Update metrics
+        rollout_stats: Statistics from summarize_rollout_stats()
+        update_stats: Statistics from trainer update
     """
-    progress = global_step / max_steps * 100
+    progress_pct = global_step / max_steps * 100 if max_steps > 0 else 0
     
     print("\n" + "=" * 80)
-    print(f"Training Progress: {global_step}/{max_steps} ({progress:.1f}%)")
+    print(f"Training Progress: {global_step}/{max_steps} ({progress_pct:.1f}%)")
     print("=" * 80)
     
-    # Rollout stats
-    print("\nRollout Statistics:")
-    print(f"  Task Return     : {rollout_info.get('return_task_mean', 0):.3f}")
-    print(f"  Safe Return     : {rollout_info.get('return_safe_mean', 0):.3f}")
-    print(f"  Total Return    : {rollout_info.get('return_total_mean', 0):.3f}")
-    print(f"  Episode Length  : {rollout_info.get('episode_length_mean', 0):.1f}")
-    
-    # Update stats
-    print("\nUpdate Statistics:")
-    print(f"  Policy Loss     : {update_info.get('loss_policy', 0):.4f}")
-    print(f"  Value Loss (Vl) : {update_info.get('loss_value_vl', 0):.4f}")
-    print(f"  Value Loss (Vh) : {update_info.get('loss_value_vh', 0):.4f}")
-    print(f"  Entropy         : {update_info.get('entropy', 0):.4f}")
-    print(f"  Clip Fraction   : {update_info.get('clip_fraction', 0):.3f}")
+    # Rollout statistics
+    print("\n[Rollout Statistics]")
+    print(f"  Task Return (avg)       : {rollout_stats.get('avg_episode_task_return', 0):.3f}")
+    print(f"  Safe Cost Sum (avg)     : {rollout_stats.get('avg_episode_safe_cost_sum', 0):.3f}")
+    print(f"  Combined Return (avg)   : {rollout_stats.get('avg_episode_combined_return', 0):.3f}")
+    print(f"  Unsafe Step Ratio       : {rollout_stats.get('unsafe_step_ratio', 0):.2%}")
+    print(f"  Progress Ratio (avg)    : {rollout_stats.get('avg_progress_ratio', 0):.2%}")
+    print(f"  Episodes Finished       : {rollout_stats.get('episodes_finished', 0)}")
     
     # Z statistics
-    print("\nZ Statistics:")
-    print(f"  Mean            : {update_info.get('z_mean', 0):.4f}")
-    print(f"  Std             : {update_info.get('z_std', 0):.4f}")
-    print(f"  Range           : [{update_info.get('z_min', 0):.4f}, {update_info.get('z_max', 0):.4f}]")
+    print("\n[Risk Budget (Z) Statistics]")
+    print(f"  Robot Z (avg)           : {rollout_stats.get('avg_z_robot', 0):.4f}")
+    print(f"  Human Z (avg)           : {rollout_stats.get('avg_z_human', 0):.4f}")
+    print(f"  Z Range                 : [{rollout_stats.get('z_min', 0):.4f}, {rollout_stats.get('z_max', 0):.4f}]")
+    
+    # Update statistics
+    print("\n[Update Statistics]")
+    print(f"  Policy Loss             : {update_stats.get('loss_policy', 0):.4f}")
+    print(f"  Value Loss (Vl)         : {update_stats.get('loss_value_vl', 0):.4f}")
+    print(f"  Value Loss (Vh)         : {update_stats.get('loss_value_vh', 0):.4f}")
+    print(f"  Entropy                 : {update_stats.get('entropy', 0):.4f}")
     
     print("=" * 80 + "\n")

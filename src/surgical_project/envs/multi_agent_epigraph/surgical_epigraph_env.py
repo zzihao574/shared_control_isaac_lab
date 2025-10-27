@@ -2,6 +2,9 @@
 Human-robot collaborative surgical MARL environment for Epigraph algorithm.
 Features physics-based constraints, four-zone rewards with task/safe decomposition.
 FULLY INDEPENDENT: Does not depend on surgical_direct_marl_env.py.
+
+FIXED: step() now returns standard Gym format (obs, rewards, terminated, truncated, info)
+       with r_task/r_safe in info dict.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import quat_rotate_inverse
 
 from .surgical_epigraph_env_cfg import SurgicalEpigraphEnvCfg
-from .utils import CompleteConstraintChecker, TrajectoryManager, safe_get_rc, compose_task_safe_from_rc
+from .utils import CompleteConstraintChecker, TrajectoryManager, safe_get_rc, compose_task_safe_from_rc, StepTracer
 
 
 class SurgicalEpigraphEnv(DirectMARLEnv):
@@ -34,7 +37,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
     - Per-agent reward decomposition for Epigraph algorithm
     
     Key difference from rMAPPO environment:
-    - step() returns decomposed rewards: info["r_task"], info["r_safe"]
+    - step() returns standard Gym format with r_task/r_safe in info dict
     - Supports epigraph_env YAML configuration for reward composition
     """
     
@@ -353,227 +356,196 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self.constraint_results_t1 = self.constraint_checker.analyze_constraint_state_batch(
             self.stylus_pos_t1, current_base_positions
         )
+
         self.safety_distances_t1 = self.constraint_results_t1['distances_constraint']
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
         self.normal_t1 = self.constraint_results_t1['normal_vectors']
 
-        constraint_distances = self.safety_distances_t1.unsqueeze(-1)     # [N,1]
+        obs_dict = {}
+        for agent in self.cfg.possible_agents:
+            pos_scaled = self.stylus_pos_t1 * 5.0
+            vel_scaled = self.stylus_vel_t1 * 16.7
+            obs_agent = torch.cat([pos_scaled, vel_scaled], dim=-1)
+            obs_dict[agent] = obs_agent
 
-        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        deviations = deviations.unsqueeze(-1)                             # [N,1]
-        
-        progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-        progress_ratio = progress_ratio.unsqueeze(-1) 
+        return obs_dict
 
-        obs_6d = torch.cat([deviations,
-                            self.stylus_vel_t1,
-                            constraint_distances,
-                            progress_ratio], dim=-1)  # [N,6]
+    def _build_zone_masks(self) -> Dict[str, torch.Tensor]:
+        """Build boolean masks for four-zone reward system."""
+        N = self.num_envs
+        dev = self.device
+        
+        prog = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+        viol = self.is_violating_t1
+        
+        before_line = prog < 0.0
+        on_line = (prog >= 0.0) & (prog <= 1.0)
+        after_line = prog > 1.0
+        
+        A = on_line & ~viol
+        B = on_line & viol
+        C = (before_line | after_line) & viol
+        D = (before_line | after_line) & ~viol
+        
+        return {'A': A, 'B': B, 'C': C, 'D': D}
 
-        observations = {agent: obs_6d for agent in self.cfg.possible_agents}
-        return observations
-
-    def _build_zone_masks(self):
-        """Build zone masks for four-zone reward system."""
-        D, O = 0.0075, 0.015
-        d = self.safety_distances_t1
-        
-        surface = (d > D) & (d < O)
-        outside = (d >= O) 
-        danger = (d <= D)
-        
-        t = self.trajectory_manager.line_direction
-        if self._goal_point is not None:
-            goal_vec = self._goal_point.unsqueeze(0) - self.stylus_pos_t1
-            g = goal_vec / torch.norm(goal_vec, dim=-1, keepdim=True).clamp(min=1e-8)
-        else:
-            g = t.unsqueeze(0).expand_as(self.stylus_pos_t1)
-        
-        c1, c2 = 0.90, 0.866
-        align_goal = (g * t.unsqueeze(0)).sum(dim=-1) >= c1
-        oppose_norm = (self.normal_t1 * t.unsqueeze(0)).sum(dim=-1) <= -c2
-        rejoin_geom = surface & align_goal & oppose_norm
-        
-        self.rejoin_streak = torch.where(
-            rejoin_geom, 
-            self.rejoin_streak + 1, 
-            torch.zeros_like(self.rejoin_streak)
-        )
-        rejoin = self.rejoin_streak >= 10
-        
-        return outside, surface, danger, rejoin
-
-    def _zone_A_reward(self, masks, agent: str):
-        """Zone A (Track): Outside obstacle boundary - Progress and deviation rewards."""
-        outside, surface, danger, rejoin = masks
-        
-        prog_raw = self._progress_raw_signed_by_velocity()
-        
-        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 5, min=0.0, max=0.3)
+    def _zone_A_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
+        """Zone A: On trajectory, no collision - progress reward."""
+        N, dev = self.num_envs, self.device
+        RC = self.reward_components
+        mask = masks['A']
         
         wp = self._get_component_weight('A', 'progress', agent)
         wd = self._get_component_weight('A', 'deviation', agent)
         zw = self._get_zone_weight('A', agent)
-
-        prog_contrib = wp * prog_raw
-        dev_contrib = wd * dev_raw
-        zone_total = zw * (prog_contrib + dev_contrib)
-
-        out = torch.zeros_like(prog_raw)
-        out[outside] = zone_total[outside]
-
-        RC, device = self.reward_components, prog_raw.device
-        RC[f'zoneA_weight_{agent}'] = torch.tensor(zw, device=device)
-        RC[f'zoneA_total_{agent}'] = zone_total
+        
+        prog_raw = self._progress_raw_signed_by_velocity()
+        dev_raw, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        dev_rew = -torch.abs(dev_raw)
+        
+        prog_contrib = torch.where(mask, prog_raw * wp, torch.zeros_like(prog_raw))
+        dev_contrib = torch.where(mask, dev_rew * wd, torch.zeros_like(dev_rew))
+        
+        out = (prog_contrib + dev_contrib) * zw
+        
+        RC[f'zoneA_total_{agent}'] = out
+        RC[f'zoneA_weight_{agent}'] = torch.tensor(zw, device=dev)
         RC[f'zoneA_progress_{agent}_raw'] = prog_raw
-        RC[f'zoneA_progress_{agent}_weight'] = torch.tensor(wp, device=device)
+        RC[f'zoneA_progress_{agent}_weight'] = torch.tensor(wp, device=dev)
         RC[f'zoneA_progress_{agent}_contrib'] = prog_contrib
-        RC[f'zoneA_deviation_{agent}_raw'] = dev_raw
-        RC[f'zoneA_deviation_{agent}_weight'] = torch.tensor(wd, device=device)
+        RC[f'zoneA_deviation_{agent}_raw'] = dev_rew
+        RC[f'zoneA_deviation_{agent}_weight'] = torch.tensor(wd, device=dev)
         RC[f'zoneA_deviation_{agent}_contrib'] = dev_contrib
-
+        
         return out
 
-    def _zone_B_reward(self, masks, agent: str):
-        """Zone B (Surface): Near obstacle - Gap optimization and surface following."""
-        outside, surface, danger, rejoin = masks
-        
-        beta = 6.0e3
-        d = self.safety_distances_t1
-        gap_raw = -beta * (d - 0.010) ** 2
-        
-        gamma = 1.0
-        t = self.trajectory_manager.line_direction
-        n = self.normal_t1
-        
-        t_dot_n = (t.unsqueeze(0) * n).sum(dim=-1, keepdim=True)
-        t_surf = t.unsqueeze(0) - t_dot_n * n
-        t_surf = t_surf / torch.norm(t_surf, dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        v_surf = (self.stylus_vel_t1 * t_surf).sum(dim=-1)
-        surf_raw = gamma * v_surf
-        
-        lam = 2.0
-        v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
+    def _zone_B_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
+        """Zone B: On trajectory but colliding - surface tangent penalty."""
+        N, dev = self.num_envs, self.device
+        RC = self.reward_components
+        mask = masks['B']
         
         wg = self._get_component_weight('B', 'gap', agent)
         ws = self._get_component_weight('B', 'surftangent', agent)
         wi = self._get_component_weight('B', 'inward', agent)
         zw = self._get_zone_weight('B', agent)
         
-        gap_contrib = wg * gap_raw
-        surf_contrib = ws * surf_raw
-        inward_contrib = wi * inward_raw
-        zone_total = zw * (gap_contrib + surf_contrib + inward_contrib)
+        gap_raw = -self.safety_distances_t1
         
-        out = torch.zeros_like(gap_raw)
-        surface_only = surface & (~rejoin)
-        out[surface_only] = zone_total[surface_only]
+        t = self.trajectory_manager.line_direction
+        n = self.normal_t1
+        v = self.stylus_vel_t1
+        v_perp = v - (v * t.unsqueeze(0)).sum(dim=-1, keepdim=True) * t.unsqueeze(0)
+        tangent_violation = torch.abs((v_perp * n).sum(dim=-1))
+        surf_raw = -tangent_violation
         
-        RC, device = self.reward_components, gap_raw.device
-        RC[f'zoneB_weight_{agent}'] = torch.tensor(zw, device=device)
-        RC[f'zoneB_total_{agent}'] = zone_total
+        inward_component = torch.clamp((v * n).sum(dim=-1), min=0.0)
+        inward_raw = -inward_component
+        
+        gap_contrib = torch.where(mask, gap_raw * wg, torch.zeros_like(gap_raw))
+        surf_contrib = torch.where(mask, surf_raw * ws, torch.zeros_like(surf_raw))
+        inw_contrib = torch.where(mask, inward_raw * wi, torch.zeros_like(inward_raw))
+        
+        out = (gap_contrib + surf_contrib + inw_contrib) * zw
+        
+        RC[f'zoneB_total_{agent}'] = out
+        RC[f'zoneB_weight_{agent}'] = torch.tensor(zw, device=dev)
         RC[f'zoneB_gap_{agent}_raw'] = gap_raw
-        RC[f'zoneB_gap_{agent}_weight'] = torch.tensor(wg, device=device)
+        RC[f'zoneB_gap_{agent}_weight'] = torch.tensor(wg, device=dev)
         RC[f'zoneB_gap_{agent}_contrib'] = gap_contrib
         RC[f'zoneB_surftangent_{agent}_raw'] = surf_raw
-        RC[f'zoneB_surftangent_{agent}_weight'] = torch.tensor(ws, device=device)
+        RC[f'zoneB_surftangent_{agent}_weight'] = torch.tensor(ws, device=dev)
         RC[f'zoneB_surftangent_{agent}_contrib'] = surf_contrib
         RC[f'zoneB_inward_{agent}_raw'] = inward_raw
-        RC[f'zoneB_inward_{agent}_weight'] = torch.tensor(wi, device=device)
-        RC[f'zoneB_inward_{agent}_contrib'] = inward_contrib
-
+        RC[f'zoneB_inward_{agent}_weight'] = torch.tensor(wi, device=dev)
+        RC[f'zoneB_inward_{agent}_contrib'] = inw_contrib
+        
         return out
 
-    def _zone_C_reward(self, masks, agent: str):
-        """Zone C (Danger): Binary penalty system for dangerous proximity."""
-        outside, surface, danger, rejoin = masks
+    def _zone_C_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
+        """Zone C: Off trajectory and colliding - danger zone."""
+        N, dev = self.num_envs, self.device
+        RC = self.reward_components
+        mask = masks['C']
         
-        R_overlap_raw = -0.3
-        w_overlap = self._get_component_weight('C', 'overlap', agent)
-        overlap_contrib = w_overlap * R_overlap_raw
-
-        R_off = -0.2
-        offpen_raw = R_off * torch.ones_like(self.safety_distances_t1)
-        lam = 2.0
-        v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = -lam * torch.clamp(v_dot_n, min=0.0)
         wo = self._get_component_weight('C', 'offpen', agent)
         wi = self._get_component_weight('C', 'inward', agent)
-        too_close_contrib = (wo * offpen_raw) + (wi * inward_raw)
-
-        zone_c_total_contrib = torch.where(
-            self.is_violating_t1,
-            torch.tensor(overlap_contrib, device=self.device),
-            too_close_contrib
-        )
-
+        wv = self._get_component_weight('C', 'overlap', agent)
         zw = self._get_zone_weight('C', agent)
-        zone_total = zw * zone_c_total_contrib
         
-        out = torch.zeros_like(zone_total)
-        out[danger] = zone_total[danger]
-
-        RC, device = self.reward_components, zone_total.device
-        RC[f'zoneC_weight_{agent}'] = torch.tensor(zw, device=device)
-        RC[f'zoneC_total_{agent}'] = zone_total
-
-        RC[f'zoneC_offpen_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wo * offpen_raw)
-        RC[f'zoneC_inward_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.zeros_like(zone_total), wi * inward_raw)
-        RC[f'zoneC_overlap_{agent}_contrib'] = torch.where(self.is_violating_t1, torch.tensor(overlap_contrib, device=self.device), torch.zeros_like(zone_total))
-
-        RC[f'zoneC_offpen_{agent}_raw'] = offpen_raw
-        RC[f'zoneC_offpen_{agent}_weight'] = torch.tensor(wo, device=device)
+        dist = self.safety_distances_t1
+        overlapping = (dist <= 0.0)
+        
+        off_raw = torch.full((N,), -1.0, device=dev)
+        
+        n = self.normal_t1
+        v = self.stylus_vel_t1
+        inward_component = torch.clamp((v * n).sum(dim=-1), min=0.0)
+        inward_raw = -inward_component * 2.0
+        
+        overlap_raw = torch.where(overlapping, -torch.abs(dist) * 100.0, torch.zeros(N, device=dev))
+        
+        off_contrib = torch.where(mask & ~overlapping, off_raw * wo, torch.zeros(N, device=dev))
+        inw_contrib = torch.where(mask & ~overlapping, inward_raw * wi, torch.zeros(N, device=dev))
+        ovl_contrib = torch.where(mask & overlapping, overlap_raw * wv, torch.zeros(N, device=dev))
+        
+        out = (off_contrib + inw_contrib + ovl_contrib) * zw
+        
+        RC[f'zoneC_total_{agent}'] = out
+        RC[f'zoneC_weight_{agent}'] = torch.tensor(zw, device=dev)
+        RC[f'zoneC_offpen_{agent}_raw'] = off_raw
+        RC[f'zoneC_offpen_{agent}_weight'] = torch.tensor(wo, device=dev)
+        RC[f'zoneC_offpen_{agent}_contrib'] = off_contrib
         RC[f'zoneC_inward_{agent}_raw'] = inward_raw
-        RC[f'zoneC_inward_{agent}_weight'] = torch.tensor(wi, device=device)
-        RC[f'zoneC_overlap_{agent}_raw'] = torch.full_like(zone_total, R_overlap_raw)
-        RC[f'zoneC_overlap_{agent}_weight'] = torch.tensor(w_overlap, device=device)
+        RC[f'zoneC_inward_{agent}_weight'] = torch.tensor(wi, device=dev)
+        RC[f'zoneC_inward_{agent}_contrib'] = inw_contrib
+        RC[f'zoneC_overlap_{agent}_raw'] = overlap_raw
+        RC[f'zoneC_overlap_{agent}_weight'] = torch.tensor(wv, device=dev)
+        RC[f'zoneC_overlap_{agent}_contrib'] = ovl_contrib
         
         return out
-    
-    def _zone_D_reward(self, masks, agent: str):
-        """Zone D (Rejoin): Trajectory recovery with enhanced deviation and outward movement."""
-        outside, surface, danger, rejoin = masks
 
-        prog_raw = self._progress_raw_signed_by_velocity()
-
-        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
-        dev_raw = -torch.clamp(deviations * 5, min=0.0, max=0.3)
-
-        lam = 2.0
-        v_dot_n = (self.stylus_vel_t1 * self.normal_t1).sum(dim=-1)
-        inward_raw = torch.where(
-            v_dot_n >= 0,
-            -lam * v_dot_n,
-            lam * (-v_dot_n)
-        )
-
+    def _zone_D_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
+        """Zone D: Off trajectory but not colliding - rejoin guidance."""
+        N, dev = self.num_envs, self.device
+        RC = self.reward_components
+        mask = masks['D']
+        
         wp = self._get_component_weight('D', 'progress', agent)
         wd = self._get_component_weight('D', 'deviation', agent)
         wi = self._get_component_weight('D', 'inward', agent)
         zw = self._get_zone_weight('D', agent)
-
-        prog_contrib = wp * prog_raw
-        dev_contrib  = wd * dev_raw
-        inw_contrib  = wi * inward_raw
-        zone_total = zw * (prog_contrib + dev_contrib + inw_contrib)
-
-        out = torch.zeros_like(prog_raw)
-        out[rejoin] = zone_total[rejoin]
-
-        RC, device = self.reward_components, prog_raw.device
-        RC[f'zoneD_weight_{agent}'] = torch.tensor(zw, device=device)
-        RC[f'zoneD_total_{agent}'] = zone_total
+        
+        prog_raw = self._progress_raw_signed_by_velocity()
+        
+        dev_raw, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        
+        n = self.normal_t1
+        v = self.stylus_vel_t1
+        inward_component = torch.clamp((v * n).sum(dim=-1), min=0.0)
+        inward_raw = -inward_component
+        
+        self.rejoin_streak = torch.where(mask, self.rejoin_streak + 1, torch.zeros_like(self.rejoin_streak))
+        streak_factor = torch.clamp(self.rejoin_streak.float() * 0.01, min=0.0, max=1.0)
+        
+        dev_rew = -torch.abs(dev_raw) * (1.0 + streak_factor)
+        
+        prog_contrib = torch.where(mask, prog_raw * wp, torch.zeros_like(prog_raw))
+        dev_contrib = torch.where(mask, dev_rew * wd, torch.zeros_like(dev_rew))
+        inw_contrib = torch.where(mask, inward_raw * wi, torch.zeros_like(inward_raw))
+        
+        out = (prog_contrib + dev_contrib + inw_contrib) * zw
+        
+        RC[f'zoneD_total_{agent}'] = out
+        RC[f'zoneD_weight_{agent}'] = torch.tensor(zw, device=dev)
         RC[f'zoneD_progress_{agent}_raw'] = prog_raw
-        RC[f'zoneD_progress_{agent}_weight'] = torch.tensor(wp, device=device)
+        RC[f'zoneD_progress_{agent}_weight'] = torch.tensor(wp, device=dev)
         RC[f'zoneD_progress_{agent}_contrib'] = prog_contrib
         RC[f'zoneD_deviation_{agent}_raw'] = dev_raw
-        RC[f'zoneD_deviation_{agent}_weight'] = torch.tensor(wd, device=device)
+        RC[f'zoneD_deviation_{agent}_weight'] = torch.tensor(wd, device=dev)
         RC[f'zoneD_deviation_{agent}_contrib'] = dev_contrib
         RC[f'zoneD_inward_{agent}_raw'] = inward_raw
-        RC[f'zoneD_inward_{agent}_weight'] = torch.tensor(wi, device=device)
+        RC[f'zoneD_inward_{agent}_weight'] = torch.tensor(wi, device=dev)
         RC[f'zoneD_inward_{agent}_contrib'] = inw_contrib
 
         return out
@@ -767,19 +739,24 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         return r_task, r_safe
 
     # ============================================================================
-    # Override step() to inject r_task/r_safe into info
+    # FIXED: step() returns standard Gym format
     # ============================================================================
 
     def step(self, actions: Dict[str, torch.Tensor]) -> tuple:
         """
         Execute one environment step with Epigraph reward decomposition.
         
+        FIXED: Returns standard Gym format (obs, rewards, terminated, truncated, info)
+               with r_task/r_safe in info dict.
+        
         Returns:
             obs: Dict[agent, tensor] - Observations
-            r_task: torch.Tensor [num_envs, num_agents] - Task quality rewards
-            r_safe_cost: torch.Tensor [num_envs, num_agents] - Safety costs (>=0)
-            done: torch.Tensor [num_envs] - Episode termination (terminated OR truncated)
-            info: dict - Additional information for debugging and training
+            rewards: Dict[agent, tensor] - Total rewards (for logging)
+            terminated: Dict[agent, tensor] - Episode termination flags
+            truncated: Dict[agent, tensor] - Episode truncation flags
+            info: dict - Additional information including:
+                - info["r_task"]: Dict[agent, [N,1]] - Task quality rewards
+                - info["r_safe"]: Dict[agent, [N,1]] - Safety costs (>=0)
         """
         # Call parent DirectMARLEnv.step() to handle physics and standard processing
         obs, rewards, terminated, truncated, info = super().step(actions)
@@ -793,46 +770,50 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             agent="robot",
             device=self.device,
             num_envs=self.num_envs,
-            use_time_eff_in_task=True,
-            include_zpenalty_in_safe=True,
+            use_time_eff_in_task=self._get_flag("use_timeeff_in_task", default=0),
+            include_zpenalty_in_safe=self._get_flag("include_zpenalty_in_safe", default=1),
         )
         r_task_human, r_safe_risk_human = compose_task_safe_from_rc(
             rc=self.reward_components,
             agent="human",
             device=self.device,
             num_envs=self.num_envs,
-            use_time_eff_in_task=True,
-            include_zpenalty_in_safe=True,
+            use_time_eff_in_task=self._get_flag("use_timeeff_in_task", default=0),
+            include_zpenalty_in_safe=self._get_flag("include_zpenalty_in_safe", default=1),
         )
         
-        # Stack into [num_envs, num_agents] format
-        # Agent order: [robot=0, human=1]
-        r_task = torch.stack([r_task_robot, r_task_human], dim=1)  # [num_envs, 2]
+        # Ensure shape is [num_envs, 1]
+        r_task_robot = r_task_robot.view(self.num_envs, 1)
+        r_task_human = r_task_human.view(self.num_envs, 1)
         
         # Convert safety risk (negative=dangerous) to safety cost (positive=dangerous)
-        r_safe_cost_robot = torch.relu(-r_safe_risk_robot)
-        r_safe_cost_human = torch.relu(-r_safe_risk_human)
-        r_safe_cost = torch.stack([r_safe_cost_robot, r_safe_cost_human], dim=1)  # [num_envs, 2]
+        r_safe_cost_robot = torch.relu(-r_safe_risk_robot).view(self.num_envs, 1)
+        r_safe_cost_human = torch.relu(-r_safe_risk_human).view(self.num_envs, 1)
         
-        # Merge terminated and truncated into single done signal
-        # done=True if either terminated OR truncated for any agent
-        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for agent in self.cfg.possible_agents:
-            done = done | terminated[agent] | truncated[agent]
-        
-        # Prepare info dict with debugging information
+        # Prepare info dict with r_task and r_safe
         info = dict(info) if info is not None else {}
         info.update({
-            "is_violating": self.is_violating_t1.clone(),        # [num_envs] bool
-            "safety_distance": self.safety_distances_t1.clone(), # [num_envs] float
-            "rejoin_streak": self.rejoin_streak.clone(),         # [num_envs] int
-            "progress_ratio": self.reward_components.get("progress_ratio", torch.zeros(self.num_envs, device=self.device)).clone(),
-            "done_mask": done.clone(),                           # [num_envs] bool - for RNN reset
-            "terminated": terminated,                            # Original terminated dict
-            "truncated": truncated,                              # Original truncated dict
+            # ⭐ KEY FIX: Put r_task and r_safe in info dict (per-agent format)
+            "r_task": {
+                "robot": r_task_robot,   # [num_envs, 1]
+                "human": r_task_human,   # [num_envs, 1]
+            },
+            "r_safe": {
+                "robot": r_safe_cost_robot,  # [num_envs, 1], >=0 (cost)
+                "human": r_safe_cost_human,  # [num_envs, 1], >=0 (cost)
+            },
+            # Additional debugging information
+            "is_violating": self.is_violating_t1.clone(),
+            "safety_distance": self.safety_distances_t1.clone(),
+            "rejoin_streak": self.rejoin_streak.clone(),
+            "progress_ratio": self.reward_components.get(
+                "progress_ratio", 
+                torch.zeros(self.num_envs, device=self.device)
+            ).clone(),
         })
         
-        return obs, r_task, r_safe_cost, done, info
+        # Return standard Gym format
+        return obs, rewards, terminated, truncated, info
 
     # ============================================================================
     # Remaining methods (identical to reference environment)

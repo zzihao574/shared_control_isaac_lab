@@ -1,329 +1,412 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-train_epigraph.py - Training script for Epigraph safe MARL algorithm
-Features dual value functions (Vl/Vh), RootFinder evaluation, and z-recursive training.
+Training script for Epigraph safe MARL.
+Main training loop with rollout collection, PPO updates, evaluation, and logging.
+
+FIXED:
+1. Correct function call signatures (no parameters passed to collect_rollout/update)
+2. Proper checkpoint saving with global_step and update_count
+3. Compatible with fixed trainer.py
 """
 
 import os
 import sys
-import torch
 import argparse
+import yaml
+import torch
+import numpy as np
+from pathlib import Path
 from datetime import datetime
+from tensorboardX import SummaryWriter
 
-# === Step 1: Parse arguments BEFORE AppLauncher ===
-parser = argparse.ArgumentParser(description="Train Epigraph agent.")
-parser.add_argument("--config", type=str, required=True,
-                    help="Path to training YAML config.")
-parser.add_argument("--task", type=str,
-                    default="Isaac-Surgical-MARL-Epigraph-v0",
-                    help="Environment task name.")
-parser.add_argument("--num_envs", type=int, default=512,
-                    help="Number of parallel environments.")
-parser.add_argument("--seed", type=int, default=42,
-                    help="Random seed for reproducibility.")
-parser.add_argument("--run_name", type=str, default=None,
-                    help="WandB run name (auto-generated if not provided).")
-parser.add_argument("--project", type=str, default="surgical-epigraph",
-                    help="WandB project name.")
-parser.add_argument("--resume_from", type=str, default=None,
-                    help="Path to checkpoint to resume from.")
+# Add project root to path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(current_dir, "..")
+sys.path.insert(0, project_root)
 
-# Import AppLauncher and add its args
-from isaaclab.app import AppLauncher
-AppLauncher.add_app_launcher_args(parser)
-args = parser.parse_args()
+from isaaclab.envs import DirectMARLEnvCfg
+from isaaclab_tasks.manager_based.surgical_epigraph import agents as surgical_agents
 
-# === Step 2: Launch Isaac App ===
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
-# === Step 3: Import after Isaac is initialized ===
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-
-from utils.training_helpers_epigraph import TrainingConfiguration, WandBLogger
-import gymnasium as gym
-
-# ----------------------------- #
-# Setup Functions
-# ----------------------------- #
-
-def setup_global_reproducibility(seed: int, strict_determinism: bool = True):
-    """Setup global random seeds for reproducibility."""
-    import random
-    import numpy as np
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Train Epigraph safe MARL policy")
     
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config YAML (default: use agents/training_params_epigraph.yaml)"
+    )
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=None,
+        help="Override number of parallel environments"
+    )
+    parser.add_argument(
+        "--total_timesteps",
+        type=int,
+        default=None,
+        help="Override total training timesteps"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Device to run on (cuda:0, cpu, etc.)"
+    )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="./logs",
+        help="Directory for logs and checkpoints"
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Name for this run (default: timestamp)"
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--eval_interval",
+        type=int,
+        default=10,
+        help="Evaluate every N updates"
+    )
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=50,
+        help="Save checkpoint every N updates"
+    )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=1,
+        help="Log to tensorboard every N updates"
+    )
     
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    
-    if strict_determinism:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    print(f"[SETUP] Global seed set to: {seed}")
+    return parser.parse_args()
 
 
-def setup_environment(args, config):
-    """Create and configure the training environment."""
-    print(f"[SETUP] Creating environment: {args.task}")
+def load_config(config_path: str = None):
+    """Load training configuration from YAML."""
+    if config_path is None:
+        # Default: use training_params_epigraph.yaml from agents directory
+        agents_dir = os.path.join(
+            project_root,
+            "isaaclab_tasks",
+            "manager_based",
+            "surgical_epigraph",
+            "agents"
+        )
+        config_path = os.path.join(agents_dir, "training_params_epigraph.yaml")
     
-    # Create environment with specified number of parallel envs
-    env = gym.make(args.task, num_envs=args.num_envs)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     
-    # Inject config into environment
-    if hasattr(env.unwrapped, "params"):
-        env.unwrapped.params = config.params
-        print(f"[SETUP] Config injected into environment")
+    print(f"[TRAIN] Loading config from: {config_path}")
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
     
-    print(f"[SETUP] Environment created with {args.num_envs} parallel environments")
+    return config
+
+
+def create_env(config: dict, num_envs: int, device: str):
+    """Create training environment."""
+    from isaaclab_tasks.manager_based.surgical_epigraph.surgical_epigraph_env_cfg import SurgicalEpigraphEnvCfg
+    from isaaclab_tasks.manager_based.surgical_epigraph.surgical_epigraph_env import SurgicalEpigraphEnv
+    
+    # Create environment config
+    env_cfg = SurgicalEpigraphEnvCfg()
+    env_cfg.scene.num_envs = num_envs
+    
+    # Inject configuration into env_cfg
+    env_cfg.params = config
+    
+    # Create environment
+    env = SurgicalEpigraphEnv(cfg=env_cfg, render_mode=None)
+    
+    # Also inject to unwrapped env
+    if hasattr(env, 'unwrapped'):
+        env.unwrapped.params = config
+    
+    print(f"[TRAIN] Environment created: {num_envs} parallel environments")
     return env
 
 
-def create_trainer(env, config, args, device):
+def create_trainer(env, config: dict, device: str):
+    """Create Epigraph trainer."""
+    from isaaclab_tasks.manager_based.surgical_epigraph.agents.trainer import EpigraphTrainer
+    
+    algo_cfg = config["algorithms"]["rmappo"]
+    epi_cfg = config["epigraph"]
+    
+    trainer = EpigraphTrainer(
+        env=env,
+        device=torch.device(device),
+        algo_cfg=algo_cfg,
+        epi_cfg=epi_cfg
+    )
+    
+    print(f"[TRAIN] Trainer created")
+    return trainer
+
+
+def setup_logging(log_dir: str, run_name: str, config: dict):
+    """Setup logging directory and tensorboard writer."""
+    # Create run directory
+    run_dir = os.path.join(log_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Create subdirectories
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Save config
+    config_path = os.path.join(run_dir, "config.yaml")
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    # Create tensorboard writer
+    writer = SummaryWriter(log_dir=run_dir)
+    
+    print(f"[TRAIN] Logging to: {run_dir}")
+    
+    return run_dir, checkpoint_dir, writer
+
+
+def train(
+    trainer,
+    env,
+    total_timesteps: int,
+    eval_interval: int,
+    save_interval: int,
+    log_interval: int,
+    checkpoint_dir: str,
+    writer: SummaryWriter,
+    resume_checkpoint: str = None
+):
     """
-    Create EpigraphTrainer instance.
+    Main training loop.
     
-    This imports the trainer from the epigraph algorithm package.
+    FIXED: Use trainer.collect_rollout() and trainer.update() without parameters.
     """
-    try:
-        sys.path.insert(0, os.path.join(
-            os.path.dirname(__file__), "..", "src", 
-            "surgical_project", "algorithms", "marl", "epigraph"
-        ))
-        from trainer import EpigraphTrainer
+    # Resume from checkpoint if provided
+    if resume_checkpoint is not None:
+        print(f"[TRAIN] Resuming from checkpoint: {resume_checkpoint}")
+        trainer.load_checkpoint(resume_checkpoint)
+        start_step = trainer.global_step
+        start_update = start_step // (trainer.rollout_horizon * trainer.num_envs)
+    else:
+        start_step = 0
+        start_update = 0
+    
+    # Calculate total updates needed
+    steps_per_update = trainer.rollout_horizon * trainer.num_envs
+    total_updates = total_timesteps // steps_per_update
+    
+    print("\n" + "=" * 60)
+    print("TRAINING CONFIGURATION")
+    print("=" * 60)
+    print(f"Total timesteps:       {total_timesteps:,}")
+    print(f"Total updates:         {total_updates:,}")
+    print(f"Steps per update:      {steps_per_update:,}")
+    print(f"Rollout horizon:       {trainer.rollout_horizon}")
+    print(f"Num envs:              {trainer.num_envs}")
+    print(f"PPO epochs:            {trainer.ppo_epoch}")
+    print(f"Mini batches:          {trainer.num_mini_batch}")
+    print(f"Starting from update:  {start_update}")
+    print("=" * 60 + "\n")
+    
+    # Training loop
+    global_step = start_step
+    
+    for update in range(start_update, total_updates):
+        update_start_time = datetime.now()
         
-        trainer = EpigraphTrainer(
-            env=env,
-            device=device,
-            algo_cfg=config.params["algorithms"]["rmappo"],  # Reuse rmappo config
-            epi_cfg=config.params["epigraph"],  # Epigraph-specific config
-        )
+        # ========== FIXED: Call without parameters ==========
+        # Collect rollout
+        rollout_info = trainer.collect_rollout()
         
-        print("[SETUP] EpigraphTrainer created successfully")
-        return trainer
+        # Update networks
+        update_info = trainer.update()
         
-    except ImportError as e:
-        print(f"[ERROR] Could not import EpigraphTrainer: {e}")
-        print("[INFO] Make sure epigraph/trainer.py exists and is properly implemented")
-        raise
-
-
-def setup_checkpoint_dir(config, run_name):
-    """Create checkpoint directory for saving models."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = run_name or f"epigraph_{timestamp}"
-    
-    ckpt_dir = os.path.join("checkpoints", "epigraph", run_name)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    
-    print(f"[SETUP] Checkpoint directory: {ckpt_dir}")
-    return ckpt_dir
-
-
-# ----------------------------- #
-# Training Loop
-# ----------------------------- #
-
-def train_loop(trainer, config, args, logger, ckpt_dir):
-    """
-    Main training loop for Epigraph algorithm.
-    
-    Structure:
-    1. Collect rollout (with per-agent z recursion)
-    2. Update networks (PPO with dual GAE)
-    3. Evaluate (with RootFinder)
-    4. Save checkpoints
-    """
-    # Extract training parameters
-    algo_cfg = config.params["algorithms"]["rmappo"]
-    epi_cfg = config.params["epigraph"]
-    
-    rollout_horizon = algo_cfg["rollout_horizon"]
-    ppo_epoch = algo_cfg["ppo_epoch"]
-    num_mini_batch = algo_cfg["num_mini_batch"]
-    max_global_steps = algo_cfg["max_global_steps"]
-    
-    # Evaluation and saving intervals
-    eval_interval = config.params.get("training", {}).get("eval_interval", 10000)
-    save_interval = config.params.get("training", {}).get("save_interval", 50000)
-    
-    global_step = 0
-    update_count = 0
-    
-    print("\n" + "=" * 80)
-    print("STARTING TRAINING")
-    print("=" * 80)
-    print(f"Max global steps: {max_global_steps}")
-    print(f"Rollout horizon: {rollout_horizon}")
-    print(f"PPO epochs: {ppo_epoch}")
-    print(f"Mini-batches: {num_mini_batch}")
-    print(f"Eval interval: {eval_interval}")
-    print(f"Save interval: {save_interval}")
-    print("=" * 80 + "\n")
-    
-    try:
-        while global_step < max_global_steps:
-            # ============ Phase 1: Collect Rollout ============
-            print(f"\n[Step {global_step}] Collecting rollout...")
-            rollout_info = trainer.collect_rollout(rollout_horizon)
-            
-            global_step += rollout_horizon * args.num_envs
-            
-            # Log rollout metrics
-            if logger:
-                logger.log_rollout(global_step, rollout_info)
-            
-            print(f"[Step {global_step}] Rollout collected: "
-                  f"return_task={rollout_info.get('return_task_mean', 0):.3f}, "
-                  f"return_safe={rollout_info.get('return_safe_mean', 0):.3f}")
-            
-            # ============ Phase 2: Update Networks ============
-            print(f"[Step {global_step}] Updating networks...")
-            update_info = trainer.update(ppo_epoch, num_mini_batch)
-            
-            update_count += 1
-            
-            # Log update metrics
-            if logger:
-                logger.log_update(global_step, update_info)
-            
-            print(f"[Step {global_step}] Update {update_count}: "
-                  f"loss_policy={update_info.get('loss_policy', 0):.4f}, "
-                  f"loss_vl={update_info.get('loss_value_vl', 0):.4f}, "
-                  f"loss_vh={update_info.get('loss_value_vh', 0):.4f}")
-            
-            # ============ Phase 3: Periodic Evaluation ============
-            if global_step % eval_interval < rollout_horizon * args.num_envs:
-                print(f"\n[Step {global_step}] Running evaluation with RootFinder...")
-                eval_info = trainer.evaluate(num_episodes=10)
-                
-                if logger:
-                    logger.log_eval(global_step, eval_info)
-                
-                print(f"[Step {global_step}] Eval: "
-                      f"return={eval_info.get('return_mean', 0):.3f}, "
-                      f"success_rate={eval_info.get('success_rate', 0):.2%}, "
-                      f"z_global_mean={eval_info.get('z_global_mean', 0):.4f}")
-            
-            # ============ Phase 4: Save Checkpoint ============
-            if global_step % save_interval < rollout_horizon * args.num_envs:
-                ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{global_step:08d}.pth")
-                print(f"\n[Step {global_step}] Saving checkpoint: {ckpt_path}")
-                
-                trainer.save_checkpoint(
-                    path=ckpt_path,
-                    global_step=global_step,
-                    update_count=update_count,
-                )
-                
-                print(f"[Step {global_step}] Checkpoint saved successfully")
-    
-    except KeyboardInterrupt:
-        print("\n[INFO] Training interrupted by user")
-    
-    except Exception as e:
-        print(f"\n[ERROR] Training failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-    
-    finally:
-        # Save final checkpoint
-        final_ckpt_path = os.path.join(ckpt_dir, "checkpoint_final.pth")
-        print(f"\n[FINAL] Saving final checkpoint: {final_ckpt_path}")
+        # Update global step counter
+        global_step += steps_per_update
+        trainer.global_step = global_step
         
-        trainer.save_checkpoint(
-            path=final_ckpt_path,
-            global_step=global_step,
-            update_count=update_count,
-        )
+        # Set global step in environment for logging
+        if hasattr(env.unwrapped, 'set_trainer_global_step'):
+            env.unwrapped.set_trainer_global_step(global_step)
         
-        print("\n" + "=" * 80)
-        print("TRAINING COMPLETE")
-        print("=" * 80)
-        print(f"Total steps: {global_step}")
-        print(f"Total updates: {update_count}")
-        print(f"Final checkpoint: {final_ckpt_path}")
-        print("=" * 80 + "\n")
+        update_time = (datetime.now() - update_start_time).total_seconds()
+        
+        # ========== Logging ==========
+        if update % log_interval == 0:
+            # Log to tensorboard
+            writer.add_scalar("train/return_task", rollout_info["return_task_mean"], global_step)
+            writer.add_scalar("train/return_safe", rollout_info["return_safe_mean"], global_step)
+            writer.add_scalar("train/episode_length", rollout_info["episode_length"], global_step)
+            writer.add_scalar("train/episodes_done", rollout_info["episodes_done"], global_step)
+            
+            # Z statistics
+            writer.add_scalar("train/z_mean", rollout_info["z_mean"], global_step)
+            writer.add_scalar("train/z_std", rollout_info["z_std"], global_step)
+            writer.add_scalar("train/z_min", rollout_info["z_min"], global_step)
+            writer.add_scalar("train/z_max", rollout_info["z_max"], global_step)
+            
+            # Update losses
+            writer.add_scalar("update/loss_policy", update_info["loss_policy"], global_step)
+            writer.add_scalar("update/loss_value_vl", update_info["loss_value_vl"], global_step)
+            writer.add_scalar("update/loss_value_vh", update_info["loss_value_vh"], global_step)
+            writer.add_scalar("update/entropy", update_info["entropy"], global_step)
+            writer.add_scalar("update/approx_kl", update_info["approx_kl"], global_step)
+            writer.add_scalar("update/clipfrac", update_info["clipfrac"], global_step)
+            
+            # Timing
+            writer.add_scalar("timing/update_time", update_time, global_step)
+            writer.add_scalar("timing/fps", steps_per_update / update_time, global_step)
+            
+            # Console output
+            print(f"[TRAIN] Update {update + 1}/{total_updates} | Step {global_step:,}/{total_timesteps:,}")
+            print(f"  Return (task): {rollout_info['return_task_mean']:.2f} ± {rollout_info['return_task_std']:.2f}")
+            print(f"  Return (safe): {rollout_info['return_safe_mean']:.2f} ± {rollout_info['return_safe_std']:.2f}")
+            print(f"  Episode length: {rollout_info['episode_length']:.1f}")
+            print(f"  Z: {rollout_info['z_mean']:.4f} ± {rollout_info['z_std']:.4f}")
+            print(f"  Loss (π/Vl/Vh): {update_info['loss_policy']:.4f} / {update_info['loss_value_vl']:.4f} / {update_info['loss_value_vh']:.4f}")
+            print(f"  Entropy: {update_info['entropy']:.4f} | KL: {update_info['approx_kl']:.4f}")
+            print(f"  Update time: {update_time:.2f}s | FPS: {steps_per_update / update_time:.0f}")
+            print()
+        
+        # ========== Evaluation ==========
+        if update % eval_interval == 0 and update > 0:
+            print(f"\n[TRAIN] Running evaluation at update {update}...")
+            eval_info = trainer.evaluate(num_episodes=10)
+            
+            # Log evaluation results
+            writer.add_scalar("eval/return_mean", eval_info["return_mean"], global_step)
+            writer.add_scalar("eval/return_std", eval_info["return_std"], global_step)
+            writer.add_scalar("eval/episode_length", eval_info["episode_length"], global_step)
+            writer.add_scalar("eval/success_rate", eval_info["success_rate"], global_step)
+            writer.add_scalar("eval/z_global_mean", eval_info["z_global_mean"], global_step)
+            writer.add_scalar("eval/z_global_std", eval_info["z_global_std"], global_step)
+            
+            print(f"[EVAL] Return: {eval_info['return_mean']:.2f} ± {eval_info['return_std']:.2f}")
+            print(f"[EVAL] Success rate: {eval_info['success_rate']:.2%}")
+            print(f"[EVAL] Z global: {eval_info['z_global_mean']:.4f} ± {eval_info['z_global_std']:.4f}\n")
+        
+        # ========== FIXED: Save checkpoint with parameters ==========
+        if update % save_interval == 0 and update > 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_update_{update}.pt")
+            trainer.save_checkpoint(
+                path=checkpoint_path,
+                global_step=global_step,
+                update_count=update
+            )
+            print(f"[TRAIN] Checkpoint saved: {checkpoint_path}\n")
+    
+    # Save final checkpoint
+    final_checkpoint = os.path.join(checkpoint_dir, "checkpoint_final.pt")
+    trainer.save_checkpoint(
+        path=final_checkpoint,
+        global_step=global_step,
+        update_count=total_updates
+    )
+    print(f"\n[TRAIN] Final checkpoint saved: {final_checkpoint}")
+    
+    writer.close()
 
-
-# ----------------------------- #
-# Main Entry Point
-# ----------------------------- #
 
 def main():
-    print("=" * 80)
-    print("Epigraph Safe MARL Training")
-    print("=" * 80)
+    """Main training function."""
+    args = parse_args()
     
-    # Setup
-    print(f"[SETUP] Loading config from: {args.config}")
-    config = TrainingConfiguration.from_yaml(args.config)
-    print(f"[SETUP] Config loaded successfully")
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     
-    setup_global_reproducibility(args.seed, strict_determinism=True)
+    print("\n" + "=" * 60)
+    print("EPIGRAPH SAFE MARL TRAINING")
+    print("=" * 60)
     
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[SETUP] Using device: {device}")
+    # Load config
+    config = load_config(args.config)
+    
+    # Override config with command line arguments
+    if args.num_envs is not None:
+        config["scene"]["num_envs"] = args.num_envs
+    if args.total_timesteps is not None:
+        config["training"]["total_timesteps"] = args.total_timesteps
+    
+    # Extract training parameters
+    num_envs = config.get("scene", {}).get("num_envs", 256)
+    total_timesteps = config.get("training", {}).get("total_timesteps", 10_000_000)
+    
+    print(f"Num envs:       {num_envs}")
+    print(f"Total steps:    {total_timesteps:,}")
+    print(f"Device:         {args.device}")
+    print(f"Seed:           {args.seed}")
+    print("=" * 60 + "\n")
+    
+    # Create run name
+    if args.run_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"epigraph_{timestamp}"
+    else:
+        run_name = args.run_name
+    
+    # Setup logging
+    run_dir, checkpoint_dir, writer = setup_logging(args.log_dir, run_name, config)
     
     # Create environment
-    env = setup_environment(args, config)
+    env = create_env(config, num_envs, args.device)
     
     # Create trainer
-    trainer = create_trainer(env, config, args, device)
-    
-    # Setup checkpoint directory
-    ckpt_dir = setup_checkpoint_dir(config, args.run_name)
-    
-    # Setup WandB logger
-    logger = None
-    if config.params.get("logging", {}).get("use_wandb", True):
-        try:
-            logger = WandBLogger(
-                project=args.project,
-                run_name=args.run_name or f"epigraph_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                config=config.params,
-            )
-            print("[SETUP] WandB logger initialized")
-        except Exception as e:
-            print(f"[WARNING] Failed to initialize WandB: {e}")
-            logger = None
-    
-    # Resume from checkpoint if specified
-    if args.resume_from:
-        print(f"[SETUP] Resuming from checkpoint: {args.resume_from}")
-        trainer.load_checkpoint(args.resume_from)
-        print("[SETUP] Checkpoint loaded successfully")
+    trainer = create_trainer(env, config, args.device)
     
     # Start training
-    train_loop(trainer, config, args, logger, ckpt_dir)
+    try:
+        train(
+            trainer=trainer,
+            env=env,
+            total_timesteps=total_timesteps,
+            eval_interval=args.eval_interval,
+            save_interval=args.save_interval,
+            log_interval=args.log_interval,
+            checkpoint_dir=checkpoint_dir,
+            writer=writer,
+            resume_checkpoint=args.resume
+        )
+    except KeyboardInterrupt:
+        print("\n[TRAIN] Training interrupted by user")
+        
+        # Save checkpoint on interrupt
+        interrupt_checkpoint = os.path.join(checkpoint_dir, "checkpoint_interrupt.pt")
+        trainer.save_checkpoint(
+            path=interrupt_checkpoint,
+            global_step=trainer.global_step,
+            update_count=trainer.global_step // (trainer.rollout_horizon * trainer.num_envs)
+        )
+        print(f"[TRAIN] Checkpoint saved: {interrupt_checkpoint}")
     
-    # Cleanup
-    env.close()
-    if logger:
-        logger.finish()
+    finally:
+        # Close environment
+        env.close()
+        print("\n[TRAIN] Training complete!")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("\n" + "=" * 80)
-        print("ERROR OCCURRED")
-        print("=" * 80)
-        print(f"Exception type   : {type(e).__name__}")
-        print(f"Exception message: {str(e)}")
-        print("\nFull traceback:")
-        import traceback
-        traceback.print_exc()
-        print("=" * 80 + "\n")
-    finally:
-        print("[CLEANUP] Closing simulation app...")
-        simulation_app.close()
-        print("[CLEANUP] Done")
+    main()

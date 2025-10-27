@@ -1,624 +1,411 @@
 """
 Epigraph Core Networks for Safe MARL.
 Contains: ZEncoder, ActorRNN, CriticVlRNN, CriticVhRNN, RootFinder.
-Reuses RNN layer from rMAPPO, implements independent TanhGaussian distribution.
-
-KEY FIX: TanhGaussian.log_prob now includes proper Jacobian correction.
+With sequence-based RNN training support (rMAPPO-aligned).
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
 
-# ============================================================================
-# REUSED UTILITIES (compatible with rMAPPO style)
-# ============================================================================
+# =============================================================================
+# RNNLayer (rMAPPO-style, supports both acting and sequence training)
+# =============================================================================
 
-def init_orthogonal(module, gain=1.0):
-    """Initialize module with orthogonal weights (rMAPPO style)."""
-    if isinstance(module, nn.Linear):
-        nn.init.orthogonal_(module.weight.data, gain=gain)
-        if module.bias is not None:
-            nn.init.constant_(module.bias.data, 0.0)
-    return module
+class RNNLayer(nn.Module):
+    """
+    GRU + LayerNorm, supports:
+    - acting mode: x [E,feat], hxs [E,H], masks [E,1] -> out [E,H], next_h [E,H]
+    - training mode: x [L*B,feat], hxs [B,H], masks [L*B,1] -> out [L*B,H], next_h [B,H]
+    where:
+      E = num_envs
+      B = mini-batch sequence count
+      L = sequence length (data_chunk_length)
+    """
+    def __init__(self, inputs_dim, outputs_dim, recurrent_N, use_orthogonal=True):
+        super().__init__()
+        self._recurrent_N = recurrent_N
+        self.rnn = nn.GRU(inputs_dim, outputs_dim, num_layers=recurrent_N)
+        for name, p in self.rnn.named_parameters():
+            if 'bias' in name:
+                nn.init.constant_(p, 0.0)
+            elif 'weight' in name:
+                if use_orthogonal:
+                    nn.init.orthogonal_(p)
+                else:
+                    nn.init.xavier_uniform_(p)
+        self.norm = nn.LayerNorm(outputs_dim)
+
+    def forward(self, x, hxs, masks):
+        """
+        x:
+          acting:   [E, feat]
+          training: [L*B, feat]
+        hxs:
+          acting:   [E, H]
+          training: [B, H]
+        masks:
+          acting:   [E, 1]
+          training: [L*B, 1]
+        return:
+          out:      same leading dim as x (E or L*B) x H
+          hxs_out:  [E, H] or [B, H] (last layer hidden)
+        """
+        assert hxs.dim() == 2
+        layers = self._recurrent_N
+        B = hxs.size(0)
+
+        if masks.dim() == 1:
+            masks = masks.unsqueeze(-1)
+        if masks.dtype not in (torch.float32, torch.float64):
+            masks = masks.float()
+
+        # Acting single-step
+        if x.dim() == 2 and x.size(0) == B:
+            h = hxs.unsqueeze(0).expand(layers, B, hxs.size(1)).contiguous()
+            m = masks.view(1, B, 1).expand(layers, B, 1).contiguous()
+            h = h * m
+
+            out, h = self.rnn(x.unsqueeze(0), h)
+            out = out.squeeze(0)
+            out = self.norm(out)
+            return out, h[-1]
+
+        # Training: sequence L×B
+        assert x.dim() == 2 and x.size(0) % B == 0, f"x {x.shape} not divisible by batch {B}"
+        L = x.size(0) // B
+        assert masks.size(0) == L * B, f"masks {masks.shape} vs L*B {L*B}"
+
+        x = x.view(L, B, x.size(1))
+        m = masks.view(L, B, 1)
+
+        h = hxs.unsqueeze(0).expand(layers, B, hxs.size(1)).contiguous()
+
+        outs = []
+        for t in range(L):
+            mt = m[t].view(1, B, 1).expand(layers, B, 1).contiguous()
+            h = h * mt
+            out_t, h = self.rnn(x[t].unsqueeze(0), h)
+            outs.append(out_t)
+
+        out = torch.cat(outs, dim=0).reshape(L * B, -1)
+        out = self.norm(out)
+        return out, h[-1]
 
 
-def init_xavier(module, gain=1.0):
-    """Initialize module with Xavier uniform (rMAPPO style)."""
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight.data, gain=gain)
-        if module.bias is not None:
-            nn.init.constant_(module.bias.data, 0.0)
-    return module
-
-
-# ============================================================================
-# TANH GAUSSIAN DISTRIBUTION (Epigraph independent implementation)
-# ============================================================================
+# =============================================================================
+# TanhGaussian distribution
+# =============================================================================
 
 class TanhGaussian:
     """
-    Tanh-Gaussian distribution for bounded continuous actions in [-1, 1].
-    Independent implementation with proper Jacobian correction.
-    
-    CRITICAL: log_prob includes Jacobian determinant correction for tanh transform.
+    tanh(Normal(mean, std)) distribution with log_prob Jacobian correction.
     """
-    def __init__(self, mean, std):
-        """
-        Args:
-            mean: [B, act_dim] - raw mean before tanh
-            std: [B, act_dim] - standard deviation
-        """
+    def __init__(self, mean, log_std, eps=1e-6):
         self.mean = mean
-        self.std = std
-        self.normal = Normal(mean, std)
-    
+        self.log_std = log_std
+        self.std = torch.exp(log_std)
+        self.normal = Normal(mean, self.std)
+        self.eps = eps
+
     def sample(self):
-        """Sample action from tanh-transformed distribution."""
-        # Sample from base normal
-        z = self.normal.rsample()  # reparameterization trick
-        # Apply tanh transform
+        z = self.normal.rsample()
         return torch.tanh(z)
-    
-    def mode(self):
-        """Return deterministic action (mean after tanh)."""
-        return torch.tanh(self.mean)
-    
+
     def log_prob(self, action):
-        """
-        Compute log probability of action under tanh-transformed distribution.
-        
-        CRITICAL FIX: Includes Jacobian correction for tanh transform.
-        
-        Args:
-            action: [B, act_dim] - action in [-1, 1]
-        
-        Returns:
-            log_prob: [B, 1] - sum over action dimensions
-        """
-        # Inverse tanh to get pre-transform value
-        # atanh(y) = 0.5 * log((1+y)/(1-y))
-        eps = 1e-6
-        action_clamped = torch.clamp(action, -1 + eps, 1 - eps)
-        z = 0.5 * torch.log((1 + action_clamped) / (1 - action_clamped))
-        
-        # Log prob of base normal
-        log_prob_normal = self.normal.log_prob(z).sum(dim=-1, keepdim=True)
-        
-        # Jacobian correction for tanh transform
-        # |det(J)| = product of (1 - tanh^2(z_i))
-        # log|det(J)| = sum of log(1 - tanh^2(z_i)) = sum of log(1 - action^2)
-        log_det_jacobian = torch.log(1 - action_clamped ** 2 + eps).sum(dim=-1, keepdim=True)
-        
-        # Final log prob = log p(z) - log|det(J)|
-        return log_prob_normal - log_det_jacobian
-    
+        a = torch.clamp(action, -1 + self.eps, 1 - self.eps)
+        z = 0.5 * torch.log((1 + a) / (1 - a))
+        logp_z = self.normal.log_prob(z)
+        log_det = torch.log(1 - a.pow(2) + self.eps)
+        logp = (logp_z - log_det).sum(dim=-1, keepdim=True)
+        return logp
+
     def entropy(self):
-        """
-        Approximate entropy using base distribution entropy.
-        Exact entropy for tanh-transformed distribution is intractable.
-        """
-        # Use base normal entropy as approximation
-        return self.normal.entropy().sum(dim=-1)
+        ent = 0.5 * (1 + torch.log(2 * torch.tensor(3.141592653589793))) + self.log_std
+        return ent.sum(dim=-1, keepdim=True)
 
 
-# ============================================================================
-# Z ENCODER (Epigraph-specific)
-# ============================================================================
+# =============================================================================
+# Initialization helper
+# =============================================================================
+
+def ortho_init(m, gain=1.0):
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight, gain)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.)
+    return m
+
+
+# =============================================================================
+# ZEncoder
+# =============================================================================
 
 class ZEncoder(nn.Module):
     """
-    Encode scalar z into multi-channel feature representation.
-    From DEF-MARL: (z - mean) / scale -> Linear(1->nz) -> tanh
+    Map scalar z to z_enc vector.
+    z: [B,1] -> z_enc: [B,nz]
     """
-    def __init__(self, nz=8, z_mean=0.0, z_scale=0.2, use_orthogonal=True):
+    def __init__(self, nz, z_mean=0.0, z_scale=0.2):
         super().__init__()
         self.nz = nz
-        self.register_buffer("z_mean", torch.tensor(z_mean, dtype=torch.float32))
-        self.register_buffer("z_scale", torch.tensor(z_scale, dtype=torch.float32))
-        
-        self.fc = nn.Linear(1, nz)
-        init_fn = init_orthogonal if use_orthogonal else init_xavier
-        init_fn(self.fc, gain=1.0)
-    
+        self.z_mean = z_mean
+        self.z_scale = z_scale
+        self.fc = nn.Sequential(
+            ortho_init(nn.Linear(1, nz), 1.0),
+            nn.Tanh(),
+            ortho_init(nn.Linear(nz, nz), 1.0),
+        )
+
     def forward(self, z):
-        """
-        Args:
-            z: [B, 1] or [B] - scalar z values
-        
-        Returns:
-            z_enc: [B, nz] - encoded features
-        """
-        if z.dim() == 1:
-            z = z.unsqueeze(-1)  # [B] -> [B, 1]
-        
-        # Normalize z
-        z_norm = (z - self.z_mean) / self.z_scale
-        
-        # Linear + tanh
-        z_enc = torch.tanh(self.fc(z_norm))
-        return z_enc
+        z_norm = (z - self.z_mean) / (self.z_scale + 1e-8)
+        return self.fc(z_norm)
 
 
-# ============================================================================
-# ACTOR RNN (Epigraph-specific: obs + z_enc)
-# ============================================================================
+# =============================================================================
+# ActorRNN
+# =============================================================================
 
 class ActorRNN(nn.Module):
     """
-    Actor network with RNN for Epigraph.
-    Input: obs_i ⊕ z_enc -> MLP -> RNN -> TanhGaussian
+    Policy π(a|o,z) with dual interfaces:
+    - act_step(): single-step for environment interaction
+    - evaluate_actions_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, obs_dim, act_dim, z_nz, hidden_size=256, 
-                 recurrent_N=1, use_orthogonal=True, gain=0.01):
+    def __init__(self, obs_dim, act_dim, hidden_size, nz, recurrent_N):
         super().__init__()
-        
         self.obs_dim = obs_dim
         self.act_dim = act_dim
-        self.z_nz = z_nz
         self.hidden_size = hidden_size
-        
-        # Input dimension: obs + z_enc
-        in_dim = obs_dim + z_nz
-        
-        # MLP base
-        init_fn = init_orthogonal if use_orthogonal else init_xavier
-        self.fc1 = init_fn(nn.Linear(in_dim, hidden_size), gain=gain)
-        self.fc2 = init_fn(nn.Linear(hidden_size, hidden_size), gain=gain)
-        
-        # RNN layer
-        self.rnn = nn.GRU(hidden_size, hidden_size, num_layers=recurrent_N)
-        for name, param in self.rnn.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.0)
-            elif 'weight' in name:
-                if use_orthogonal:
-                    nn.init.orthogonal_(param)
-                else:
-                    nn.init.xavier_uniform_(param)
-        
-        self.norm = nn.LayerNorm(hidden_size)
-        
-        # Action distribution head
-        self.fc_mean = init_fn(nn.Linear(hidden_size, act_dim), gain=gain)
-        
-        # Learnable log std (initialized to -2.0 for stable exploration)
-        # Clamped to [-20, 2] range as per RMAPPO
-        self.log_std = nn.Parameter(torch.full((act_dim,), -2.0))
-        self.log_std_min = -20.0
-        self.log_std_max = 2.0
-    
-    def forward(self, obs, z_enc, rnn_states, masks, deterministic=False):
+        self.nz = nz
+
+        self.fc1 = ortho_init(nn.Linear(obs_dim + nz, hidden_size), 1.0)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
+        self.fc_mean = ortho_init(nn.Linear(hidden_size, act_dim), 0.01)
+        self.log_std = nn.Parameter(torch.zeros(1, act_dim))
+
+    def _dist_from_latent(self, h):
+        mean = self.fc_mean(h)
+        log_std = self.log_std.expand_as(mean)
+        return TanhGaussian(mean, log_std)
+
+    def act_step(self, obs, z_enc, hxs, masks, deterministic=False):
         """
-        Forward pass through actor network.
+        Single-step acting for rollout/eval.
         
         Args:
-            obs: [B, obs_dim] - agent observation
-            z_enc: [B, z_nz] - encoded z features
-            rnn_states: [B, hidden_size] - RNN hidden states
-            masks: [B, 1] - episode continuation mask
-            deterministic: bool - if True, return mean action
+            obs: [E, obs_dim]
+            z_enc: [E, nz]
+            hxs: [E, H]
+            masks: [E, 1]
         
         Returns:
-            actions: [B, act_dim] - sampled or deterministic actions
-            action_log_probs: [B, 1] - log probabilities
-            rnn_states_out: [B, hidden_size] - updated RNN states
+            action: [E, act_dim]
+            logp: [E, 1]
+            next_h: [E, H]
+            entropy: [E, 1]
         """
-        # Concatenate obs and z_enc
-        x = torch.cat([obs, z_enc], dim=-1)  # [B, obs_dim + z_nz]
-        
-        # MLP base
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN forward
-        # Reshape for GRU: [1, B, hidden_size]
-        x = x.unsqueeze(0)
-        h = rnn_states.unsqueeze(0)
-        
-        # Apply mask to hidden state (episode reset)
-        h = h * masks.unsqueeze(0)
-        
-        # GRU forward
-        x, h = self.rnn(x, h)
-        
-        # Remove sequence dimension
-        x = x.squeeze(0)  # [B, hidden_size]
-        h = h.squeeze(0)  # [B, hidden_size]
-        
-        # Layer normalization
-        x = self.norm(x)
-        
-        # Compute mean and std
-        mean = self.fc_mean(x)  # [B, act_dim]
-        
-        # Clamp log_std to prevent numerical issues
-        log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std_clamped).expand_as(mean)  # [B, act_dim]
-        
-        # Create TanhGaussian distribution
-        dist = TanhGaussian(mean, std)
-        
-        # Sample or get mode
+        x = torch.cat([obs, z_enc], dim=-1)
+        x = F.relu(self.fc1(x))
+        rnn_out, next_h = self.rnn(x, hxs, masks)
+
+        dist = self._dist_from_latent(rnn_out)
         if deterministic:
-            action = dist.mode()
+            action = torch.tanh(dist.mean)
         else:
             action = dist.sample()
-        
-        # Compute log probability
-        action_log_prob = dist.log_prob(action)
-        
-        return action, action_log_prob, h
-    
-    def evaluate_actions(self, obs, z_enc, rnn_states, masks, actions):
+
+        logp = dist.log_prob(action)
+        entropy = dist.entropy()
+        return action, logp, next_h, entropy
+
+    def evaluate_actions_seq(self, obs_seq, z_enc_seq, hxs_init, masks_seq, act_seq):
         """
-        Evaluate actions for PPO update (compute log_prob and entropy).
+        Sequence evaluation for PPO training.
         
         Args:
-            obs: [L*B, obs_dim]
-            z_enc: [L*B, z_nz]
-            rnn_states: [B, hidden_size]
-            masks: [L*B, 1]
-            actions: [L*B, act_dim]
+            obs_seq: [L*B, obs_dim]
+            z_enc_seq: [L*B, nz]
+            hxs_init: [B, H]
+            masks_seq: [L*B, 1]
+            act_seq: [L*B, act_dim]
         
         Returns:
-            action_log_probs: [L*B, 1]
-            dist_entropy: [L*B, 1]
+            logp: [L*B, 1]
+            entropy: [L*B, 1]
+            last_h: [B, H]
         """
-        # Concatenate obs and z_enc
-        x = torch.cat([obs, z_enc], dim=-1)
-        
-        # MLP base
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN sequence processing
-        B = rnn_states.size(0)
-        L = x.size(0) // B
-        
-        x = x.view(L, B, -1)
-        masks_seq = masks.view(L, B, 1)
-        
-        h = rnn_states.unsqueeze(0)
-        
-        outs = []
-        for t in range(L):
-            h = h * masks_seq[t].unsqueeze(0)
-            out_t, h = self.rnn(x[t].unsqueeze(0), h)
-            outs.append(out_t)
-        
-        x = torch.cat(outs, dim=0).reshape(L * B, -1)
-        x = self.norm(x)
-        
-        # Compute mean and std
-        mean = self.fc_mean(x)
-        log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std_clamped).expand_as(mean)
-        
-        # Create distribution
-        dist = TanhGaussian(mean, std)
-        
-        # Evaluate actions
-        action_log_probs = dist.log_prob(actions)
-        dist_entropy = dist.entropy().unsqueeze(-1)  # [L*B, 1]
-        
-        return action_log_probs, dist_entropy
+        x = torch.cat([obs_seq, z_enc_seq], dim=-1)
+        x = F.relu(self.fc1(x))
+        rnn_out, last_h = self.rnn(x, hxs_init, masks_seq)
+
+        dist = self._dist_from_latent(rnn_out)
+        logp = dist.log_prob(act_seq)
+        entropy = dist.entropy()
+        return logp, entropy, last_h
 
 
-# ============================================================================
-# CRITIC Vl RNN (Task value, centralized)
-# ============================================================================
+# =============================================================================
+# CriticVlRNN (centralized performance value)
+# =============================================================================
 
 class CriticVlRNN(nn.Module):
     """
-    Task value function V^l (centralized).
-    Input: share_obs ⊕ global_z_enc -> MLP -> RNN -> V
+    Vl: team performance value with dual interfaces:
+    - value_step(): single-step for rollout
+    - value_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, share_obs_dim, z_nz, hidden_size=256,
-                 recurrent_N=1, use_orthogonal=True, gain=0.01):
+    def __init__(self, share_obs_dim, hidden_size, nz, recurrent_N):
         super().__init__()
-        
         self.share_obs_dim = share_obs_dim
-        self.z_nz = z_nz
         self.hidden_size = hidden_size
-        
-        in_dim = share_obs_dim + z_nz
-        
-        # MLP base
-        init_fn = init_orthogonal if use_orthogonal else init_xavier
-        self.fc1 = init_fn(nn.Linear(in_dim, hidden_size), gain=gain)
-        self.fc2 = init_fn(nn.Linear(hidden_size, hidden_size), gain=gain)
-        
-        # RNN
-        self.rnn = nn.GRU(hidden_size, hidden_size, num_layers=recurrent_N)
-        for name, param in self.rnn.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.0)
-            elif 'weight' in name:
-                if use_orthogonal:
-                    nn.init.orthogonal_(param)
-                else:
-                    nn.init.xavier_uniform_(param)
-        
-        self.norm = nn.LayerNorm(hidden_size)
-        
-        # Value head
-        self.v_out = init_fn(nn.Linear(hidden_size, 1), gain=gain)
-    
-    def forward(self, share_obs, z_enc, rnn_states, masks):
+        self.nz = nz
+
+        self.fc1 = ortho_init(nn.Linear(share_obs_dim + nz, hidden_size), 1.0)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
+        self.fc_value = ortho_init(nn.Linear(hidden_size, 1), 1.0)
+
+    def value_step(self, share_obs, z_enc, hxs, masks):
         """
-        Forward pass through critic Vl.
+        Single-step value prediction for rollout.
         
         Args:
-            share_obs: [B, share_obs_dim] - centralized observation
-            z_enc: [B, z_nz] - global z encoding
-            rnn_states: [B, hidden_size] - RNN hidden states
-            masks: [B, 1] - continuation masks
+            share_obs: [E, share_obs_dim]
+            z_enc: [E, nz]
+            hxs: [E, H]
+            masks: [E, 1]
         
         Returns:
-            values: [B, 1] - task values
-            rnn_states_out: [B, hidden_size] - updated states
+            vl: [E, 1]
+            next_h: [E, H]
         """
         x = torch.cat([share_obs, z_enc], dim=-1)
-        
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN
-        x = x.unsqueeze(0)
-        h = rnn_states.unsqueeze(0)
-        h = h * masks.unsqueeze(0)
-        
-        x, h = self.rnn(x, h)
-        
-        x = x.squeeze(0)
-        h = h.squeeze(0)
-        
-        x = self.norm(x)
-        values = self.v_out(x)
-        
-        return values, h
-    
-    def evaluate_values(self, share_obs, z_enc, rnn_states, masks):
+        x = F.relu(self.fc1(x))
+        rnn_out, next_h = self.rnn(x, hxs, masks)
+        vl = self.fc_value(rnn_out)
+        return vl, next_h
+
+    def value_seq(self, share_obs_seq, z_enc_seq, hxs_init, masks_seq):
         """
-        Evaluate values for sequence (PPO update).
+        Sequence value prediction for PPO training.
         
         Args:
-            share_obs: [L*B, share_obs_dim]
-            z_enc: [L*B, z_nz]
-            rnn_states: [B, hidden_size]
-            masks: [L*B, 1]
+            share_obs_seq: [L*B, share_obs_dim]
+            z_enc_seq: [L*B, nz]
+            hxs_init: [B, H]
+            masks_seq: [L*B, 1]
         
         Returns:
-            values: [L*B, 1]
+            vl: [L*B, 1]
+            last_h: [B, H]
         """
-        x = torch.cat([share_obs, z_enc], dim=-1)
-        
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN sequence processing
-        B = rnn_states.size(0)
-        L = x.size(0) // B
-        
-        x = x.view(L, B, -1)
-        masks_seq = masks.view(L, B, 1)
-        
-        h = rnn_states.unsqueeze(0)
-        
-        outs = []
-        for t in range(L):
-            h = h * masks_seq[t].unsqueeze(0)
-            out_t, h = self.rnn(x[t].unsqueeze(0), h)
-            outs.append(out_t)
-        
-        x = torch.cat(outs, dim=0).reshape(L * B, -1)
-        x = self.norm(x)
-        
-        values = self.v_out(x)
-        return values
+        x = torch.cat([share_obs_seq, z_enc_seq], dim=-1)
+        x = F.relu(self.fc1(x))
+        rnn_out, last_h = self.rnn(x, hxs_init, masks_seq)
+        vl = self.fc_value(rnn_out)
+        return vl, last_h
 
 
-# ============================================================================
-# CRITIC Vh RNN (Safety value, per-agent)
-# ============================================================================
+# =============================================================================
+# CriticVhRNN (per-agent safety value)
+# =============================================================================
 
 class CriticVhRNN(nn.Module):
     """
-    Safety value function V^h (per-agent, decentralized).
-    Input: obs_i ⊕ z_enc_i -> MLP -> RNN -> V
+    Vh: per-agent safety value with dual interfaces:
+    - value_step(): single-step for rollout
+    - value_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, obs_dim, z_nz, hidden_size=256,
-                 recurrent_N=1, use_orthogonal=True, gain=0.01):
+    def __init__(self, obs_dim, hidden_size, nz, recurrent_N):
         super().__init__()
-        
         self.obs_dim = obs_dim
-        self.z_nz = z_nz
         self.hidden_size = hidden_size
-        
-        in_dim = obs_dim + z_nz
-        
-        # MLP base
-        init_fn = init_orthogonal if use_orthogonal else init_xavier
-        self.fc1 = init_fn(nn.Linear(in_dim, hidden_size), gain=gain)
-        self.fc2 = init_fn(nn.Linear(hidden_size, hidden_size), gain=gain)
-        
-        # RNN
-        self.rnn = nn.GRU(hidden_size, hidden_size, num_layers=recurrent_N)
-        for name, param in self.rnn.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.0)
-            elif 'weight' in name:
-                if use_orthogonal:
-                    nn.init.orthogonal_(param)
-                else:
-                    nn.init.xavier_uniform_(param)
-        
-        self.norm = nn.LayerNorm(hidden_size)
-        
-        # Value head
-        self.v_out = init_fn(nn.Linear(hidden_size, 1), gain=gain)
-    
-    def forward(self, obs, z_enc, rnn_states, masks):
+        self.nz = nz
+
+        self.fc1 = ortho_init(nn.Linear(obs_dim + nz, hidden_size), 1.0)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
+        self.fc_value = ortho_init(nn.Linear(hidden_size, 1), 1.0)
+
+    def value_step(self, obs, z_enc, hxs, masks):
         """
-        Forward pass through critic Vh.
+        Single-step value prediction for rollout.
         
         Args:
-            obs: [B, obs_dim] - agent observation
-            z_enc: [B, z_nz] - encoded z (per-agent)
-            rnn_states: [B, hidden_size] - RNN hidden states
-            masks: [B, 1] - continuation masks
+            obs: [E, obs_dim]
+            z_enc: [E, nz]
+            hxs: [E, H]
+            masks: [E, 1]
         
         Returns:
-            values: [B, 1] - safety values
-            rnn_states_out: [B, hidden_size] - updated states
+            vh: [E, 1]
+            next_h: [E, H]
         """
         x = torch.cat([obs, z_enc], dim=-1)
-        
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN
-        x = x.unsqueeze(0)
-        h = rnn_states.unsqueeze(0)
-        h = h * masks.unsqueeze(0)
-        
-        x, h = self.rnn(x, h)
-        
-        x = x.squeeze(0)
-        h = h.squeeze(0)
-        
-        x = self.norm(x)
-        values = self.v_out(x)
-        
-        return values, h
-    
-    def evaluate_values(self, obs, z_enc, rnn_states, masks):
+        x = F.relu(self.fc1(x))
+        rnn_out, next_h = self.rnn(x, hxs, masks)
+        vh = self.fc_value(rnn_out)
+        return vh, next_h
+
+    def value_seq(self, obs_seq, z_enc_seq, hxs_init, masks_seq):
         """
-        Evaluate values for sequence (PPO update).
+        Sequence value prediction for PPO training.
         
         Args:
-            obs: [L*B, obs_dim]
-            z_enc: [L*B, z_nz]
-            rnn_states: [B, hidden_size]
-            masks: [L*B, 1]
+            obs_seq: [L*B, obs_dim]
+            z_enc_seq: [L*B, nz]
+            hxs_init: [B, H]
+            masks_seq: [L*B, 1]
         
         Returns:
-            values: [L*B, 1]
+            vh: [L*B, 1]
+            last_h: [B, H]
         """
-        x = torch.cat([obs, z_enc], dim=-1)
-        
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        
-        # RNN sequence processing
-        B = rnn_states.size(0)
-        L = x.size(0) // B
-        
-        x = x.view(L, B, -1)
-        masks_seq = masks.view(L, B, 1)
-        
-        h = rnn_states.unsqueeze(0)
-        
-        outs = []
-        for t in range(L):
-            h = h * masks_seq[t].unsqueeze(0)
-            out_t, h = self.rnn(x[t].unsqueeze(0), h)
-            outs.append(out_t)
-        
-        x = torch.cat(outs, dim=0).reshape(L * B, -1)
-        x = self.norm(x)
-        
-        values = self.v_out(x)
-        return values
+        x = torch.cat([obs_seq, z_enc_seq], dim=-1)
+        x = F.relu(self.fc1(x))
+        rnn_out, last_h = self.rnn(x, hxs_init, masks_seq)
+        vh = self.fc_value(rnn_out)
+        return vh, last_h
 
 
-# ============================================================================
-# ROOT FINDER (Epigraph-specific)
-# ============================================================================
+# =============================================================================
+# RootFinder (for inference-time safe z solving)
+# =============================================================================
 
 class RootFinder:
     """
-    Batch root finder for solving Vh(o, z) - z = 0.
-    Uses bisection method with vectorized PyTorch operations.
-    From DEF-MARL chandrupatla + root_finder implementation.
+    Binary search to find safe z values.
+    Optional utility for inference.
     """
     def __init__(self, z_min=-0.6, z_max=0.6, max_iter=32, tol=1e-4):
-        """
-        Args:
-            z_min: Lower bound for z search
-            z_max: Upper bound for z search
-            max_iter: Maximum iterations for bisection
-            tol: Convergence tolerance
-        """
         self.z_min = z_min
         self.z_max = z_max
         self.max_iter = max_iter
         self.tol = tol
-    
+
     @torch.no_grad()
-    def solve(self, vh_fn, obs, rnn_states_vh, masks):
+    def solve(self, vh_eval_fn, obs, h_tgt=0.0):
         """
-        Solve for z* such that Vh(obs, z*) - z* = 0 using bisection.
-        
-        Args:
-            vh_fn: Callable - function(z, obs, rnn_states, masks) -> Vh(obs, z)
-            obs: [B, obs_dim] - observations
-            rnn_states_vh: [B, hidden_size] - RNN states for Vh
-            masks: [B, 1] - continuation masks
-        
-        Returns:
-            z_star: [B, 1] - root solutions
+        vh_eval_fn: Callable([B,1] z) -> [B,1] predicted risk Vh
+        obs: not used directly unless vh_eval_fn closes over it
+        h_tgt: safety threshold
         """
-        B = obs.size(0)
         device = obs.device
-        
-        # Initialize bounds
-        a = torch.full((B, 1), self.z_min, device=device)
-        b = torch.full((B, 1), self.z_max, device=device)
-        
-        # Evaluate function at bounds
-        fa = self._eval_residual(vh_fn, a, obs, rnn_states_vh, masks)
-        fb = self._eval_residual(vh_fn, b, obs, rnn_states_vh, masks)
-        
-        # Bisection iteration
-        for i in range(self.max_iter):
-            # Midpoint
-            c = 0.5 * (a + b)
-            fc = self._eval_residual(vh_fn, c, obs, rnn_states_vh, masks)
-            
-            # Check convergence
-            if torch.abs(fc).max() < self.tol:
+        B = obs.shape[0]
+
+        low = torch.full((B, 1), self.z_min, device=device)
+        high = torch.full((B, 1), self.z_max, device=device)
+
+        for _ in range(self.max_iter):
+            mid = 0.5 * (low + high)
+            vh_mid = vh_eval_fn(mid)
+            safe_mask = (vh_mid <= h_tgt)
+            high = torch.where(safe_mask, mid, high)
+            low = torch.where(safe_mask, low, mid)
+
+            if (high - low).abs().max() < self.tol:
                 break
-            
-            # Update bounds based on sign
-            # If fa and fc have same sign, move a to c
-            # Otherwise, move b to c
-            same_sign = (fa * fc) > 0
-            a = torch.where(same_sign, c, a)
-            fa = torch.where(same_sign, fc, fa)
-            b = torch.where(same_sign, b, c)
-            fb = torch.where(same_sign, fb, fc)
-        
-        # Return best estimate
-        z_star = 0.5 * (a + b)
-        return z_star
-    
-    def _eval_residual(self, vh_fn, z, obs, rnn_states_vh, masks):
-        """
-        Evaluate residual function: R(z) = Vh(obs, z) - z
-        
-        Args:
-            vh_fn: Callable
-            z: [B, 1] - z values
-            obs: [B, obs_dim] - observations
-            rnn_states_vh: [B, hidden_size] - RNN states
-            masks: [B, 1] - masks
-        
-        Returns:
-            residual: [B, 1] - Vh(obs, z) - z
-        """
-        vh_values = vh_fn(z, obs, rnn_states_vh, masks)
-        return vh_values - z
+
+        return 0.5 * (low + high)

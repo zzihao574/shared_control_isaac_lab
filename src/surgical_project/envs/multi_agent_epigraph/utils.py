@@ -198,8 +198,26 @@ class StepTracer:
         self.print_every_steps = print_every_steps
         self.max_envs_to_print = max_envs_to_print
 
-    def maybe_print_step(self, env, rewards: Dict, global_step: int, force_print: bool = False):
-        """Print step information if conditions are met."""
+    def maybe_print_step(
+        self,
+        env,
+        r_task: torch.Tensor,        # [num_envs, num_agents]
+        r_safe_cost: torch.Tensor,   # [num_envs, num_agents], >=0
+        z: torch.Tensor,             # [num_envs, num_agents]
+        global_step: int,
+        force_print: bool = False,
+    ):
+        """
+        Print step information with Epigraph decomposition (task/safe/z).
+        
+        Args:
+            env: Environment instance
+            r_task: Task rewards [num_envs, num_agents]
+            r_safe_cost: Safety costs [num_envs, num_agents], non-negative
+            z: Risk budget values [num_envs, num_agents]
+            global_step: Current training step
+            force_print: Force printing regardless of print_every_steps
+        """
         if not self.enable_console_logging:
             return
             
@@ -209,19 +227,38 @@ class StepTracer:
         to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
 
         print("=" * 80)
-        print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D)")
+        print(f"[STEP {global_step}] Four-Zone Safety Monitor (Epigraph)")
         print("=" * 80)
         print(f"Showing first {len(to_show)} of {self.num_envs} environments")
 
+        # 1. Environment state snapshot: trajectory progress, normals, zone classification
         for env_id in to_show:
             self._print_env_snapshot(env, env_id)
 
-        print("\n[REWARDS FOR THIS STEP]")
+        # 2. Reward decomposition display
+        print("\n[REWARD BREAKDOWN THIS STEP]")
         for env_id in to_show:
-            robot_total = rewards["robot"][env_id].item()
-            human_total = rewards["human"][env_id].item()
-            combined_total = robot_total + human_total
-            print(f"  Env {env_id}: Robot: {robot_total:+.3f} | Human: {human_total:+.3f} | Combined: {combined_total:+.3f}")
+            rt_robot  = r_task[env_id, 0].item()
+            rt_human  = r_task[env_id, 1].item()
+            rc_robot  = r_safe_cost[env_id, 0].item()
+            rc_human  = r_safe_cost[env_id, 1].item()
+            print(f"  Env {env_id}:")
+            print(f"    task_reward        robot {rt_robot:+.3f} | human {rt_human:+.3f}")
+            print(f"    safe_cost (>=0)    robot {rc_robot:+.3f} | human {rc_human:+.3f}")
+
+        # 3. Risk budget z
+        print("\n[Z (RISK BUDGET) THIS STEP]")
+        for env_id in to_show:
+            z_robot = z[env_id, 0].item()
+            z_human = z[env_id, 1].item()
+            z_team  = 0.5 * (z_robot + z_human)  # Team average for reference
+            print(f"  Env {env_id}: z_robot={z_robot:.4f} | z_human={z_human:.4f} | z_team(ref)={z_team:.4f}")
+
+        # 4. Agent-level reward decomposition (original detailed breakdown)
+        for env_id in to_show:
+            self._print_agent_rewards(env, env_id, "ROBOT")
+            self._print_agent_rewards(env, env_id, "HUMAN")
+
 
     def _print_env_snapshot(self, env, env_id: int):
         """Print detailed environment state snapshot."""
@@ -389,16 +426,17 @@ def compose_task_safe_from_rc(
     agent: str,
     device,
     num_envs: int,
-    use_time_eff_in_task: bool = False,
+    use_time_eff_in_task: bool = True,
     include_zpenalty_in_safe: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Split single agent's reward_components into (r_task, r_safe).
+    Decompose reward_components into task reward and safety risk for Epigraph training.
     
     Task includes:
-        - Zone A/B/D (excluding B/D inward penalties)
+        - Zone A/B/D (excluding inward penalties)
         - Global: potential, completion, (optional) time_eff
         - Force penalties (already negative)
+        - Awareness: humanaware (robot) / robotaware (human)
         
     Safe includes:
         - Zone C (danger zone)
@@ -414,29 +452,32 @@ def compose_task_safe_from_rc(
         include_zpenalty_in_safe: whether to include z penalty in safety cost
         
     Returns:
-        Tuple of (r_task, r_safe) tensors
+        Tuple of (r_task, r_safe_risk) tensors
     """
     z = lambda k: safe_get_rc(rc, k, device, num_envs)
 
-    # Task: ABD zones (excluding inward) + positive globals + force penalties
+    aware_key = "humanaware" if agent == "robot" else "robotaware"
+
+    # Task quality reward (for training Vl)
     r_task = (
         z(f"zoneA_total_{agent}")
         + z(f"zoneB_gap_{agent}_contrib")
         + z(f"zoneB_surftangent_{agent}_contrib")
         + z(f"zoneD_progress_{agent}_contrib")
         + z(f"zoneD_deviation_{agent}_contrib")
-        + z(f"global_potential_{agent}_contrib")
-        + z(f"global_completion_{agent}_contrib")
+        + z(f"global_potential_{agent}_contrib")      # potential_xxx
+        + z(f"global_completion_{agent}_contrib")     # completion_xxx
         + (z(f"global_timeeff_{agent}_contrib") if use_time_eff_in_task else _zeros(device, num_envs))
-        + z(f"{agent}force_contrib")  # Already negative; directly add as penalty
+        + z(f"{agent}force_contrib")                  # forceeff_xxx
+        + z(f"{aware_key}_contrib")                   # humanaware / robotaware
     )
 
-    # Safe: Zone C + B/D inward + optional zpenalty
-    r_safe = (
+    # Safety risk (for training Vh) - negative values indicating danger
+    r_safe_risk = (
         z(f"zoneC_total_{agent}")
         + z(f"zoneB_inward_{agent}_contrib")
         + z(f"zoneD_inward_{agent}_contrib")
         + (z(f"global_zpenalty_{agent}_contrib") if include_zpenalty_in_safe else _zeros(device, num_envs))
     )
     
-    return r_task, r_safe
+    return r_task, r_safe_risk

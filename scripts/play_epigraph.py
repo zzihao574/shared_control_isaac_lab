@@ -1,345 +1,417 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-play_epigraph.py - Evaluation script for trained Epigraph dual networks
-Features RootFinder integration for z* computation and deterministic policy evaluation.
-Compatible with unified --checkpoint interface for milestone checkpoints.
+Play/Evaluation script for trained Epigraph policies.
+Loads checkpoint and runs evaluation episodes with RootFinder for safe z* computation.
 
-KEY FIX: Added complete eval_step_with_root() function for proper z* solving.
+FIXED: 
+1. Corrected sys.path to use ".." instead of "."
+2. Uses proper RootFinder logic (solve for minimum safe z per agent, then max)
 """
 
 import os
 import sys
-import torch
 import argparse
+import yaml
+import torch
+import numpy as np
+from pathlib import Path
 
-# === Step 1: Parse arguments BEFORE AppLauncher ===
-parser = argparse.ArgumentParser(description="Play trained Epigraph agent.")
-parser.add_argument("--config", type=str, required=True,
-                    help="Path to training YAML config.")
-parser.add_argument("--checkpoint", type=str, required=True,
-                    help="Path to trained checkpoint (.pth) - unified interface.")
-parser.add_argument("--task", type=str,
-                    default="Isaac-Surgical-MARL-Epigraph-v0",
-                    help="Environment task name (must match training).")
-parser.add_argument("--seed", type=str, default=42,
-                    help="Random seed for reproducibility.")
-parser.add_argument("--num_envs", type=int, default=1,
-                    help="Number of parallel environments (forced to 1 for eval).")
+# FIXED: Correct sys.path (use ".." to go up one level from scripts/)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(current_dir, "..")
+sys.path.insert(0, project_root)
 
-# Import AppLauncher and add its args
-from isaaclab.app import AppLauncher
-AppLauncher.add_app_launcher_args(parser)
-args = parser.parse_args()
+from isaaclab.envs import DirectMARLEnvCfg
+from isaaclab_tasks.manager_based.surgical_epigraph import agents as surgical_agents
 
-# === Step 2: Launch Isaac App ===
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
-# === Step 3: Import after Isaac is initialized ===
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-
-from utils.training_helpers_epigraph import TrainingConfiguration
-import gymnasium as gym
-
-# ----------------------------- #
-# Helpers
-# ----------------------------- #
-
-def setup_global_reproducibility(seed: int, strict_determinism: bool = True):
-    """Setup global random seeds for reproducibility."""
-    import random
-    import numpy as np
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Evaluate trained Epigraph policy")
     
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to checkpoint file (.pt)"
+    )
+    parser.add_argument(
+        "--num_episodes",
+        type=int,
+        default=10,
+        help="Number of episodes to evaluate"
+    )
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help="Number of parallel environments (default: 1 for visualization)"
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Enable rendering/visualization"
+    )
+    parser.add_argument(
+        "--record_video",
+        action="store_true",
+        help="Record video of evaluation"
+    )
+    parser.add_argument(
+        "--video_dir",
+        type=str,
+        default="./videos",
+        help="Directory to save videos"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Device to run on (cuda:0, cpu, etc.)"
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic policy (no exploration noise)"
+    )
+    parser.add_argument(
+        "--use_root_finder",
+        action="store_true",
+        default=True,
+        help="Use RootFinder to compute safe z* (default: True)"
+    )
+    parser.add_argument(
+        "--z_fixed",
+        type=float,
+        default=None,
+        help="If set, use fixed z value instead of RootFinder"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed step information"
+    )
     
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    
-    if strict_determinism:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    print(f"[SETUP] Global seed set to: {seed}")
+    return parser.parse_args()
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device):
+def load_config(checkpoint_path: str):
     """
-    Load trained Epigraph checkpoint.
-    
-    Checkpoint contains:
-        - human_actor, human_critic_vl, human_critic_vh
-        - robot_actor, robot_critic_vl, robot_critic_vh
-        - z_encoder (shared)
-        - optim_state, rng_state, counters (optional, ignored for play)
-    
-    Returns:
-        checkpoint: Dictionary with network states
+    Load configuration from checkpoint directory.
+    Assumes config YAML is in same directory as checkpoint.
     """
-    print(f"[LOAD] Loading checkpoint: {checkpoint_path}")
+    checkpoint_dir = os.path.dirname(checkpoint_path)
     
-    # PyTorch 2.6+ requires weights_only=False for checkpoints with RNG states
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Try to find config file
+    possible_config_names = [
+        "training_params_epigraph.yaml",
+        "config.yaml",
+        "env_config.yaml"
+    ]
     
-    # Check for required keys
-    required_keys = {
-        "z_encoder",
-        "critic_vl",
-    }
+    config_path = None
+    for config_name in possible_config_names:
+        candidate = os.path.join(checkpoint_dir, config_name)
+        if os.path.exists(candidate):
+            config_path = candidate
+            break
     
-    # Check for per-agent keys
-    agents = ["human", "robot"]
-    for agent in agents:
-        required_keys.add(f"actor_{agent}")
-        required_keys.add(f"critic_vh_{agent}")
+    # Fallback: look in agents directory
+    if config_path is None:
+        agents_dir = os.path.join(project_root, "isaaclab_tasks", "manager_based", "surgical_epigraph", "agents")
+        config_path = os.path.join(agents_dir, "training_params_epigraph.yaml")
     
-    if not required_keys.issubset(ckpt.keys()):
-        raise KeyError(
-            f"Checkpoint missing required keys. Expected: {required_keys}\n"
-            f"Found: {list(ckpt.keys())[:20]}..."
-        )
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Could not find config YAML. Tried: {possible_config_names}")
     
-    print("[LOAD] Successfully loaded checkpoint")
+    print(f"[PLAY] Loading config from: {config_path}")
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
     
-    # Optional metadata logging
-    for k in ("global_step", "episodes_done"):
-        if k in ckpt:
-            print(f"[INFO] {k}: {ckpt[k]}")
-    
-    return ckpt
+    return config
 
 
-def create_trainer_from_checkpoint(env, config, ckpt, device):
+def create_env(config: dict, num_envs: int, render: bool, device: str):
+    """Create evaluation environment."""
+    from isaaclab_tasks.manager_based.surgical_epigraph.surgical_epigraph_env_cfg import SurgicalEpigraphEnvCfg
+    
+    # Create environment config
+    env_cfg = SurgicalEpigraphEnvCfg()
+    env_cfg.scene.num_envs = num_envs
+    
+    # Inject configuration
+    env_cfg.params = config
+    
+    # Create environment
+    from isaaclab_tasks.manager_based.surgical_epigraph.surgical_epigraph_env import SurgicalEpigraphEnv
+    
+    env = SurgicalEpigraphEnv(cfg=env_cfg, render_mode="human" if render else None)
+    
+    # Inject params to unwrapped env as well
+    if hasattr(env, 'unwrapped'):
+        env.unwrapped.params = config
+    
+    print(f"[PLAY] Environment created: {num_envs} envs")
+    return env
+
+
+def create_trainer(env, config: dict, device: str):
+    """Create trainer (for loading networks only, no training)."""
+    from isaaclab_tasks.manager_based.surgical_epigraph.agents.trainer import EpigraphTrainer
+    
+    algo_cfg = config["algorithms"]["rmappo"]
+    epi_cfg = config["epigraph"]
+    
+    trainer = EpigraphTrainer(
+        env=env,
+        device=torch.device(device),
+        algo_cfg=algo_cfg,
+        epi_cfg=epi_cfg
+    )
+    
+    print(f"[PLAY] Trainer created")
+    return trainer
+
+
+def evaluate_policy(
+    trainer,
+    env,
+    num_episodes: int,
+    deterministic: bool,
+    use_root_finder: bool,
+    z_fixed: float = None,
+    verbose: bool = False
+):
     """
-    Create EpigraphTrainer and load checkpoint weights.
-    """
-    # Import trainer
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "surgical_project", "algorithms", "marl", "epigraph"))
-        from trainer import EpigraphTrainer
-        
-        # Create trainer
-        trainer = EpigraphTrainer(
-            env=env,
-            device=device,
-            algo_cfg=config.params["algorithms"]["rmappo"],  # Reuse rmappo config
-            epi_cfg=config.params["epigraph"],  # Epigraph-specific config
-        )
-        
-        # Load network weights
-        trainer.z_encoder.load_state_dict(ckpt["z_encoder"])
-        trainer.critic_vl.load_state_dict(ckpt["critic_vl"])
-        
-        for agent in ["human", "robot"]:
-            trainer.actors[agent].load_state_dict(ckpt[f"actor_{agent}"])
-            trainer.critics_vh[agent].load_state_dict(ckpt[f"critic_vh_{agent}"])
-        
-        # Set eval mode
-        trainer.set_eval_mode()
-        
-        print("[LOAD] Trainer created and weights loaded")
-        return trainer
-        
-    except ImportError as e:
-        print(f"[ERROR] Could not import EpigraphTrainer: {e}")
-        print("[INFO] Using placeholder - evaluation will not work correctly")
-        return None
-
-
-# ----------------------------- #
-# Evaluation Step with Root Finding
-# ----------------------------- #
-
-@torch.no_grad()
-def eval_step_with_root(trainer, obs):
-    """
-    Single evaluation step with root finding for z*.
-    
-    Process:
-    1. For each agent, solve Vh(o_i, z*) - z* = 0 to get z_i*
-    2. Compute z_global = max(z_i*) across agents
-    3. Use z_global for all actors to get deterministic actions
+    Evaluate trained policy.
     
     Args:
-        trainer: EpigraphTrainer instance
-        obs: Dict[agent, [B, obs_dim]] - observations
+        trainer: EpigraphTrainer with loaded checkpoint
+        env: Environment
+        num_episodes: Number of episodes to run
+        deterministic: Use deterministic actions
+        use_root_finder: Use RootFinder to compute safe z*
+        z_fixed: If set, use this fixed z value
+        verbose: Print step information
     
     Returns:
-        actions: Dict[agent, [B, act_dim]] - actions
-        z_global: [B, 1] - global z value
+        eval_stats: Dictionary of evaluation statistics
     """
-    masks_ones = torch.ones(trainer.num_envs, 1, device=trainer.device)
-    z_stars = []
+    trainer.set_eval_mode()
     
-    # ========== 1) Solve z* for each agent ==========
-    for agent in trainer.agent_ids:
-        # Define Vh function for root finding
-        def vh_fn(z, obs_a, rnn_a, mask_a):
-            """Wrapper function for Vh(obs, z)."""
-            z_enc = trainer.z_encoder(z)  # [B, nz]
-            vh, _ = trainer.critics_vh[agent](obs_a, z_enc, rnn_a, mask_a)
-            return vh
+    episode_returns = []
+    episode_lengths = []
+    episode_successes = []
+    z_values = []
+    safety_violations = []
+    
+    print(f"\n[PLAY] Starting evaluation: {num_episodes} episodes")
+    print(f"[PLAY] Deterministic: {deterministic}, RootFinder: {use_root_finder}, z_fixed: {z_fixed}")
+    
+    for episode in range(num_episodes):
+        obs, _ = env.reset()
+        trainer._init_rnn_states()
         
-        # Solve Vh(o, z*) - z* = 0
-        z_star = trainer.root_finder.solve(
-            vh_fn,
-            obs[agent],
-            trainer.rnn_states[agent]["vh"],
-            masks_ones
-        )
-        z_stars.append(z_star)
-    
-    # ========== 2) Compute global z = max(z_i*) ==========
-    z_global = torch.max(torch.stack(z_stars, dim=0), dim=0)[0]  # [B, 1]
-    z_enc_global = trainer.z_encoder(z_global)
-    
-    # ========== 3) Get deterministic actions with shared z_global ==========
-    actions = {}
-    for agent in trainer.agent_ids:
-        # Deterministic action from actor
-        a, _, h_next = trainer.actors[agent](
-            obs[agent],
-            z_enc_global,
-            trainer.rnn_states[agent]["actor"],
-            masks_ones,
-            deterministic=True
-        )
+        episode_return = 0.0
+        episode_length = 0
+        episode_violations = 0
+        done = False
         
-        # Update RNN state
-        trainer.rnn_states[agent]["actor"] = h_next
-        actions[agent] = a
+        if verbose:
+            print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
+        
+        while not done and episode_length < 2000:
+            # ========== Compute z* ==========
+            if z_fixed is not None:
+                # Use fixed z
+                z_global = torch.full((env.num_envs, 1), z_fixed, device=trainer.device)
+            elif use_root_finder:
+                # FIXED: Use RootFinder to solve for safe z* per agent, then max
+                z_stars = []
+                for agent in trainer.agent_ids:
+                    z_i_star = trainer._solve_safe_z_for_agent(
+                        critic_vh=trainer.critics_vh[agent],
+                        obs=obs[agent],
+                        rnn_state=trainer.rnn_states[agent]["vh"],
+                        h_tgt=0.0  # Safety threshold
+                    )
+                    z_stars.append(z_i_star)
+                
+                # Take maximum across agents
+                z_global = torch.max(torch.stack(z_stars, dim=0), dim=0)[0]
+            else:
+                # Random z
+                z_global = torch.rand(env.num_envs, 1, device=trainer.device) * \
+                           (trainer.z_max - trainer.z_min) + trainer.z_min
+            
+            z_values.append(z_global.mean().item())
+            
+            # ========== Encode z (shared by all agents) ==========
+            z_enc_global = trainer.z_encoder(z_global)
+            
+            # ========== Actor forward ==========
+            actions = {}
+            for agent in trainer.agent_ids:
+                obs_agent = obs[agent]
+                masks = torch.ones(env.num_envs, 1, device=trainer.device)
+                
+                act, _, rnn_h = trainer.actors[agent](
+                    obs_agent, z_enc_global,  # All agents use shared z_global
+                    trainer.rnn_states[agent]["actor"],
+                    masks,
+                    deterministic=deterministic
+                )
+                
+                actions[agent] = act
+                trainer.rnn_states[agent]["actor"] = rnn_h
+            
+            # ========== Step environment ==========
+            obs, rewards, terminated, truncated, info = env.step(actions)
+            
+            # Accumulate statistics
+            for agent in trainer.agent_ids:
+                episode_return += rewards[agent].mean().item()
+            episode_length += 1
+            
+            # Check safety violations
+            if "is_violating" in info:
+                episode_violations += info["is_violating"].sum().item()
+            
+            # Verbose logging
+            if verbose and episode_length % 50 == 0:
+                print(f"  Step {episode_length}: z={z_global.mean().item():.4f}, "
+                      f"return={episode_return:.2f}")
+            
+            # Check done
+            done_any = torch.zeros(env.num_envs, dtype=torch.bool, device=trainer.device)
+            for agent in trainer.agent_ids:
+                agent_done = terminated[agent] | truncated[agent]
+                if agent_done.dim() > 1:
+                    agent_done = agent_done.squeeze(-1)
+                done_any |= agent_done
+            
+            if done_any.any():
+                done = True
+        
+        # Episode statistics
+        episode_returns.append(episode_return)
+        episode_lengths.append(episode_length)
+        safety_violations.append(episode_violations)
+        
+        # Check success (if task completed)
+        if "progress_ratio" in info:
+            progress = info["progress_ratio"].mean().item()
+            episode_successes.append(1.0 if progress >= 0.95 else 0.0)
+        else:
+            episode_successes.append(0.0)
+        
+        print(f"[PLAY] Episode {episode + 1}: return={episode_return:.2f}, "
+              f"length={episode_length}, violations={episode_violations}, "
+              f"z_mean={np.mean(z_values[-episode_length:]):.4f}")
     
-    return actions, z_global
+    # Aggregate statistics
+    eval_stats = {
+        "return_mean": np.mean(episode_returns),
+        "return_std": np.std(episode_returns),
+        "return_min": np.min(episode_returns),
+        "return_max": np.max(episode_returns),
+        "episode_length_mean": np.mean(episode_lengths),
+        "episode_length_std": np.std(episode_lengths),
+        "success_rate": np.mean(episode_successes),
+        "safety_violations_mean": np.mean(safety_violations),
+        "safety_violations_total": np.sum(safety_violations),
+        "z_mean": np.mean(z_values),
+        "z_std": np.std(z_values),
+        "z_min": np.min(z_values),
+        "z_max": np.max(z_values),
+    }
+    
+    return eval_stats
 
 
-# ----------------------------- #
-# Main
-# ----------------------------- #
+def print_eval_summary(stats: dict):
+    """Print evaluation summary."""
+    print("\n" + "=" * 60)
+    print("EVALUATION SUMMARY")
+    print("=" * 60)
+    print(f"Episodes:              {len(stats)}")
+    print(f"Return (mean ± std):   {stats['return_mean']:.2f} ± {stats['return_std']:.2f}")
+    print(f"Return (min/max):      {stats['return_min']:.2f} / {stats['return_max']:.2f}")
+    print(f"Episode length:        {stats['episode_length_mean']:.1f} ± {stats['episode_length_std']:.1f}")
+    print(f"Success rate:          {stats['success_rate']:.2%}")
+    print(f"Safety violations:     {stats['safety_violations_mean']:.1f} (total: {stats['safety_violations_total']:.0f})")
+    print(f"Z values:              {stats['z_mean']:.4f} ± {stats['z_std']:.4f}")
+    print(f"Z range:               [{stats['z_min']:.4f}, {stats['z_max']:.4f}]")
+    print("=" * 60 + "\n")
+
 
 def main():
-    print("=" * 80)
-    print("Epigraph Dual Network Evaluation with RootFinder")
-    print("=" * 80)
-
-    # Force single environment for evaluation
-    args.num_envs = 1
-    print(f"[SETUP] num_envs set to: {args.num_envs}")
-
-    # Load configuration
-    print(f"[SETUP] Loading config from: {args.config}")
-    config = TrainingConfiguration.from_yaml(args.config)
-    print(f"[SETUP] Config loaded successfully")
-
-    setup_global_reproducibility(args.seed, strict_determinism=True)
-
-    # Device setup
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[SETUP] Using device: {device}")
-
+    """Main evaluation function."""
+    args = parse_args()
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    print("\n" + "=" * 60)
+    print("EPIGRAPH POLICY EVALUATION")
+    print("=" * 60)
+    print(f"Checkpoint:     {args.checkpoint}")
+    print(f"Num episodes:   {args.num_episodes}")
+    print(f"Num envs:       {args.num_envs}")
+    print(f"Device:         {args.device}")
+    print(f"Seed:           {args.seed}")
+    print("=" * 60 + "\n")
+    
+    # Check checkpoint exists
+    if not os.path.exists(args.checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    
+    # Load config
+    config = load_config(args.checkpoint)
+    
     # Create environment
-    print(f"[SETUP] Creating environment: {args.task}")
-    env = gym.make(args.task, num_envs=args.num_envs)
-    print(f"[SETUP] Environment created successfully")
+    env = create_env(config, args.num_envs, args.render, args.device)
     
-    # Inject config into environment
-    if hasattr(env.unwrapped, "params"):
-        env.unwrapped.params = config.params
-        print(f"[SETUP] Config injected into environment")
-
+    # Create trainer
+    trainer = create_trainer(env, config, args.device)
+    
     # Load checkpoint
-    ckpt = load_checkpoint(args.checkpoint, device)
+    print(f"[PLAY] Loading checkpoint from: {args.checkpoint}")
+    trainer.load_checkpoint(args.checkpoint)
     
-    # Create trainer and load weights
-    trainer = create_trainer_from_checkpoint(env, config, ckpt, device)
+    # Evaluate
+    eval_stats = evaluate_policy(
+        trainer=trainer,
+        env=env,
+        num_episodes=args.num_episodes,
+        deterministic=args.deterministic,
+        use_root_finder=args.use_root_finder,
+        z_fixed=args.z_fixed,
+        verbose=args.verbose
+    )
     
-    if trainer is None:
-        print("[ERROR] Failed to create trainer - cannot proceed with evaluation")
-        return
-
-    # === Reset environment ===
-    print(f"[RESET] Resetting environment...")
-    obs, _ = env.reset()
-    print(f"[RESET] Environment reset complete")
-    try:
-        print(f"[RESET] Observation keys: {list(obs.keys())}")
-        obs_shapes = {k: v.shape for k, v in obs.items()}
-        print(f"[RESET] Observation shapes: {obs_shapes}")
-    except Exception:
-        pass
-
-    # === Evaluation loop ===
-    print(f"\n[EVAL] Starting evaluation loop with RootFinder...")
-    total_return = 0.0
-    steps = 0
-    max_steps = 2000
+    # Print summary
+    print_eval_summary(eval_stats)
     
-    z_global_values = []
-
-    print("\n" + "=" * 80)
-    print("Starting evaluation...")
-    print("=" * 80 + "\n")
-
-    while simulation_app.is_running() and (max_steps <= 0 or steps < max_steps):
-        # ============ EPIGRAPH-SPECIFIC: Solve for z* using RootFinder ============
-        actions, z_global = eval_step_with_root(trainer, obs)
-        z_global_values.append(z_global.mean().item())
-        
-        if steps % 100 == 0:
-            print(f"[Step {steps}] z_global={z_global[0].item():.4f}")
-        
-        # ============ Step environment ============
-        obs, rewards, terminated, truncated, info = env.step(actions)
-
-        # Average reward across agents
-        avg_reward = sum(rewards[aid].item() for aid in ["human", "robot"]) / 2.0
-        total_return += avg_reward
-        steps += 1
-
-        if steps % 100 == 0:
-            print(f"[Step {steps}] Return so far: {total_return:.3f}")
-
-        # Check done
-        done = any(terminated[aid].item() or truncated[aid].item() 
-                  for aid in ["human", "robot"])
-        if done:
-            print(f"\n[DONE] Episode terminated at step {steps}")
-            break
-
-    # === Final score ===
-    final_score = total_return * 1000.0 / max(1, steps)
-    z_global_mean = sum(z_global_values) / len(z_global_values) if z_global_values else 0.0
-
-    print("\n" + "=" * 80)
-    print("EVALUATION RESULTS")
-    print("=" * 80)
-    print(f"Total Steps    : {steps}")
-    print(f"Total Return   : {total_return:.3f}")
-    print(f"Final Score    : {final_score:.2f}   (total_return * 1000 / steps)")
-    print(f"Avg Return/Step: {total_return / max(1, steps):.4f}")
-    print(f"Z Global Mean  : {z_global_mean:.4f}")
-    print("=" * 80 + "\n")
-
+    # Save results
+    results_dir = os.path.dirname(args.checkpoint)
+    results_path = os.path.join(results_dir, "eval_results.yaml")
+    
+    with open(results_path, 'w') as f:
+        yaml.dump(eval_stats, f, default_flow_style=False)
+    print(f"[PLAY] Results saved to: {results_path}")
+    
+    # Close environment
     env.close()
+    
+    print("\n[PLAY] Evaluation complete!")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("\n" + "=" * 80)
-        print("ERROR OCCURRED")
-        print("=" * 80)
-        print(f"Exception type   : {type(e).__name__}")
-        print(f"Exception message: {str(e)}")
-        print("\nFull traceback:")
-        import traceback
-        traceback.print_exc()
-        print("=" * 80 + "\n")
-    finally:
-        print("[CLEANUP] Closing simulation app...")
-        simulation_app.close()
-        print("[CLEANUP] Done")
+    main()
