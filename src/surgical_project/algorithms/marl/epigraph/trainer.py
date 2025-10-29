@@ -14,6 +14,7 @@ ROUTE B MODIFICATIONS:
 """
 
 import os
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,26 +27,11 @@ import traceback
 from .epigraph_core import ZEncoder, ActorRNN, CriticVlRNN, CriticVhRNN, RootFinder
 from .rollout_buffer_z import RolloutBufferZ
 
-
-# Import training helpers
-try:
-    from scripts.utils.training_helpers_epigraph import (
-        summarize_rollout_stats,
-        summarize_eval_stats,
-        WandBLogger,
-    )
-except ImportError:
-    try:
-        from surgical_project.scripts.utils.training_helpers_epigraph import (
-            summarize_rollout_stats,
-            summarize_eval_stats,
-            WandBLogger,
-        )
-    except ImportError:
-        print("[WARNING] Could not import training_helpers_epigraph, some features may be limited")
-        summarize_rollout_stats = None
-        summarize_eval_stats = None
-        WandBLogger = None
+from scripts.utils.training_helpers_epigraph import (
+    summarize_rollout_stats,
+    summarize_eval_stats,
+    WandBLogger,
+)
 
 
 def init_z_global(num_envs: int, z_min: float, z_max: float, device, mode: str = "mixed", p_extreme: float = 0.3):
@@ -157,6 +143,12 @@ class EpigraphTrainer:
         self.z_init_mode = epi_cfg["z"]["init"]["mode"]
         self.z_init_p_extreme = epi_cfg["z"]["init"]["p_extreme"]
         self.lambda_safe = epi_cfg["losses"]["lambda_safe"]
+
+        constraints_cfg = full_config.get("constraints", {})
+        self.max_forces = {
+            "robot": float(constraints_cfg.get("max_robot_force", 1.0)),
+            "human": float(constraints_cfg.get("max_human_force", 1.0)),
+        }
         
         # Build networks, buffer, optimizers
         self._build_networks()
@@ -168,6 +160,10 @@ class EpigraphTrainer:
         self.global_step = 0
         self.global_episodes = 0
         self.episodes_done = 0  # Legacy name for compatibility
+
+        train_seed = int(full_config.get("training", {}).get("seed", 42))
+        self._train_generator = torch.Generator(device="cpu")
+        self._train_generator.manual_seed(train_seed + 424242)
         
         # Milestone tracking (Route B)
         milestone_episodes = full_config.get("training_monitor", {}).get("milestone_episodes", [])
@@ -188,6 +184,11 @@ class EpigraphTrainer:
                 print("[TRAINER] WandB logger initialized")
             else:
                 print("[TRAINER] WandB logger disabled")
+
+        lr_decay_cfg = full_config.get("training", {}).get("lr_decay", {})
+        self.lr_decay_enabled = bool(lr_decay_cfg.get("enabled", False))
+        self.lr_final_factor = float(lr_decay_cfg.get("final_factor", 0.1))
+        self.global_update_step = 0
 
         self._cached_obs = None
         self._cached_z = None
@@ -275,6 +276,12 @@ class EpigraphTrainer:
                 lr=self.algo_cfg["critic_lr"],
                 eps=self.algo_cfg["opt_eps"]
             )
+
+        self.actor_lr_init = self.optimizer_actor.param_groups[0]["lr"]
+        self.vl_lr_init = self.optimizer_vl.param_groups[0]["lr"]
+        self.vh_lr_init = {
+            agent: opt.param_groups[0]["lr"] for agent, opt in self.optimizers_vh.items()
+        }
         
     def _init_rnn_states(self):
         """Initialize RNN hidden states."""
@@ -292,6 +299,91 @@ class EpigraphTrainer:
         self._cached_obs = None
         self._cached_z = None
         self._cached_masks = None
+
+    def _scale_actions(self, actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Scale normalized actions to physical force limits."""
+        scaled = {}
+        for agent in self.agent_ids:
+            limit = float(self.max_forces.get(agent, 1.0))
+            scaled[agent] = actions[agent] * limit
+        return scaled
+
+    def _check_milestone_crossed(self, future_episodes: int):
+        """Return the next milestone if crossed by future episode count."""
+        if not self.milestones:
+            return None
+        if future_episodes >= self.milestones[0]:
+            return self.milestones[0]
+        return None
+
+    def _maybe_decay_lr(self, update_idx: int):
+        """Apply cosine LR decay to all optimizers."""
+        if not self.lr_decay_enabled:
+            return
+
+        progress = min(1.0, update_idx / 1000.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        actor_min = self.actor_lr_init * self.lr_final_factor
+        actor_lr = actor_min + (self.actor_lr_init - actor_min) * cosine
+        for pg in self.optimizer_actor.param_groups:
+            pg["lr"] = actor_lr
+
+        vl_min = self.vl_lr_init * self.lr_final_factor
+        vl_lr = vl_min + (self.vl_lr_init - vl_min) * cosine
+        for pg in self.optimizer_vl.param_groups:
+            pg["lr"] = vl_lr
+
+        for agent, opt in self.optimizers_vh.items():
+            base_lr = self.vh_lr_init[agent]
+            min_lr = base_lr * self.lr_final_factor
+            current_lr = min_lr + (base_lr - min_lr) * cosine
+            for pg in opt.param_groups:
+                pg["lr"] = current_lr
+
+    def _log_rollout_stats(self, step: int, stats: Dict[str, float]):
+        """Log rollout statistics to WandB with epigraph-specific keys."""
+        if self.wandb_logger is None or not getattr(self.wandb_logger, "enabled", False):
+            return
+
+        payload = {
+            "rollout/avg_task_return": stats.get("avg_episode_task_return"),
+            "rollout/avg_safe_cost": stats.get("avg_episode_safe_cost_sum"),
+            "rollout/avg_combined_return": stats.get("avg_episode_combined_return"),
+            "rollout/episodes_finished": stats.get("episodes_finished"),
+            "epigraph/unsafe_step_ratio": stats.get("unsafe_step_ratio"),
+            "epigraph/progress_ratio": stats.get("avg_progress_ratio"),
+            "epigraph/z_mean_rollout": stats.get("z_mean"),
+            "epigraph/z_std_rollout": stats.get("z_std"),
+        }
+
+        for agent in self.agent_ids:
+            key_suffix = agent.replace(" ", "_")
+            payload[f"rollout/task_mean_{key_suffix}"] = stats.get(f"r_task_mean_{key_suffix}")
+            payload[f"rollout/safe_cost_mean_{key_suffix}"] = stats.get(f"r_safe_cost_mean_{key_suffix}")
+            payload[f"epigraph/z_mean_{key_suffix}"] = stats.get(f"avg_z_{key_suffix}")
+
+        cleaned = {k: v for k, v in payload.items() if v is not None}
+        if cleaned:
+            self.wandb_logger.log_rollout(step, cleaned)
+
+    def _log_update_stats(self, step: int, stats: Dict[str, float]):
+        """Log update statistics to WandB."""
+        if self.wandb_logger is None or not getattr(self.wandb_logger, "enabled", False):
+            return
+
+        payload = {
+            "train/loss_policy": stats.get("loss_policy"),
+            "train/loss_value_vl": stats.get("loss_value_vl"),
+            "train/loss_value_vh": stats.get("loss_value_vh"),
+            "train/entropy": stats.get("entropy"),
+            "train/approx_kl": stats.get("approx_kl"),
+            "train/clipfrac": stats.get("clipfrac"),
+            "epigraph/lambda_safe": self.lambda_safe,
+        }
+        cleaned = {k: v for k, v in payload.items() if v is not None}
+        if cleaned:
+            self.wandb_logger.log_update(step, cleaned)
 
         
     def _flatten_per_agent(self, per_agent_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -360,6 +452,7 @@ class EpigraphTrainer:
             rollout_stats: Dictionary with statistics for logging
         """
         self.set_eval_mode()
+        actual_env = getattr(self.env, "unwrapped", self.env)
 
         if self._needs_env_reset or self._cached_obs is None:
             obs, _ = self.env.reset()
@@ -379,7 +472,6 @@ class EpigraphTrainer:
             else:
                 masks = torch.ones(self.num_envs, 1, device=self.device)
 
-        # Episode-level bookkeeping for logging
         episode_returns_task = []
         episode_returns_safe = []
         episode_lengths = []
@@ -387,71 +479,79 @@ class EpigraphTrainer:
         current_returns_safe = torch.zeros(self.num_envs, device=self.device)
         current_lengths = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
-        # Track z values and violations for rollout stats
         z_values_rollout = []
         violations_rollout = []
 
-        for t in range(self.rollout_horizon):
-            # Encode z for all envs (shared z is broadcast to all agents)
-            z_enc = self.z_encoder(z_global)  # [E, nz]
+        episodes_window = 0
+        evaluation_done_this_rollout = False
+
+        for _ in range(self.rollout_horizon):
+            z_enc = self.z_encoder(z_global)
             z_values_rollout.append(z_global.clone())
 
-            # Act for each agent
             actions = {}
             action_log_probs = {}
             for agent in self.agent_ids:
                 act, logp, next_h_actor, _ = self.actors[agent].act_step(
-                    obs[agent],                        # [E, obs_dim]
-                    z_enc,                             # [E, nz]
-                    self.rnn_states[agent]["actor"],   # [E, H]
-                    masks,                             # [E, 1]
-                    deterministic=False
+                    obs[agent],
+                    z_enc,
+                    self.rnn_states[agent]["actor"],
+                    masks,
+                    deterministic=False,
                 )
                 actions[agent] = act
                 action_log_probs[agent] = logp
                 self.rnn_states[agent]["actor"] = next_h_actor
 
-            # Centralized Vl critic uses concatenated obs from all agents
-            share_obs = self._get_share_obs(obs)  # [E, A*obs_dim]
+            env_actions = self._scale_actions(actions)
+            detail_payload = {
+                "applied_forces": {aid: env_actions[aid].clone() for aid in self.agent_ids},
+                "mean_actions": {aid: env_actions[aid].clone() for aid in self.agent_ids},
+                "noise_actions": {aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids},
+                "deterministic": False,
+            }
+            if hasattr(actual_env, "set_detail_actor_info"):
+                actual_env.set_detail_actor_info(detail_payload)
+
+            actual_env._last_z_snapshot = z_global.clone().detach()
+
+            share_obs = self._get_share_obs(obs)
             vl, next_h_vl = self.critic_vl.value_step(
-                share_obs,            # [E, share_obs_dim]
-                z_enc,                # [E, nz]
-                self.rnn_states_vl,   # [E, H]
-                masks                 # [E, 1]
+                share_obs,
+                z_enc,
+                self.rnn_states_vl,
+                masks,
             )
             self.rnn_states_vl = next_h_vl
 
-            # Per-agent Vh critics
             vh = {}
             for agent in self.agent_ids:
                 vh_val, next_h_vh = self.critics_vh[agent].value_step(
-                    obs[agent],                      # [E, obs_dim]
-                    z_enc,                           # [E, nz]
-                    self.rnn_states[agent]["vh"],    # [E, H]
-                    masks                            # [E, 1]
+                    obs[agent],
+                    z_enc,
+                    self.rnn_states[agent]["vh"],
+                    masks,
                 )
                 vh[agent] = vh_val
                 self.rnn_states[agent]["vh"] = next_h_vh
 
-            # Env step
-            obs_next, rewards, terminated, truncated, info = self.env.step(actions)
+            rnn_states_snapshot = {
+                "vl": self.rnn_states_vl.clone(),
+                "vh": {agent: self.rnn_states[agent]["vh"].clone() for agent in self.agent_ids},
+            }
 
-            # Pull training signals (dicts keyed by agent)
-            r_task = info["r_task"]   # {agent: [E,1]} task part for Vl
-            r_safe = info["r_safe"]   # {agent: [E,1]} safety cost part for Vh
+            obs_next, rewards, terminated, truncated, info = self.env.step(env_actions)
 
-            # Team reward = average over agents (shape [E,1])
+            r_task = info["r_task"]
+            r_safe = info["r_safe"]
             r_team = sum(r_task[a] for a in self.agent_ids) / self.num_agents
 
-            # Track violations if available
             if "is_violating" in info and info["is_violating"] is not None:
                 violations_rollout.append(info["is_violating"])
 
-            # Figure out which envs ended this step
             term_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
             trunc_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
             done_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
-
             for agent in self.agent_ids:
                 term_a = terminated[agent] if terminated[agent].dim() == 2 else terminated[agent].unsqueeze(-1)
                 trunc_a = truncated[agent] if truncated[agent].dim() == 2 else truncated[agent].unsqueeze(-1)
@@ -459,67 +559,12 @@ class EpigraphTrainer:
                 trunc_any_env |= trunc_a
                 done_any_env |= (term_a | trunc_a)
 
-            # Masks used for PPO/RNN:
-            masks_flat_t = masks.repeat(self.num_agents, 1)  # [N,1] (N=E*A)
-            term_mask_env = (~term_any_env).float()          # [E,1]
-            term_masks_flat_t = term_mask_env.repeat(self.num_agents, 1)  # [N,1]
+            masks_flat_t = masks.repeat(self.num_agents, 1)
+            term_mask_env = (~term_any_env).float()
+            term_masks_flat_t = term_mask_env.repeat(self.num_agents, 1)
 
-            (
-                override_mask_vl_flat_t,
-                override_vl_flat_t,
-                override_mask_vh_flat_t,
-                override_vh_flat_t,
-            ) = self._maybe_override_bootstrap(
-                obs_next=obs_next,
-                z_next=z_global,
-                rnn_states_snapshot={
-                    "vl": self.rnn_states_vl.clone(),
-                    "vh": {aid: self.rnn_states[aid]["vh"].clone() for aid in self.agent_ids},
-                },
-                allow_env_mask=masks.clone(),
-                term_any_env=term_any_env,
-                trunc_any_env=trunc_any_env,
-            )
-
-            # Ensure rewards have shape [E, 1]
-            rewards_formatted = {}
-            for agent in self.agent_ids:
-                rew_agent = rewards[agent]
-                if rew_agent.dim() == 1:
-                    rew_agent = rew_agent.unsqueeze(-1)
-                rewards_formatted[agent] = rew_agent
-
-            # Write step t into rollout buffer (agent-major order)
-            self.buffer.insert(
-                obs=self._flatten_per_agent(obs),                           # [N, obs_dim]
-                share_obs=self._replicate_global_for_agents(share_obs),     # [N, share_obs_dim]
-                actions=self._flatten_per_agent(actions),                   # [N, act_dim]
-                action_log_probs=self._flatten_per_agent(action_log_probs), # [N, 1]
-                rewards=self._flatten_per_agent(rewards_formatted),         # [N, 1] raw env reward
-                rewards_task=self._flatten_per_agent(r_task),               # [N, 1] task part
-                costs_safe=self._flatten_per_agent(r_safe),                 # [N, 1] safety cost
-                values_vl=self._replicate_global_for_agents(vl),            # [N, 1]
-                values_vh=self._flatten_per_agent(vh),                      # [N, 1]
-                z=self._replicate_global_for_agents(z_global),              # [N, 1]
-                masks=masks_flat_t,                                         # [N, 1] alive going into t
-                term_masks=term_masks_flat_t,                               # [N, 1] alive after t
-                override_bootstrap_mask_vl=override_mask_vl_flat_t,         # [N, 1]
-                override_bootstrap_vl=override_vl_flat_t,                   # [N, 1]
-                override_bootstrap_mask_vh=override_mask_vh_flat_t,         # [N, 1]
-                override_bootstrap_vh=override_vh_flat_t,                   # [N, 1]
-                rnn_states_actor=torch.cat(
-                    [self.rnn_states[a]["actor"] for a in self.agent_ids],
-                    dim=0
-                ),                                                          # [N, H]
-                rnn_states_critic=self.rnn_states_vl.repeat(self.num_agents, 1),  # [N, H]
-                rnn_states_vh=torch.cat(
-                    [self.rnn_states[a]["vh"] for a in self.agent_ids],
-                    dim=0
-                ),                                                          # [N, H]
-            )
-
-            # Z update: source-style z_{t+1} = (z_t + r_team) / gamma
-            z_global = update_z_epigraph(
+            episode_increment = int(done_any_env.sum().item())
+            z_next = update_z_epigraph(
                 z_global,
                 r_team,
                 self.gamma,
@@ -527,14 +572,76 @@ class EpigraphTrainer:
                 self.z_max,
             )
 
-            # Episode return bookkeeping (for logging only)
-            r_task_mean = sum(r_task[a].squeeze(-1) for a in self.agent_ids) / self.num_agents  # [E]
-            r_safe_mean = sum(r_safe[a].squeeze(-1) for a in self.agent_ids) / self.num_agents  # [E]
+            override_mask_vl_flat = torch.zeros(self.num_envs * self.num_agents, 1, dtype=torch.bool, device=self.device)
+            override_vl_flat = torch.zeros(self.num_envs * self.num_agents, 1, device=self.device)
+            override_mask_vh_flat = torch.zeros(self.num_envs * self.num_agents, 1, dtype=torch.bool, device=self.device)
+            override_vh_flat = torch.zeros(self.num_envs * self.num_agents, 1, device=self.device)
+            ongoing_env_mask = None
+            milestone_to_trigger = None
+
+            if not evaluation_done_this_rollout:
+                future_episodes = self.global_episodes + episodes_window + episode_increment
+                milestone_to_trigger = self._check_milestone_crossed(future_episodes)
+                if milestone_to_trigger is not None:
+                    (
+                        override_mask_vl_flat,
+                        override_vl_flat,
+                        override_mask_vh_flat,
+                        override_vh_flat,
+                        ongoing_env_mask,
+                    ) = self._maybe_override_bootstrap(
+                        obs_next=obs_next,
+                        z_next=z_next,
+                        rnn_states_snapshot=rnn_states_snapshot,
+                        allow_env_mask=masks,
+                        term_any_env=term_any_env,
+                        trunc_any_env=trunc_any_env,
+                    )
+
+            rewards_formatted = {}
+            for agent in self.agent_ids:
+                rew_agent = rewards[agent]
+                if rew_agent.dim() == 1:
+                    rew_agent = rew_agent.unsqueeze(-1)
+                rewards_formatted[agent] = rew_agent
+
+            self.buffer.insert(
+                obs=self._flatten_per_agent(obs),
+                share_obs=self._replicate_global_for_agents(share_obs),
+                actions=self._flatten_per_agent(actions),
+                action_log_probs=self._flatten_per_agent(action_log_probs),
+                rewards=self._flatten_per_agent(rewards_formatted),
+                rewards_task=self._flatten_per_agent(r_task),
+                costs_safe=self._flatten_per_agent(r_safe),
+                values_vl=self._replicate_global_for_agents(vl),
+                values_vh=self._flatten_per_agent(vh),
+                z=self._replicate_global_for_agents(z_global),
+                masks=masks_flat_t,
+                term_masks=term_masks_flat_t,
+                override_bootstrap_mask_vl=override_mask_vl_flat,
+                override_bootstrap_vl=override_vl_flat,
+                override_bootstrap_mask_vh=override_mask_vh_flat,
+                override_bootstrap_vh=override_vh_flat,
+                rnn_states_actor=torch.cat(
+                    [self.rnn_states[a]["actor"] for a in self.agent_ids],
+                    dim=0,
+                ),
+                rnn_states_critic=self.rnn_states_vl.repeat(self.num_agents, 1),
+                rnn_states_vh=torch.cat(
+                    [self.rnn_states[a]["vh"] for a in self.agent_ids],
+                    dim=0,
+                ),
+            )
+
+            buffer_step_idx = self.buffer.step - 1
+            self.global_step += 1
+
+            r_task_mean = sum(r_task[a].squeeze(-1) for a in self.agent_ids) / self.num_agents
+            r_safe_mean = sum(r_safe[a].squeeze(-1) for a in self.agent_ids) / self.num_agents
             current_returns_task += r_task_mean
             current_returns_safe += r_safe_mean
             current_lengths += 1
 
-            # Finalize stats for envs that ended
             if done_any_env.any():
                 done_indices = done_any_env.squeeze(-1).nonzero(as_tuple=True)[0]
                 episode_returns_task.extend(current_returns_task[done_indices].cpu().tolist())
@@ -546,13 +653,30 @@ class EpigraphTrainer:
                 self.episodes_done += len(done_indices)
                 self.global_episodes += len(done_indices)
 
-            # Advance loop state
-            obs = obs_next
-            masks = (~done_any_env).float()  # [E,1] 1 for still-running envs
-            self.global_step += self.num_envs  # Count only *training* env steps
+            if milestone_to_trigger is not None:
+                self._apply_truncation_masks(buffer_step_idx, ongoing_env_mask)
+                episodes_window += episode_increment
+                self._run_milestone_evaluation(milestone_to_trigger)
+                self.milestones.popleft()
+                evaluation_done_this_rollout = True
 
-        # Bootstrap final values at t = T
-        z_enc_last = self.z_encoder(z_global)  # [E, nz]
+                obs, _ = self.env.reset()
+                z_global = self._init_z_training()
+                self._init_rnn_states()
+                masks = torch.ones(self.num_envs, 1, device=self.device)
+                current_returns_task.zero_()
+                current_returns_safe.zero_()
+                current_lengths.zero_()
+                self._needs_env_reset = False
+                continue
+            else:
+                z_global = z_next
+                episodes_window += episode_increment
+
+            obs = obs_next
+            masks = (~done_any_env).float()
+
+        z_enc_last = self.z_encoder(z_global)
         share_obs_last = self._get_share_obs(obs)
         masks_last = torch.ones(self.num_envs, 1, device=self.device)
 
@@ -571,7 +695,6 @@ class EpigraphTrainer:
                 masks_last,
             )
 
-        # Store bootstrap slice at T (for GAE computation)
         self.buffer.insert_final_step(
             obs=self._flatten_per_agent(obs),
             share_obs=self._replicate_global_for_agents(share_obs_last),
@@ -580,7 +703,6 @@ class EpigraphTrainer:
             z=self._replicate_global_for_agents(z_global),
         )
 
-        # Compute rollout statistics using helper function (if available)
         if summarize_rollout_stats is not None:
             T = self.rollout_horizon
             E = self.num_envs
@@ -588,20 +710,20 @@ class EpigraphTrainer:
 
             r_task_tensor = self._reshape_agentmajor_to_env_agent_T(
                 self.buffer.rewards_task[:T], has_trailing_dim1=True
-            ).squeeze(-1)  # [T, E, A]
+            ).squeeze(-1)
 
             r_safe_tensor = self._reshape_agentmajor_to_env_agent_T(
                 self.buffer.costs_safe[:T], has_trailing_dim1=True
-            ).squeeze(-1)  # [T, E, A]
+            ).squeeze(-1)
 
             z_tensor = self._reshape_agentmajor_to_env_agent_T(
                 self.buffer.z[:T], has_trailing_dim1=True
-            ).squeeze(-1)  # [T, E, A]
+            ).squeeze(-1)
 
             term_masks_bool = (self.buffer.term_masks[:T] > 0.5)
             dones_tensor = self._reshape_agentmajor_to_env_agent_T(
                 ~term_masks_bool, has_trailing_dim1=True
-            ).squeeze(-1).any(dim=2).float()  # [T, E]
+            ).squeeze(-1).any(dim=2).float()
 
             info_for_stats = {}
             if len(violations_rollout) > 0:
@@ -629,12 +751,14 @@ class EpigraphTrainer:
                 "z_std": float(torch.stack(z_values_rollout).std().item()) if z_values_rollout else 0.0,
             }
 
-        # Cache state for next rollout
         self._cached_obs = {agent: obs[agent].clone().detach() for agent in self.agent_ids}
         self._cached_z = z_global.clone().detach()
         self._cached_masks = masks.clone().detach()
 
+        self._log_rollout_stats(self.global_step, rollout_stats)
+
         return rollout_stats
+
     def _maybe_override_bootstrap(
         self,
         obs_next,
@@ -645,31 +769,122 @@ class EpigraphTrainer:
         trunc_any_env,
     ):
         """
-        Placeholder for override bootstrap mechanism.
-        In milestone truncation, this will be used to set custom bootstrap values.
+        Compute override bootstrap values for mid-rollout evaluation if needed.
+        
+        Returns:
+            override_mask_vl_flat, override_vl_flat,
+            override_mask_vh_flat, override_vh_flat,
+            ongoing_env_mask (bool tensor [E])
         """
         E = self.num_envs
         A = self.num_agents
         device = self.device
-        
-        override_mask_vl_env = torch.zeros(E, 1, dtype=torch.bool, device=device)
-        override_vl_env = torch.zeros(E, 1, device=device)
-        
-        override_mask_vh_env = torch.zeros(E, A, dtype=torch.bool, device=device)
-        override_vh_env = torch.zeros(E, A, device=device)
-        
+
+        with torch.no_grad():
+            alive_mask = allow_env_mask.squeeze(-1) > 0.5
+            term_mask = term_any_env.squeeze(-1).to(torch.bool)
+            trunc_mask = trunc_any_env.squeeze(-1).to(torch.bool)
+            ongoing_env = alive_mask & (~term_mask) & (~trunc_mask)
+
+            if not ongoing_env.any():
+                override_mask_vl_env = torch.zeros(E, 1, dtype=torch.bool, device=device)
+                override_vl_env = torch.zeros(E, 1, device=device)
+                override_mask_vh_env = torch.zeros(E, A, dtype=torch.bool, device=device)
+                override_vh_env = torch.zeros(E, A, device=device)
+            else:
+                share_obs_next = self._get_share_obs(obs_next)
+                masks_next = torch.ones(E, 1, device=device)
+                z_enc_next = self.z_encoder(z_next)
+
+                vl_next, _ = self.critic_vl.value_step(
+                    share_obs_next,
+                    z_enc_next,
+                    rnn_states_snapshot["vl"],
+                    masks_next,
+                )
+
+                vh_next = {}
+                for agent in self.agent_ids:
+                    vh_next[agent], _ = self.critics_vh[agent].value_step(
+                        obs_next[agent],
+                        z_enc_next,
+                        rnn_states_snapshot["vh"][agent],
+                        masks_next,
+                    )
+
+                override_mask_vl_env = ongoing_env.view(E, 1)
+                override_vl_env = vl_next
+
+                override_mask_vh_env = ongoing_env.view(E, 1).repeat(1, A)
+                override_vh_env = torch.stack([vh_next[aid].squeeze(-1) for aid in self.agent_ids], dim=1)
+
         override_mask_vl_flat = override_mask_vl_env.repeat(A, 1)
         override_vl_flat = override_vl_env.repeat(A, 1)
-        
-        override_mask_vh_flat = override_mask_vh_env.reshape(E * A, 1)
-        override_vh_flat = override_vh_env.reshape(E * A, 1)
-        
+
+        # Convert [E, A] -> agent-major [A*E, 1] i.e., human(env0..E-1), robot(env0..E-1)
+        override_mask_vh_flat = override_mask_vh_env.permute(1, 0).reshape(A * E, 1)
+        override_vh_flat = override_vh_env.permute(1, 0).reshape(A * E, 1)
+
         return (
             override_mask_vl_flat,
             override_vl_flat,
             override_mask_vh_flat,
             override_vh_flat,
+            ongoing_env,
         )
+
+    def _apply_truncation_masks(self, buffer_step_idx: int, ongoing_env_mask: torch.Tensor):
+        """Zero masks for ongoing environments after mid-rollout evaluation."""
+        if ongoing_env_mask is None or not ongoing_env_mask.any():
+            return
+
+        env_ids = torch.nonzero(ongoing_env_mask, as_tuple=False).view(-1)
+        if env_ids.numel() == 0:
+            return
+
+        for agent_idx, _ in enumerate(self.agent_ids):
+            slots = env_ids + agent_idx * self.num_envs
+            self.buffer.masks[buffer_step_idx, slots, 0] = 0.0
+            self.buffer.term_masks[buffer_step_idx, slots, 0] = 1.0
+
+    def _run_milestone_evaluation(self, milestone: int):
+        """Run evaluation, log metrics, and save checkpoint for the milestone."""
+        eval_episodes = int(
+            self.full_config.get("training_monitor", {}).get("eval_episodes", 10)
+        )
+        print(f"\n{'='*80}")
+        print(f"MILESTONE REACHED: {milestone} episodes")
+        print(f"Running evaluation for {eval_episodes} episodes...")
+        print(f"{'='*80}\n")
+
+        eval_stats = self.evaluate(num_episodes=eval_episodes)
+
+        if self.wandb_logger is not None and getattr(self.wandb_logger, "enabled", False):
+            payload = {
+                "eval/return_mean": eval_stats.get("eval_return_mean"),
+                "eval/return_std": eval_stats.get("eval_return_std"),
+                "eval/num_episodes": eval_stats.get("eval_num_episodes"),
+                "epigraph/eval_safe_cost_mean": eval_stats.get("eval_safe_cost_mean"),
+                "epigraph/eval_safe_cost_std": eval_stats.get("eval_safe_cost_std"),
+                "epigraph/eval_z_mean": eval_stats.get("eval_z_mean"),
+                "epigraph/eval_z_std": eval_stats.get("eval_z_std"),
+                "epigraph/eval_success_rate": eval_stats.get("eval_success_rate"),
+            }
+            cleaned = {k: v for k, v in payload.items() if v is not None}
+            if cleaned:
+                self.wandb_logger.log_eval(self.global_step, cleaned)
+
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(self.ckpt_dir, f"epigraph_milestone_{milestone}.pth")
+        self.save_checkpoint(ckpt_path)
+        print(f"[MILESTONE] Checkpoint saved: {ckpt_path}")
+
+        print(f"[MILESTONE] Evaluation stats summary: {eval_stats}")
+
+        self.set_train_mode()
+        self._mark_env_reset_needed()
+
+        return eval_stats
     
     def update(self) -> Dict[str, Any]:
         """
@@ -886,6 +1101,10 @@ class EpigraphTrainer:
             update_info[k] /= max(1, num_updates)
         
         self.buffer.reset()
+
+        self._log_update_stats(self.global_step, update_info)
+        self._maybe_decay_lr(self.global_update_step)
+        self.global_update_step += 1
         
         return update_info
     
@@ -939,7 +1158,11 @@ class EpigraphTrainer:
 
         for _ in range(self.num_mini_batch):
             # Sample which (chunk, env, agent) tuples go in this minibatch
-            perm = torch.randperm(total_samples)
+            perm = torch.randperm(
+                total_samples,
+                device=torch.device("cpu"),
+                generator=self._train_generator,
+            )
             mb_indices = perm[:batch_size].tolist()
 
             seq_list = []
@@ -1033,6 +1256,8 @@ class EpigraphTrainer:
         z_values = []
         done = False
         
+        actual_env = getattr(self.env, "unwrapped", self.env)
+
         while not done and episode_length < 2000:
             # Use root_finder to compute safe z*
             z_candidates = []
@@ -1079,9 +1304,21 @@ class EpigraphTrainer:
                 )
                 actions[agent] = act
                 self.rnn_states[agent]["actor"] = next_h
-            
+
+            env_actions = self._scale_actions(actions)
+            detail_payload = {
+                "applied_forces": {aid: env_actions[aid].clone() for aid in self.agent_ids},
+                "mean_actions": {aid: env_actions[aid].clone() for aid in self.agent_ids},
+                "noise_actions": {aid: torch.zeros_like(env_actions[aid]) for aid in self.agent_ids},
+                "deterministic": deterministic,
+            }
+            if hasattr(actual_env, "set_detail_actor_info"):
+                actual_env.set_detail_actor_info(detail_payload)
+
+            actual_env._last_z_snapshot = z_global.clone().detach()
+
             # Step environment
-            obs, rewards, terminated, truncated, info = self.env.step(actions)
+            obs, rewards, terminated, truncated, info = self.env.step(env_actions)
             
             # Accumulate statistics
             if "r_task" in info:
@@ -1181,53 +1418,8 @@ class EpigraphTrainer:
         return eval_stats
     
     def maybe_milestone_eval_and_save(self):
-        """
-        Check if milestone reached. If yes:
-        1. Mark milestone truncation in buffer (if mid-rollout)
-        2. Set eval mode
-        3. Run evaluation
-        4. Log to wandb
-        5. Save checkpoint
-        6. Reset env and RNN, back to train mode
-        
-        This is the ROUTE B core method.
-        """
-        if len(self.milestones) == 0:
-            return
-        
-        # Check if we've reached the next milestone
-        if self.global_episodes >= self.milestones[0]:
-            milestone = self.milestones.popleft()
-            
-            print(f"\n{'='*80}")
-            print(f"MILESTONE REACHED: {milestone} episodes")
-            print(f"{'='*80}\n")
-            
-            # Run evaluation
-            num_eval_episodes = self.full_config.get("training_monitor", {}).get("eval_episodes", 10)
-            eval_stats = self.evaluate(num_episodes=num_eval_episodes)
-            
-            # Log to wandb if enabled
-            if self.wandb_logger is not None:
-                self.wandb_logger.log_eval(self.global_step, eval_stats)
-            
-            # Save checkpoint
-            os.makedirs(self.ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(self.ckpt_dir, f"epigraph_milestone_{milestone}.pth")
-            self.save_checkpoint(ckpt_path)
-            print(f"[MILESTONE] Checkpoint saved: {ckpt_path}")
-            
-            # Print evaluation summary
-            print(f"\n[MILESTONE EVAL] Milestone {milestone}:")
-            print(f"  Return:       {eval_stats.get('return_mean', 0):.2f} ± {eval_stats.get('return_std', 0):.2f}")
-            print(f"  Success Rate: {eval_stats.get('success_rate', 0):.2%}")
-            print(f"  Ep Length:    {eval_stats.get('episode_length', 0):.1f}")
-            print(f"  Z Mean:       {eval_stats.get('z_global_mean', 0):.4f}\n")
-            
-            # Back to training mode
-            self.set_train_mode()
-            self._mark_env_reset_needed()
-            print(f"[MILESTONE] Resuming training...\n")
+        """Legacy interface retained for compatibility; milestones handled during rollouts."""
+        return
     
     def save_checkpoint(self, path: str, global_step: Optional[int] = None, update_count: Optional[int] = None):
         """Save checkpoint with all networks, optimizers, and training state."""

@@ -258,6 +258,12 @@ class StepTracer:
         try:
             r_task_mat = self._agent_matrix(r_task, agent_order, label='r_task')
             r_safe_mat = self._agent_matrix(r_safe_cost, agent_order, label='r_safe_cost', default_zero=True)
+            z_mat = None
+            if z is not None:
+                try:
+                    z_mat = self._agent_matrix(z, agent_order, label='z', default_zero=False)
+                except KeyError:
+                    z_mat = None
 
             idx_robot = agent_order.index('robot') if 'robot' in agent_order else 0
             idx_human = agent_order.index('human') if 'human' in agent_order else min(1, r_task_mat.shape[1] - 1)
@@ -269,25 +275,29 @@ class StepTracer:
             print('=' * 80)
             print(f"Showing first {len(to_show)} of {self.num_envs} environments")
 
-            # 1. Environment state snapshot: trajectory progress, normals, zone classification
+            print("\n[TASK/SAFE/Z SUMMARY]")
+            for env_id in to_show:
+                zone_label = self._get_zone_label(env, env_id)
+                task_robot = r_task_mat[env_id, idx_robot].item()
+                task_human = r_task_mat[env_id, idx_human].item()
+                safe_robot = r_safe_mat[env_id, idx_robot].item()
+                safe_human = r_safe_mat[env_id, idx_human].item()
+                progress = self._safe_get_reward_component(env, 'progress_ratio', env_id, 0.0)
+                distance = self._safe_get_reward_component(env, 'distance_to_final', env_id, 0.0)
+                if z_mat is not None:
+                    z_value = float(z_mat[env_id].mean().item())
+                else:
+                    z_value = 0.0
+                print(
+                    f"  Env {env_id}: zone={zone_label} | "
+                    f"task/robot {task_robot:+.3f} | task/human {task_human:+.3f} | "
+                    f"safe_cost/robot {safe_robot:+.3f} | safe_cost/human {safe_human:+.3f} | "
+                    f"z/mean {z_value:+.4f} | progress {progress:.1%} | dist_to_end {distance:.4f}"
+                )
+
+            print("\n[DETAILED SNAPSHOT]")
             for env_id in to_show:
                 self._print_env_snapshot(env, env_id)
-
-            # 2. Reward decomposition display
-            print("\n[REWARD BREAKDOWN THIS STEP]")
-            for env_id in to_show:
-                rt_robot  = r_task_mat[env_id, idx_robot].item()
-                rt_human  = r_task_mat[env_id, idx_human].item()
-                rc_robot  = r_safe_mat[env_id, idx_robot].item()
-                rc_human  = r_safe_mat[env_id, idx_human].item()
-                print(f"  Env {env_id}:")
-                print(f"    task_reward        robot {rt_robot:+.3f} | human {rt_human:+.3f}")
-                print(f"    safe_cost (>=0)    robot {rc_robot:+.3f} | human {rc_human:+.3f}")
-
-            # 3. Risk budget z is omitted (trainer controls z statistics)
-
-            # 4. Agent-level reward decomposition (original detailed breakdown)
-            for env_id in to_show:
                 self._print_agent_rewards(env, env_id, 'ROBOT')
                 self._print_agent_rewards(env, env_id, 'HUMAN')
         except Exception as exc:
@@ -381,15 +391,7 @@ class StepTracer:
 
         print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
-        D, O = 0.0075, 0.015
-        is_colliding = env.is_violating_t1[env_id].item()
-
-        if safety >= O:
-            active_zone = "A (Track)"
-        elif safety <= D:
-            active_zone = "C (Danger - Overlapping)" if is_colliding else "C (Danger - Outside)"
-        else:
-            active_zone = "D (Rejoin)" if env.rejoin_streak[env_id] >= 10 else "B (Surface)"
+        active_zone = self._get_zone_label(env, env_id)
         print(f"Active Zone: {active_zone}")
 
         self._print_agent_rewards(env, env_id, "ROBOT")
@@ -493,8 +495,21 @@ class StepTracer:
         
         if component.shape[0] <= env_id:
             return default
-            
+           
         return float(component[env_id].item())
+
+    def _get_zone_label(self, env, env_id: int) -> str:
+        """Return human-readable zone label for summary output."""
+        safety = float(env.safety_distances_t1[env_id].item())
+        is_colliding = bool(env.is_violating_t1[env_id].item())
+        rejoin = env.rejoin_streak[env_id] >= 10
+        D, O = 0.0075, 0.015
+
+        if safety >= O:
+            return "A (Track)"
+        if safety <= D:
+            return "C (Danger-Overlap)" if is_colliding else "C (Danger)"
+        return "D (Rejoin)" if rejoin else "B (Surface)"
 
 
 # ============================================================================

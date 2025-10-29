@@ -188,6 +188,17 @@ def main():
     # Override WandB toggle via CLI (default: disabled unless --wandb provided)
     config.setdefault("logging", {})
     config["logging"]["use_wandb"] = bool(args.wandb)
+
+    # ===== Scale milestone episodes by number of environments (align with rMAPPO) =====
+    training_monitor_cfg = config.setdefault("training_monitor", {})
+    milestone_episodes = list(training_monitor_cfg.get("milestone_episodes", []))
+    if milestone_episodes:
+        scaled_milestones = [int(m * args.num_envs) for m in milestone_episodes]
+        training_monitor_cfg["milestone_episodes"] = scaled_milestones
+        print(f"[MILESTONES] Using scaled milestones (per-env -> total episodes): {scaled_milestones}")
+    else:
+        print("[MILESTONES] No milestone_episodes defined in config.")
+
     print(f"[CONFIG] Loaded configuration from: {args.config}\n")
     
     # ===== 2. Set Reproducibility =====
@@ -250,9 +261,6 @@ def main():
                 agent_labels=trainer.agent_ids,
             )
         
-        # Milestone-driven evaluation and checkpoint saving
-        trainer.maybe_milestone_eval_and_save()
-    
     # ===== 9. Final Checkpoint =====
     final_ckpt = os.path.join(args.ckpt_dir, f"epigraph_final_step{trainer.global_step}.pth")
     os.makedirs(os.path.dirname(final_ckpt), exist_ok=True)

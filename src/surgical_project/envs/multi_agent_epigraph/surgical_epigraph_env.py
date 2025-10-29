@@ -396,15 +396,24 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
 
         # Get scaling factors from YAML config (ensures train-eval consistency)
         scale_cfg = self.params.get("obs_scaling", {}).get("factors", [5.0, 16.7])
-        pos_scale = float(scale_cfg[0])
-        vel_scale = float(scale_cfg[1])
+        if len(scale_cfg) >= 6:
+            scale_tensor = torch.tensor(
+                scale_cfg[:6],
+                device=self.device,
+                dtype=self.stylus_pos_t1.dtype,
+            ).unsqueeze(0)
+            obs_base = torch.cat([self.stylus_pos_t1, self.stylus_vel_t1], dim=-1)
+            obs_scaled = obs_base * scale_tensor
+        else:
+            pos_scale = float(scale_cfg[0]) if len(scale_cfg) > 0 else 1.0
+            vel_scale = float(scale_cfg[1]) if len(scale_cfg) > 1 else 1.0
+            pos_scaled = self.stylus_pos_t1 * pos_scale
+            vel_scaled = self.stylus_vel_t1 * vel_scale
+            obs_scaled = torch.cat([pos_scaled, vel_scaled], dim=-1)
         
         obs_dict = {}
         for agent in self.cfg.possible_agents:
-            pos_scaled = self.stylus_pos_t1 * pos_scale
-            vel_scaled = self.stylus_vel_t1 * vel_scale
-            obs_agent = torch.cat([pos_scaled, vel_scaled], dim=-1)
-            obs_dict[agent] = obs_agent
+            obs_dict[agent] = obs_scaled.clone()
 
         return obs_dict
 
@@ -691,15 +700,35 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             self.step_tracer is not None and
             self.step_tracer.enable_console_logging
         ):
+            r_task_dict, r_safe_risk_dict = self._compose_task_and_safe()
+            r_task_for_tracer = {
+                agent: r_task_dict[agent].detach().unsqueeze(-1)
+                for agent in self.cfg.possible_agents
+            }
+            r_safe_cost = {
+                agent: torch.relu(-r_safe_risk_dict[agent]).detach().unsqueeze(-1)
+                for agent in self.cfg.possible_agents
+            }
+            z_snapshot = getattr(self, "_last_z_snapshot", None)
+            if isinstance(z_snapshot, torch.Tensor):
+                z_tensor = z_snapshot.detach()
+                if z_tensor.dim() == 1:
+                    z_tensor = z_tensor.unsqueeze(-1)
+                z_for_tracer = {
+                    agent: z_tensor.clone()
+                    for agent in self.cfg.possible_agents
+                }
+            else:
+                z_for_tracer = None
             self.step_tracer.maybe_print_step(
                 env=self,
-                r_task=rewards,  # Dict[agent, tensor[E]]
-                r_safe_cost=None,  # Not needed for basic debug
-                z=None,  # Not tracked in env
-                global_step=self._env_debug_step_counter,  # Use env's own counter
+                r_task=r_task_for_tracer,
+                r_safe_cost=r_safe_cost,
+                z=z_for_tracer,
+                global_step=self._env_debug_step_counter,
                 force_print=False,
             )
-        
+
         return rewards
 
     def _calculate_potential_reward(self) -> torch.Tensor:
