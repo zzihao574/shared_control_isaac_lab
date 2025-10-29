@@ -67,9 +67,15 @@ class TrainingConfiguration:
             if section not in self.params:
                 raise ValueError(f"Missing required config section: {section}")
         
-        # Validate algorithms.rmappo
+        # Validate algorithms.rmappo (NOT algorithms.epigraph)
         if "rmappo" not in self.params["algorithms"]:
             raise ValueError("Missing algorithms.rmappo configuration")
+        
+        # Validate training_monitor.milestone_episodes (CRITICAL for Route B)
+        if "training_monitor" not in self.params:
+            raise ValueError("Missing training_monitor section in config")
+        if "milestone_episodes" not in self.params["training_monitor"]:
+            raise ValueError("Missing training_monitor.milestone_episodes in config")
         
         print("[CONFIG] Configuration validated successfully")
     
@@ -95,6 +101,7 @@ def summarize_rollout_stats(
     z: torch.Tensor,
     dones: torch.Tensor,
     info: Dict[str, Any],
+    agent_labels: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """
     Compute statistics from rollout data for logging.
@@ -102,11 +109,12 @@ def summarize_rollout_stats(
     This is the key function required by the modification plan for trainer logging.
     
     Args:
-        r_task: [T, N, num_agents] - Task rewards collected during rollout
-        r_safe_cost: [T, N, num_agents] - Safety costs (>=0) collected during rollout
-        z: [T, N, num_agents] - Risk budget values during rollout
-        dones: [T, N] - Episode termination flags
+        r_task: [T, E, num_agents] - Task rewards collected during rollout
+        r_safe_cost: [T, E, num_agents] - Safety costs (>=0) collected during rollout
+        z: [T, E, num_agents] - Risk budget values during rollout
+        dones: [T, E] - Episode termination flags
         info: Additional information dictionary from rollout
+        agent_labels: Optional list of agent identifiers (length must equal num_agents)
         
     Returns:
         stats: Dictionary of statistics including:
@@ -114,35 +122,43 @@ def summarize_rollout_stats(
             - avg_episode_safe_cost_sum: Average safety cost sum per episode
             - unsafe_step_ratio: Ratio of unsafe steps
             - avg_progress_ratio: Average task progress
-            - avg_z_robot, avg_z_human: Average z values per agent
+            - Per-agent metrics keyed by sanitized agent label (r_task_mean_*, r_safe_cost_mean_*, avg_z_*)
     """
-    T, N, num_agents = r_task.shape
-    
+    T, batch_dim, num_agents = r_task.shape
+
+    if agent_labels is None:
+        agent_labels = [f"agent{i}" for i in range(num_agents)]
+    if len(agent_labels) != num_agents:
+        raise ValueError(
+            f"agent_labels length ({len(agent_labels)}) does not match num_agents ({num_agents})"
+        )
+    sanitized_labels = [label.replace(" ", "_") for label in agent_labels]
+
     stats = {}
     
     # ========== Task Return Statistics ==========
     # Total task rewards (sum over time)
-    task_return_total = r_task.sum(dim=0)  # [N, num_agents]
+    task_return_total = r_task.sum(dim=0)  # [batch_dim, num_agents]
     stats['avg_episode_task_return'] = float(task_return_total.mean().item())
     stats['r_task_mean_per_step'] = float(r_task.mean().item())
-    stats['r_task_robot_mean'] = float(r_task[:, :, 0].mean().item())
-    stats['r_task_human_mean'] = float(r_task[:, :, 1].mean().item())
+    for idx, label in enumerate(sanitized_labels):
+        stats[f"r_task_mean_{label}"] = float(r_task[:, :, idx].mean().item())
     
     # ========== Safety Cost Statistics ==========
     # Total safety costs (sum over time)
-    safe_cost_total = r_safe_cost.sum(dim=0)  # [N, num_agents]
+    safe_cost_total = r_safe_cost.sum(dim=0)  # [batch_dim, num_agents]
     stats['avg_episode_safe_cost_sum'] = float(safe_cost_total.mean().item())
     stats['r_safe_cost_mean_per_step'] = float(r_safe_cost.mean().item())
-    stats['r_safe_cost_robot_mean'] = float(r_safe_cost[:, :, 0].mean().item())
-    stats['r_safe_cost_human_mean'] = float(r_safe_cost[:, :, 1].mean().item())
+    for idx, label in enumerate(sanitized_labels):
+        stats[f"r_safe_cost_mean_{label}"] = float(r_safe_cost[:, :, idx].mean().item())
     
     # ========== Z Statistics (Per Agent) ==========
-    stats['avg_z_robot'] = float(z[:, :, 0].mean().item())
-    stats['avg_z_human'] = float(z[:, :, 1].mean().item())
     stats['z_mean'] = float(z.mean().item())
     stats['z_std'] = float(z.std().item())
     stats['z_min'] = float(z.min().item())
     stats['z_max'] = float(z.max().item())
+    for idx, label in enumerate(sanitized_labels):
+        stats[f"avg_z_{label}"] = float(z[:, :, idx].mean().item())
     
     # ========== Episode Statistics ==========
     episodes_finished = int(dones.sum().item())
@@ -153,7 +169,7 @@ def summarize_rollout_stats(
     if 'is_violating' in info and info['is_violating'] is not None:
         violations = info['is_violating']  # Should be [T, N] bool
         if isinstance(violations, torch.Tensor):
-            total_steps = T * N
+            total_steps = T * batch_dim
             unsafe_steps = violations.sum().item()
             stats['unsafe_step_ratio'] = unsafe_steps / total_steps if total_steps > 0 else 0.0
         else:
@@ -260,6 +276,7 @@ class WandBLogger:
             entity: WandB entity (username or team)
         """
         try:
+            os.environ.setdefault("WANDB_START_METHOD", "thread")
             import wandb
             self.wandb = wandb
             self.enabled = True
@@ -388,6 +405,7 @@ def print_training_progress(
     max_steps: int,
     rollout_stats: Dict[str, float],
     update_stats: Dict[str, float],
+    agent_labels: Optional[List[str]] = None,
 ):
     """
     Print training progress to console.
@@ -404,6 +422,16 @@ def print_training_progress(
     print(f"Training Progress: {global_step}/{max_steps} ({progress_pct:.1f}%)")
     print("=" * 80)
     
+    # Determine per-agent ordering
+    if agent_labels is None:
+        agent_labels = []
+    sanitized_labels = [label.replace(" ", "_") for label in agent_labels]
+    if not sanitized_labels:
+        sanitized_labels = sorted(
+            [k[len("avg_z_"):] for k in rollout_stats.keys() if k.startswith("avg_z_")]
+        )
+        agent_labels = sanitized_labels
+
     # Rollout statistics
     print("\n[Rollout Statistics]")
     print(f"  Task Return (avg)       : {rollout_stats.get('avg_episode_task_return', 0):.3f}")
@@ -413,10 +441,16 @@ def print_training_progress(
     print(f"  Progress Ratio (avg)    : {rollout_stats.get('avg_progress_ratio', 0):.2%}")
     print(f"  Episodes Finished       : {rollout_stats.get('episodes_finished', 0)}")
     
+    if sanitized_labels:
+        print("\n[Per-Agent Averages]")
+        for label, sanitized in zip(agent_labels, sanitized_labels):
+            task_mean = rollout_stats.get(f"r_task_mean_{sanitized}", 0.0)
+            safe_mean = rollout_stats.get(f"r_safe_cost_mean_{sanitized}", 0.0)
+            z_mean = rollout_stats.get(f"avg_z_{sanitized}", 0.0)
+            print(f"  {label} -> task {task_mean:+.3f}, safe {safe_mean:+.3f}, z {z_mean:+.4f}")
+    
     # Z statistics
     print("\n[Risk Budget (Z) Statistics]")
-    print(f"  Robot Z (avg)           : {rollout_stats.get('avg_z_robot', 0):.4f}")
-    print(f"  Human Z (avg)           : {rollout_stats.get('avg_z_human', 0):.4f}")
     print(f"  Z Range                 : [{rollout_stats.get('z_min', 0):.4f}, {rollout_stats.get('z_max', 0):.4f}]")
     
     # Update statistics

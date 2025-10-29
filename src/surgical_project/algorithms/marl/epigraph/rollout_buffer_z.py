@@ -1,6 +1,7 @@
 """
 Rollout buffer for Epigraph algorithm with z-encoding support.
 Stores complete trajectories including RNN states for recurrent policies.
+Enhanced with milestone truncation support.
 """
 
 import torch
@@ -173,23 +174,169 @@ class RolloutBufferZ:
         self.values_vh[t].copy_(values_vh)
         self.z[t].copy_(z)
     
-    def compute_returns_and_advantages(
+    def mark_milestone_truncation(
         self,
-        Q_perf: torch.Tensor,
-        Q_safe: torch.Tensor,
-        advantages: torch.Tensor,
+        t_last: Optional[int] = None,
+        vl_bootstrap: Optional[torch.Tensor] = None,
+        vh_bootstrap: Optional[torch.Tensor] = None,
     ):
         """
-        Store computed returns and advantages from Epigraph GAE.
+        Mark milestone truncation at the last valid step.
+        
+        This is the CRITICAL method for milestone-driven evaluation:
+        - When a milestone is reached, we want to truncate the current rollout
+          to run evaluation, but NOT treat it as a true episode termination.
+        - This method sets override bootstrap masks and values so that GAE
+          treats it as a "time truncation" with proper bootstrap values.
         
         Args:
-            Q_perf: [T, N, 1] - Performance Q values
-            Q_safe: [T, N, 1] - Safety Q values
-            advantages: [T, N, 1] - Epigraph advantages
+            t_last: Last valid timestep index (default: self.step - 1)
+            vl_bootstrap: [N, 1] Bootstrap value for Vl (default: use current values_vl[t_last+1])
+            vh_bootstrap: [N, 1] Bootstrap value for Vh (default: use current values_vh[t_last+1])
+        
+        The rMAPPO Runner milestone trick:
+        - Set override_bootstrap_mask = True at t_last
+        - Set override_bootstrap_value = V(s_{t_last+1}, z_{t_last+1})
+        - Keep term_masks[t_last] = 1 (allow bootstrap, not true terminal)
+        - Set masks[t_last+1] = 0 to prevent GAE from propagating beyond this rollout
+        
+        This allows clean evaluation without corrupting the next rollout's RNN states.
         """
-        self.returns_vl = Q_perf
-        self.returns_vh = Q_safe
-        self.advantages = advantages
+        if t_last is None:
+            t_last = self.step - 1
+        
+        if t_last < 0 or t_last >= self.T:
+            raise ValueError(f"Invalid t_last={t_last}, must be in [0, {self.T-1}]")
+        
+        # Use provided bootstrap values or default to next-step predictions
+        if vl_bootstrap is None:
+            vl_bootstrap = self.values_vl[t_last + 1]  # [N, 1]
+        
+        if vh_bootstrap is None:
+            vh_bootstrap = self.values_vh[t_last + 1]  # [N, 1]
+        
+        # Set override masks to True at t_last
+        self.override_bootstrap_mask_vl[t_last, :, :] = True
+        self.override_bootstrap_mask_vh[t_last, :, :] = True
+        
+        # Set override values
+        self.override_bootstrap_vl[t_last].copy_(vl_bootstrap)
+        self.override_bootstrap_vh[t_last].copy_(vh_bootstrap)
+        
+        # CRITICAL: Keep term_masks[t_last] = 1 (allow bootstrap)
+        # This is different from true episode termination where term_masks = 0
+        self.term_masks[t_last, :, :] = 1.0
+        
+        print(f"[BUFFER] Marked milestone truncation at t={t_last}")
+        print(f"[BUFFER] Override Vl: mean={vl_bootstrap.mean().item():.4f}")
+        print(f"[BUFFER] Override Vh: mean={vh_bootstrap.mean().item():.4f}")
+    
+    def compute_epigraph_returns_and_advantages(
+        self,
+        gamma: float,
+        gae_lambda: float,
+        lambda_safe: float,
+        num_envs: int,
+        num_agents: int,
+    ):
+        """
+        Compute Epigraph returns and advantages using GAE.
+        
+        This method:
+        1. Reshapes agent-major buffer data to [T, E, A] format
+        2. Calls compute_epigraph_gae from utils.py
+        3. Normalizes advantages
+        4. Stores results back to buffer
+        
+        Args:
+            gamma: Discount factor
+            gae_lambda: GAE lambda parameter
+            lambda_safe: Safety weighting parameter for advantages
+            num_envs: Number of parallel environments (E)
+            num_agents: Number of agents (A)
+        """
+        from .utils import compute_epigraph_gae, normalize_advantages
+        
+        T = self.T
+        E = num_envs
+        A = num_agents
+        N = E * A
+        
+        # ========== Reshape data from agent-major [T, N, 1] to [T, E, A] ==========
+        # Buffer stores in agent-major order: [agent0_env0...agent0_envE-1, agent1_env0...]
+        # We need [T, E, A] for compute_epigraph_gae
+        
+        # Task rewards: average over agents to get team reward [T, E]
+        # rewards_task shape: [T, N, 1] -> [T, A, E, 1] -> [T, E, A, 1]
+        rewards_task_reshaped = self.rewards_task.view(T, A, E, 1).permute(0, 2, 1, 3)  # [T,E,A,1]
+        team_task_reward = rewards_task_reshaped.mean(dim=2).squeeze(-1)  # [T,E]
+        
+        # Safety costs: [T, N, 1] -> [T, E, A]
+        costs_safe_reshaped = self.costs_safe.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
+        
+        # Z trajectory: [T, N, 1] -> [T, E] (take first agent's z since it's shared)
+        z_traj = self.z[:T, :E, 0]  # [T, E]
+        
+        # Vl predictions: [T+1, N, 1] -> [T+1, E] (take first agent since Vl is shared)
+        vl_preds = self.values_vl[:T+1, :E, 0]  # [T+1, E]
+        
+        # Vh predictions: [T+1, N, 1] -> [T+1, E, A]
+        vh_preds = self.values_vh.view(T+1, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T+1,E,A]
+        
+        # Masks: [T, N, 1] -> [T, E]
+        masks = self.masks[:, :E, 0]  # [T, E]
+        term_masks = self.term_masks[:, :E, 0]  # [T, E]
+        
+        # Override bootstrap: [T, N, 1] -> [T, E] and [T, E, A]
+        ov_mask_vl = self.override_bootstrap_mask_vl[:, :E, 0]  # [T, E]
+        ov_vl = self.override_bootstrap_vl[:, :E, 0]  # [T, E]
+        ov_mask_vh = self.override_bootstrap_mask_vh.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
+        ov_vh = self.override_bootstrap_vh.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
+        
+        # ========== Call Epigraph GAE ==========
+        Q_perf, Q_safe, advantages = compute_epigraph_gae(
+            rewards=team_task_reward,     # [T, E]
+            costs=costs_safe_reshaped,    # [T, E, A]
+            z_traj=z_traj,                # [T, E]
+            vl_preds=vl_preds,            # [T+1, E]
+            vh_preds=vh_preds,            # [T+1, E, A]
+            masks=masks,                  # [T, E]
+            term_masks=term_masks,        # [T, E]
+            ov_mask_vl=ov_mask_vl,        # [T, E]
+            ov_vl=ov_vl,                  # [T, E]
+            ov_mask_vh=ov_mask_vh,        # [T, E, A]
+            ov_vh=ov_vh,                  # [T, E, A]
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            lambda_safe=lambda_safe,
+        )
+        
+        # ========== Normalize Advantages ==========
+        advantages_normalized = normalize_advantages(
+            advantages=advantages,  # [T, E, A]
+            masks=masks,            # [T, E]
+        )
+        
+        # ========== Reshape back to agent-major [T, N, 1] and store ==========
+        # Q_perf: [T, E] -> [T, E, A] (broadcast to all agents) -> [T, A, E] -> [T, N, 1]
+        Q_perf_broadcast = Q_perf.unsqueeze(-1).expand(T, E, A)  # [T, E, A]
+        Q_perf_agentmajor = Q_perf_broadcast.permute(0, 2, 1).contiguous().view(T, N, 1)
+        
+        # Q_safe: [T, E, A] -> [T, A, E] -> [T, N, 1]
+        Q_safe_agentmajor = Q_safe.permute(0, 2, 1).contiguous().view(T, N, 1)
+        
+        # advantages: [T, E, A] -> [T, A, E] -> [T, N, 1]
+        advantages_agentmajor = advantages_normalized.permute(0, 2, 1).contiguous().view(T, N, 1)
+        
+        # Store to buffer
+        self.returns_vl = Q_perf_agentmajor
+        self.returns_vh = Q_safe_agentmajor
+        self.advantages = advantages_agentmajor
+        
+        print(f"[BUFFER] Computed returns and advantages:")
+        print(f"         Q_perf: mean={Q_perf.mean().item():.4f}, std={Q_perf.std().item():.4f}")
+        print(f"         Q_safe: mean={Q_safe.mean().item():.4f}, std={Q_safe.std().item():.4f}")
+        print(f"         Advantages: mean={advantages_normalized.mean().item():.4f}, std={advantages_normalized.std().item():.4f}")
     
     def reset(self):
         """Reset buffer for next rollout."""

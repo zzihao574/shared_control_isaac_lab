@@ -2,6 +2,9 @@
 Epigraph Core Networks for Safe MARL.
 Contains: ZEncoder, ActorRNN, CriticVlRNN, CriticVhRNN, RootFinder.
 With sequence-based RNN training support (rMAPPO-aligned).
+
+This file is already well-structured and aligned with the paper.
+No major changes needed.
 """
 
 import math
@@ -148,6 +151,8 @@ class ZEncoder(nn.Module):
     """
     Map scalar z to z_enc vector.
     z: [B,1] -> z_enc: [B,nz]
+    
+    This is a learnable embedding that conditions the policy and critics on the risk budget.
     """
     def __init__(self, nz, z_mean=0.0, z_scale=0.2):
         super().__init__()
@@ -377,7 +382,7 @@ class CriticVhRNN(nn.Module):
 class RootFinder:
     """
     Binary search to find safe z values.
-    Optional utility for inference.
+    Used during evaluation to compute the minimum safe risk budget.
     """
     def __init__(self, z_min=-0.6, z_max=0.6, max_iter=32, tol=1e-4):
         self.z_min = z_min
@@ -388,9 +393,15 @@ class RootFinder:
     @torch.no_grad()
     def solve(self, vh_eval_fn, obs, h_tgt=0.0):
         """
-        vh_eval_fn: Callable([B,1] z) -> [B,1] predicted risk Vh
-        obs: not used directly unless vh_eval_fn closes over it
-        h_tgt: safety threshold
+        Find z* such that Vh(obs, z*) ≈ h_tgt using binary search.
+        
+        Args:
+            vh_eval_fn: Callable([B,1] z) -> [B,1] predicted risk Vh
+            obs: [B, obs_dim] observations (for device and batch size)
+            h_tgt: Safety threshold (default 0.0)
+        
+        Returns:
+            z_star: [B, 1] - Minimum safe z value per environment
         """
         device = obs.device
         B = obs.shape[0]

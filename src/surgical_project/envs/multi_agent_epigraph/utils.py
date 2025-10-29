@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """
 Environment utilities for Epigraph MARL training.
-Copied from multi_agent/utils.py with Epigraph helpers appended at the end.
-"""
 
-# ============================================================================
-# ORIGINAL UTILS (完整复制 surgical_direct_marl_env 的 utils.py)
-# ============================================================================
+Provides:
+- CompleteConstraintChecker: physics-based safety analysis
+- TrajectoryManager: task progress tracking
+- StepTracer: debug printing for four-zone rewards
+- compose_task_safe_from_rc: reward decomposition into task/safety signals
+
+ARCHITECTURE NOTE (Pure Epigraph: Self-Contained):
+- Environment maintains its own step counter (_env_debug_step_counter)
+- StepTracer is called by environment's own reward logic (_get_rewards)
+- Printing controlled purely by YAML config (logging.enable_console_logging)
+- No dependency on trainer or global_step from external sources
+- Completely independent from RMAPPO or other algorithms
+"""
 
 import torch
 import numpy as np
@@ -55,7 +63,7 @@ class CompleteConstraintChecker:
         
         for env_id in range(num_envs):
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
-            constraint_path = f"/World/envs/env_{env_id}/Constraint/Torus"
+            constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
             
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
@@ -186,7 +194,24 @@ class TrajectoryManager:
 
 
 class StepTracer:
-    """Console debugging with four-zone reward system monitoring."""
+    """
+    Console debug printer for Epigraph four-zone reward monitoring.
+    
+    HOW IT'S USED IN EPIGRAPH (Pure Self-Contained Design):
+    - The environment constructs a StepTracer in its __init__
+    - The environment calls step_tracer.maybe_print_step(...) from inside its own
+      reward logic (_get_rewards), but ONLY if logging.enable_console_logging == true
+      in the YAML
+    - No trainer/external dependency: the environment maintains its own local counter
+      (env._env_debug_step_counter) for step numbers
+    - This keeps Epigraph completely self-contained and independent
+    
+    DESIGN PRINCIPLES:
+    - RMAPPO is NOT involved
+    - Trainer does NOT need to inject step counts
+    - Environment controls its own logging based purely on YAML config
+    - Works identically in training and evaluation
+    """
     
     def __init__(self, num_envs: int, device: torch.device,
                  enable_console_logging: bool = False,
@@ -201,22 +226,26 @@ class StepTracer:
     def maybe_print_step(
         self,
         env,
-        r_task: torch.Tensor,        # [num_envs, num_agents]
-        r_safe_cost: torch.Tensor,   # [num_envs, num_agents], >=0
-        z: torch.Tensor,             # [num_envs, num_agents]
-        global_step: int,
+        r_task: torch.Tensor = None,        # [num_envs, num_agents] or Dict[agent, tensor]
+        r_safe_cost: torch.Tensor = None,   # [num_envs, num_agents], >=0
+        z: torch.Tensor = None,             # [num_envs, num_agents]
+        global_step: int = 0,
         force_print: bool = False,
     ):
         """
-        Print step information with Epigraph decomposition (task/safe/z).
-        
+        Print Epigraph decomposition (task/safe/z) for debugging.
+
+        NOTE: Environment calls this from its own _get_rewards() method,
+        using its own step counter (env._env_debug_step_counter).
+        No external dependency on trainer or global training step.
+
         Args:
             env: Environment instance
-            r_task: Task rewards [num_envs, num_agents]
-            r_safe_cost: Safety costs [num_envs, num_agents], non-negative
-            z: Risk budget values [num_envs, num_agents]
-            global_step: Current training step
-            force_print: Force printing regardless of print_every_steps
+            r_task: Task rewards (can be Dict[agent, tensor] or [num_envs, num_agents])
+            r_safe_cost: Safety costs [num_envs, num_agents], non-negative (optional)
+            z: Risk budget [num_envs, num_agents] (optional)
+            global_step: Step counter from environment (env._env_debug_step_counter)
+            force_print: Override print_every_steps frequency
         """
         if not self.enable_console_logging:
             return
@@ -224,42 +253,116 @@ class StepTracer:
         if not force_print and global_step % self.print_every_steps != 0:
             return
 
-        to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
+        agent_order = getattr(getattr(env, 'cfg', None), 'possible_agents', ['robot', 'human'])
 
-        print("=" * 80)
-        print(f"[STEP {global_step}] Four-Zone Safety Monitor (Epigraph)")
-        print("=" * 80)
-        print(f"Showing first {len(to_show)} of {self.num_envs} environments")
+        try:
+            r_task_mat = self._agent_matrix(r_task, agent_order, label='r_task')
+            r_safe_mat = self._agent_matrix(r_safe_cost, agent_order, label='r_safe_cost', default_zero=True)
 
-        # 1. Environment state snapshot: trajectory progress, normals, zone classification
-        for env_id in to_show:
-            self._print_env_snapshot(env, env_id)
+            idx_robot = agent_order.index('robot') if 'robot' in agent_order else 0
+            idx_human = agent_order.index('human') if 'human' in agent_order else min(1, r_task_mat.shape[1] - 1)
 
-        # 2. Reward decomposition display
-        print("\n[REWARD BREAKDOWN THIS STEP]")
-        for env_id in to_show:
-            rt_robot  = r_task[env_id, 0].item()
-            rt_human  = r_task[env_id, 1].item()
-            rc_robot  = r_safe_cost[env_id, 0].item()
-            rc_human  = r_safe_cost[env_id, 1].item()
-            print(f"  Env {env_id}:")
-            print(f"    task_reward        robot {rt_robot:+.3f} | human {rt_human:+.3f}")
-            print(f"    safe_cost (>=0)    robot {rc_robot:+.3f} | human {rc_human:+.3f}")
+            to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
 
-        # 3. Risk budget z
-        print("\n[Z (RISK BUDGET) THIS STEP]")
-        for env_id in to_show:
-            z_robot = z[env_id, 0].item()
-            z_human = z[env_id, 1].item()
-            z_team  = 0.5 * (z_robot + z_human)  # Team average for reference
-            print(f"  Env {env_id}: z_robot={z_robot:.4f} | z_human={z_human:.4f} | z_team(ref)={z_team:.4f}")
+            print('=' * 80)
+            print(f"[STEP {global_step}] Four-Zone Safety Monitor (Epigraph)")
+            print('=' * 80)
+            print(f"Showing first {len(to_show)} of {self.num_envs} environments")
 
-        # 4. Agent-level reward decomposition (original detailed breakdown)
-        for env_id in to_show:
-            self._print_agent_rewards(env, env_id, "ROBOT")
-            self._print_agent_rewards(env, env_id, "HUMAN")
+            # 1. Environment state snapshot: trajectory progress, normals, zone classification
+            for env_id in to_show:
+                self._print_env_snapshot(env, env_id)
 
+            # 2. Reward decomposition display
+            print("\n[REWARD BREAKDOWN THIS STEP]")
+            for env_id in to_show:
+                rt_robot  = r_task_mat[env_id, idx_robot].item()
+                rt_human  = r_task_mat[env_id, idx_human].item()
+                rc_robot  = r_safe_mat[env_id, idx_robot].item()
+                rc_human  = r_safe_mat[env_id, idx_human].item()
+                print(f"  Env {env_id}:")
+                print(f"    task_reward        robot {rt_robot:+.3f} | human {rt_human:+.3f}")
+                print(f"    safe_cost (>=0)    robot {rc_robot:+.3f} | human {rc_human:+.3f}")
 
+            # 3. Risk budget z is omitted (trainer controls z statistics)
+
+            # 4. Agent-level reward decomposition (original detailed breakdown)
+            for env_id in to_show:
+                self._print_agent_rewards(env, env_id, 'ROBOT')
+                self._print_agent_rewards(env, env_id, 'HUMAN')
+        except Exception as exc:
+            print('[STEPTRACER][ERROR] Exception during maybe_print_step:', repr(exc))
+            print(f'  agent_order: {agent_order}')
+            print(f"  r_task type: {type(r_task)}")
+            if torch.is_tensor(r_task):
+                print(f"  r_task shape: {tuple(r_task.shape)}")
+            elif isinstance(r_task, dict):
+                for key, val in r_task.items():
+                    shape = tuple(val.shape) if torch.is_tensor(val) else type(val)
+                    print(f"    r_task[{key}] -> {shape}")
+            print(f"  r_safe_cost type: {type(r_safe_cost)}")
+            if torch.is_tensor(r_safe_cost):
+                print(f"  r_safe_cost shape: {tuple(r_safe_cost.shape)}")
+            elif isinstance(r_safe_cost, dict):
+                for key, val in r_safe_cost.items():
+                    shape = tuple(val.shape) if torch.is_tensor(val) else type(val)
+                    print(f"    r_safe_cost[{key}] -> {shape}")
+            print(f"  z provided: {z is not None}")
+            if z is not None and torch.is_tensor(z):
+                print(f"  z shape: {tuple(z.shape)}")
+            reward_keys = []
+            if hasattr(env, 'reward_components'):
+                reward_keys = list(env.reward_components.keys())
+            print(f"  env.reward_components keys: {reward_keys}")
+            print(f"  global_step: {global_step}")
+            raise
+
+    def _agent_matrix(self, data, agent_order, label, default_zero=False):
+        num_agents = len(agent_order)
+        if data is None:
+            if default_zero:
+                return torch.zeros(self.num_envs, num_agents, device=self.device, dtype=torch.float32)
+            raise KeyError(f"{label} is None")
+
+        if torch.is_tensor(data):
+            if data.dim() == 2:
+                if data.shape[0] != self.num_envs:
+                    raise ValueError(f"{label} tensor has invalid shape {tuple(data.shape)}")
+                if data.shape[1] == num_agents:
+                    return data.to(self.device)
+                if data.shape[1] == 1 and num_agents > 1:
+                    return data.repeat(1, num_agents).to(self.device)
+                raise ValueError(f"{label} tensor second dim mismatch {data.shape[1]} vs {num_agents}")
+            if data.dim() == 1:
+                base = data.view(self.num_envs, 1)
+                base = base.to(self.device)
+                return base.repeat(1, num_agents) if num_agents > 1 else base
+            raise ValueError(f"{label} tensor unsupported dims {data.dim()}")
+
+        if isinstance(data, dict):
+            cols = []
+            for agent in agent_order:
+                value = data.get(agent)
+                if value is None:
+                    if default_zero:
+                        cols.append(torch.zeros(self.num_envs, device=self.device, dtype=torch.float32))
+                        continue
+                    raise KeyError((agent, label))
+                if not torch.is_tensor(value):
+                    raise TypeError(f"{label}[{agent}] must be tensor, got {type(value)}")
+                if value.dim() == 1:
+                    cols.append(value.to(self.device))
+                elif value.dim() == 2:
+                    if value.shape[1] == 1:
+                        cols.append(value[:, 0].to(self.device))
+                    else:
+                        raise ValueError(f"{label}[{agent}] tensor shape {tuple(value.shape)} unsupported")
+                else:
+                    cols.append(value.reshape(self.num_envs).to(self.device))
+            stacked = torch.stack(cols, dim=1)
+            return stacked
+
+        raise TypeError(f"{label} has unsupported type {type(data)}")
     def _print_env_snapshot(self, env, env_id: int):
         """Print detailed environment state snapshot."""
         stylus = env.stylus_pos_t1[env_id]
@@ -430,49 +533,56 @@ def compose_task_safe_from_rc(
     include_zpenalty_in_safe: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Decompose reward_components into task reward and safety risk for Epigraph training.
+    Decompose reward_components into task reward and safety risk for Epigraph.
     
-    Task includes:
-        - Zone A/B/D (excluding inward penalties)
-        - Global: potential, completion, (optional) time_eff
-        - Force penalties (already negative)
-        - Awareness: humanaware (robot) / robotaware (human)
+    Returns:
+        r_task: Task performance reward (for Vl critic)
+        r_safe_risk: Safety risk signal (for Vh critic)
+    
+    SIGN CONVENTION:
+        r_safe_risk is NEGATIVE or zero in danger zones (penalties).
+        Trainer/env converts to positive cost via: cost = relu(-r_safe_risk)
+        Higher cost = more dangerous.
+    
+    Task components:
+        - Zone A/B/D (progress, deviation, gap, surface tangent)
+        - Global: potential, completion, (optional) time efficiency
+        - Force penalties (negative comfort penalties)
+        - Awareness (humanaware/robotaware)
         
-    Safe includes:
-        - Zone C (danger zone)
+    Safety components:
+        - Zone C danger penalties (offpen, inward, overlap)
         - B/D inward penalties
-        - (optional) Z penalty
+        - (optional) Global z-penalty
     
     Args:
         rc: reward_components from environment
         agent: "human" or "robot"
         device: torch device
         num_envs: number of environments
-        use_time_eff_in_task: whether to include time efficiency in task reward
-        include_zpenalty_in_safe: whether to include z penalty in safety cost
-        
-    Returns:
-        Tuple of (r_task, r_safe_risk) tensors
+        use_time_eff_in_task: include time efficiency in task
+        include_zpenalty_in_safe: include z penalty in safety
     """
     z = lambda k: safe_get_rc(rc, k, device, num_envs)
 
     aware_key = "humanaware" if agent == "robot" else "robotaware"
 
-    # Task quality reward (for training Vl)
+    # Task quality reward (for Vl critic)
     r_task = (
         z(f"zoneA_total_{agent}")
         + z(f"zoneB_gap_{agent}_contrib")
         + z(f"zoneB_surftangent_{agent}_contrib")
         + z(f"zoneD_progress_{agent}_contrib")
         + z(f"zoneD_deviation_{agent}_contrib")
-        + z(f"global_potential_{agent}_contrib")      # potential_xxx
-        + z(f"global_completion_{agent}_contrib")     # completion_xxx
+        + z(f"global_potential_{agent}_contrib")
+        + z(f"global_completion_{agent}_contrib")
         + (z(f"global_timeeff_{agent}_contrib") if use_time_eff_in_task else _zeros(device, num_envs))
-        + z(f"{agent}force_contrib")                  # forceeff_xxx
-        + z(f"{aware_key}_contrib")                   # humanaware / robotaware
+        + z(f"{agent}force_contrib")
+        + z(f"{aware_key}_contrib")
     )
 
-    # Safety risk (for training Vh) - negative values indicating danger
+    # Safety risk (NEGATIVE when dangerous, for Vh critic)
+    # Trainer converts to positive cost: cost = relu(-r_safe_risk)
     r_safe_risk = (
         z(f"zoneC_total_{agent}")
         + z(f"zoneB_inward_{agent}_contrib")

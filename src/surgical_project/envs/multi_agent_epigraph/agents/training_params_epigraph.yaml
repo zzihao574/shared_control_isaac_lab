@@ -8,8 +8,6 @@
 # ==============================================================================
 training:
   seed: 42
-  eval_interval: 10000          # Steps between evaluations
-  save_interval: 50000          # Steps between checkpoints
   lr_decay:
     enabled: true               # Enable cosine learning rate decay
     final_factor: 0.1          # Final learning rate = initial * 0.1
@@ -18,8 +16,7 @@ training:
 # Logging Configuration
 # ==============================================================================
 logging:
-  use_wandb: true              # Enable WandB logging
-  enable_console_logging: false # Enable detailed console logging
+  enable_console_logging: true # Enable detailed console logging
 
 # ==============================================================================
 # Algorithm Configuration (RMAPPO-compatible)
@@ -73,15 +70,15 @@ algorithms:
 # ==============================================================================
 epigraph:
   z:
-    min: -0.6                         # Lower bound for z values
-    max: 0.6                          # Upper bound for z values
+    min: -0.2                         # Lower bound for z values
+    max: 0.2                          # Upper bound for z values
     init:
       mode: mixed                     # Initialization mode: uniform/extreme/mixed
       p_extreme: 0.3                  # Probability of extreme values (for mixed mode)
     encode:
       nz: 8                           # Z encoding dimension
       mean: 0.0                       # Normalization mean
-      scale: 0.2                      # Normalization scale
+      scale: 0.3                      # Normalization scale
   
   losses:
     lambda_safe: 1.0                  # Weight for safety advantage in combined advantage

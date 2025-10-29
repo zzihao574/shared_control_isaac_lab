@@ -158,7 +158,7 @@ class SurgicalEpigraphEnvCfg(DirectMARLEnvCfg):
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/torus.usd",
+            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/sphere.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,
                 disable_gravity=True,
@@ -166,7 +166,7 @@ class SurgicalEpigraphEnvCfg(DirectMARLEnvCfg):
             scale=(1, 1, 1),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.14, -0.04, 0.0),
+            pos=(0.14, 0.0, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )

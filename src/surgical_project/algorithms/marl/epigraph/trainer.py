@@ -1,23 +1,51 @@
 """
 Epigraph Trainer for Safe Multi-Agent Reinforcement Learning.
-With sequence-based RNN training (rMAPPO-aligned).
-Final corrected version with:
-1. No gamma in z dynamics
-2. Agent-major reshape logic
-3. z_encoder gradient isolation
-4. z_encoder config from YAML
+With sequence-based RNN training (rMAPPO-aligned) and milestone-driven evaluation.
+
+ROUTE B MODIFICATIONS:
+1. Added full_config, ckpt_dir, max_global_steps to constructor
+2. Added milestone tracking and maybe_milestone_eval_and_save()
+3. Added run_single_eval_episode() for root_finder-based evaluation
+4. Improved evaluate() to use run_single_eval_episode()
+5. Added WandB logger integration
+6. Added global_episodes tracking
+7. collect_rollout() now returns proper statistics using summarize_rollout_stats()
+8. update() uses buffer.compute_returns_and_advantages()
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from typing import Dict, Any, Optional, Tuple, List
+from collections import deque
 import numpy as np
+import traceback
 
 from .epigraph_core import ZEncoder, ActorRNN, CriticVlRNN, CriticVhRNN, RootFinder
 from .rollout_buffer_z import RolloutBufferZ
-from .utils import compute_epigraph_gae, normalize_advantages
+
+
+# Import training helpers
+try:
+    from scripts.utils.training_helpers_epigraph import (
+        summarize_rollout_stats,
+        summarize_eval_stats,
+        WandBLogger,
+    )
+except ImportError:
+    try:
+        from surgical_project.scripts.utils.training_helpers_epigraph import (
+            summarize_rollout_stats,
+            summarize_eval_stats,
+            WandBLogger,
+        )
+    except ImportError:
+        print("[WARNING] Could not import training_helpers_epigraph, some features may be limited")
+        summarize_rollout_stats = None
+        summarize_eval_stats = None
+        WandBLogger = None
 
 
 def init_z_global(num_envs: int, z_min: float, z_max: float, device, mode: str = "mixed", p_extreme: float = 0.3):
@@ -38,33 +66,67 @@ def init_z_global(num_envs: int, z_min: float, z_max: float, device, mode: str =
     return z
 
 
-def update_z_epigraph(z: torch.Tensor, reward: torch.Tensor, z_min: float, z_max: float):
+def update_z_epigraph(
+    z: torch.Tensor,
+    reward: torch.Tensor,      # team reward per env, shape [E, 1]
+    gamma: float,
+    z_min: float,
+    z_max: float,
+):
     """
-    Epigraph z dynamics (paper-style).
-    z_{t+1} = z_t + r_team(t)
-    No gamma here.
+    Epigraph z dynamics aligned with the source rollout:
+        z_{t+1} = (z_t + r_team_t) / gamma
+    Then clamp to [z_min, z_max].
     """
-    z_next = z + reward
-    return torch.clamp(z_next, z_min, z_max)
+    z_next = (z + reward) / gamma
+    z_next = torch.clamp(z_next, z_min, z_max)
+    return z_next
 
 
 class EpigraphTrainer:
     """
-    Epigraph MARL trainer with sequence-based RNN training.
+    Epigraph MARL trainer with sequence-based RNN training and milestone-driven evaluation.
+    
+    This trainer acts as a unified "Runner + Updater + Evaluator" following Route B design.
     """
     
-    def __init__(self, env, device: torch.device, algo_cfg: Dict[str, Any], epi_cfg: Dict[str, Any]):
-        """Initialize Epigraph trainer."""
+    def __init__(
+        self,
+        env,
+        device: torch.device,
+        algo_cfg: Dict[str, Any],
+        epi_cfg: Dict[str, Any],
+        full_config: Dict[str, Any],
+        ckpt_dir: str,
+        max_global_steps: int,
+    ):
+        """
+        Initialize Epigraph trainer.
+        
+        Args:
+            env: Multi-agent environment
+            device: PyTorch device
+            algo_cfg: Algorithm configuration (from config["algorithms"]["rmappo"])
+            epi_cfg: Epigraph-specific configuration (from config["epigraph"])
+            full_config: Complete YAML configuration dictionary
+            ckpt_dir: Directory to save checkpoints
+            max_global_steps: Maximum training steps
+        """
         self.env = env
         self.device = device
         self.algo_cfg = algo_cfg
         self.epi_cfg = epi_cfg
+        self.full_config = full_config
+        self.ckpt_dir = ckpt_dir
+        self.max_global_steps = max_global_steps
         
+        # Extract environment params
         if hasattr(env.unwrapped, "params"):
             self.env_cfg = env.unwrapped.params.get("epigraph_env", {})
         else:
             self.env_cfg = {}
         
+        # Environment dimensions
         self.num_envs = env.num_envs
         self.agent_ids = list(env.unwrapped.cfg.possible_agents)
         self.num_agents = len(self.agent_ids)
@@ -75,6 +137,7 @@ class EpigraphTrainer:
         self.hidden_size = algo_cfg["hidden_size"]
         self.recurrent_N = algo_cfg.get("recurrent_N", 1)
         
+        # Training hyperparameters
         self.rollout_horizon = algo_cfg["rollout_horizon"]
         self.gamma = algo_cfg["gamma"]
         self.gae_lambda = algo_cfg["gae_lambda"]
@@ -87,6 +150,7 @@ class EpigraphTrainer:
         self.max_grad_norm_actor = algo_cfg["max_grad_norm_actor"]
         self.max_grad_norm_critic = algo_cfg["max_grad_norm_critic"]
         
+        # Epigraph-specific hyperparameters
         self.z_min = epi_cfg["z"]["min"]
         self.z_max = epi_cfg["z"]["max"]
         self.z_nz = epi_cfg["z"]["encode"]["nz"]
@@ -94,23 +158,53 @@ class EpigraphTrainer:
         self.z_init_p_extreme = epi_cfg["z"]["init"]["p_extreme"]
         self.lambda_safe = epi_cfg["losses"]["lambda_safe"]
         
+        # Build networks, buffer, optimizers
         self._build_networks()
         self._build_buffer()
         self._build_optimizers()
         self._init_rnn_states()
         
+        # Training state
         self.global_step = 0
-        self.episodes_done = 0
+        self.global_episodes = 0
+        self.episodes_done = 0  # Legacy name for compatibility
         
+        # Milestone tracking (Route B)
+        milestone_episodes = full_config.get("training_monitor", {}).get("milestone_episodes", [])
+        self.milestones = deque(sorted(milestone_episodes))
+        print(f"[TRAINER] Milestones configured: {list(self.milestones)}")
+        
+        # WandB logger (if enabled)
+        self.wandb_logger = None
+        if full_config.get("logging", {}).get("use_wandb", False) and WandBLogger is not None:
+            wandb_cfg = full_config.get("logging", {}).get("wandb", {})
+            self.wandb_logger = WandBLogger(
+                project=wandb_cfg.get("project", "epigraph_training"),
+                run_name=wandb_cfg.get("run_name", f"epigraph_{os.path.basename(ckpt_dir)}"),
+                config=full_config,
+                entity=wandb_cfg.get("entity", None),
+            )
+            if self.wandb_logger.enabled:
+                print("[TRAINER] WandB logger initialized")
+            else:
+                print("[TRAINER] WandB logger disabled")
+
+        self._cached_obs = None
+        self._cached_z = None
+        self._cached_masks = None
+        self._needs_env_reset = True
+
+
     def _build_networks(self):
         """Build all networks."""
-        # FIX 4: Read z_encoder params from config
+        # Z encoder
         self.z_encoder = ZEncoder(
             nz=self.z_nz,
             z_mean=self.epi_cfg["z"]["encode"]["mean"],
             z_scale=self.epi_cfg["z"]["encode"]["scale"],
         ).to(self.device)
         
+        # Per-agent actors and safety critics
         self.actors = {}
         self.critics_vh = {}
         for agent in self.agent_ids:
@@ -129,6 +223,7 @@ class EpigraphTrainer:
                 recurrent_N=self.recurrent_N,
             ).to(self.device)
         
+        # Centralized performance critic
         self.critic_vl = CriticVlRNN(
             share_obs_dim=self.share_obs_dim,
             hidden_size=self.hidden_size,
@@ -136,6 +231,7 @@ class EpigraphTrainer:
             recurrent_N=self.recurrent_N,
         ).to(self.device)
         
+        # Root finder for safe z* computation (used in evaluation)
         self.root_finder = RootFinder(
             max_iter=self.epi_cfg["root_finder"]["max_iter"],
             tol=self.epi_cfg["root_finder"]["tol"],
@@ -157,6 +253,7 @@ class EpigraphTrainer:
         
     def _build_optimizers(self):
         """Build optimizers."""
+        # Actor optimizer includes z_encoder parameters
         actor_params = list(self.z_encoder.parameters())
         for agent in self.agent_ids:
             actor_params.extend(list(self.actors[agent].parameters()))
@@ -165,10 +262,12 @@ class EpigraphTrainer:
             actor_params, lr=self.algo_cfg["actor_lr"], eps=self.algo_cfg["opt_eps"]
         )
         
+        # Centralized Vl critic optimizer
         self.optimizer_vl = optim.Adam(
             self.critic_vl.parameters(), lr=self.algo_cfg["critic_lr"], eps=self.algo_cfg["opt_eps"]
         )
         
+        # Per-agent Vh critic optimizers
         self.optimizers_vh = {}
         for agent in self.agent_ids:
             self.optimizers_vh[agent] = optim.Adam(
@@ -186,6 +285,14 @@ class EpigraphTrainer:
                 "vh": torch.zeros(self.num_envs, self.hidden_size, device=self.device),
             }
         self.rnn_states_vl = torch.zeros(self.num_envs, self.hidden_size, device=self.device)
+
+    def _mark_env_reset_needed(self):
+        """Flag that the environment should be fully reset before the next rollout."""
+        self._needs_env_reset = True
+        self._cached_obs = None
+        self._cached_z = None
+        self._cached_masks = None
+
         
     def _flatten_per_agent(self, per_agent_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Flatten per-agent dict to [num_envs*num_agents, ...] in agent-major order."""
@@ -247,69 +354,116 @@ class EpigraphTrainer:
     @torch.no_grad()
     def collect_rollout(self) -> Dict[str, Any]:
         """
-        Collect one rollout with dynamic masks and proper bootstrap logic.
+        Collect one rollout of length self.rollout_horizon from all parallel envs.
+
+        Returns:
+            rollout_stats: Dictionary with statistics for logging
         """
         self.set_eval_mode()
-        
-        obs, _ = self.env.reset()
-        z_global = self._init_z_training()
-        self._init_rnn_states()
-        
-        masks = torch.ones(self.num_envs, 1, device=self.device)
-        
+
+        if self._needs_env_reset or self._cached_obs is None:
+            obs, _ = self.env.reset()
+            z_global = self._init_z_training()
+            self._init_rnn_states()
+            masks = torch.ones(self.num_envs, 1, device=self.device)
+            self._needs_env_reset = False
+        else:
+            obs = {agent: self._cached_obs[agent].clone().detach() for agent in self.agent_ids}
+            cached_z = self._cached_z
+            if cached_z is None or cached_z.shape[0] != self.num_envs:
+                z_global = self._init_z_training()
+            else:
+                z_global = cached_z.clone().detach()
+            if self._cached_masks is not None:
+                masks = self._cached_masks.clone().detach()
+            else:
+                masks = torch.ones(self.num_envs, 1, device=self.device)
+
+        # Episode-level bookkeeping for logging
         episode_returns_task = []
         episode_returns_safe = []
         episode_lengths = []
         current_returns_task = torch.zeros(self.num_envs, device=self.device)
         current_returns_safe = torch.zeros(self.num_envs, device=self.device)
         current_lengths = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        
+
+        # Track z values and violations for rollout stats
+        z_values_rollout = []
+        violations_rollout = []
+
         for t in range(self.rollout_horizon):
-            z_enc = self.z_encoder(z_global)
-            
+            # Encode z for all envs (shared z is broadcast to all agents)
+            z_enc = self.z_encoder(z_global)  # [E, nz]
+            z_values_rollout.append(z_global.clone())
+
+            # Act for each agent
             actions = {}
             action_log_probs = {}
             for agent in self.agent_ids:
                 act, logp, next_h_actor, _ = self.actors[agent].act_step(
-                    obs[agent], z_enc, self.rnn_states[agent]["actor"], masks, deterministic=False
+                    obs[agent],                        # [E, obs_dim]
+                    z_enc,                             # [E, nz]
+                    self.rnn_states[agent]["actor"],   # [E, H]
+                    masks,                             # [E, 1]
+                    deterministic=False
                 )
                 actions[agent] = act
                 action_log_probs[agent] = logp
                 self.rnn_states[agent]["actor"] = next_h_actor
-            
-            share_obs = self._get_share_obs(obs)
-            vl, next_h_vl = self.critic_vl.value_step(share_obs, z_enc, self.rnn_states_vl, masks)
+
+            # Centralized Vl critic uses concatenated obs from all agents
+            share_obs = self._get_share_obs(obs)  # [E, A*obs_dim]
+            vl, next_h_vl = self.critic_vl.value_step(
+                share_obs,            # [E, share_obs_dim]
+                z_enc,                # [E, nz]
+                self.rnn_states_vl,   # [E, H]
+                masks                 # [E, 1]
+            )
             self.rnn_states_vl = next_h_vl
-            
+
+            # Per-agent Vh critics
             vh = {}
             for agent in self.agent_ids:
                 vh_val, next_h_vh = self.critics_vh[agent].value_step(
-                    obs[agent], z_enc, self.rnn_states[agent]["vh"], masks
+                    obs[agent],                      # [E, obs_dim]
+                    z_enc,                           # [E, nz]
+                    self.rnn_states[agent]["vh"],    # [E, H]
+                    masks                            # [E, 1]
                 )
                 vh[agent] = vh_val
                 self.rnn_states[agent]["vh"] = next_h_vh
-            
+
+            # Env step
             obs_next, rewards, terminated, truncated, info = self.env.step(actions)
-            
-            r_task = info["r_task"]
-            r_safe = info["r_safe"]
+
+            # Pull training signals (dicts keyed by agent)
+            r_task = info["r_task"]   # {agent: [E,1]} task part for Vl
+            r_safe = info["r_safe"]   # {agent: [E,1]} safety cost part for Vh
+
+            # Team reward = average over agents (shape [E,1])
             r_team = sum(r_task[a] for a in self.agent_ids) / self.num_agents
-            
+
+            # Track violations if available
+            if "is_violating" in info and info["is_violating"] is not None:
+                violations_rollout.append(info["is_violating"])
+
+            # Figure out which envs ended this step
             term_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
             trunc_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
             done_any_env = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
-            
+
             for agent in self.agent_ids:
                 term_a = terminated[agent] if terminated[agent].dim() == 2 else terminated[agent].unsqueeze(-1)
                 trunc_a = truncated[agent] if truncated[agent].dim() == 2 else truncated[agent].unsqueeze(-1)
                 term_any_env |= term_a
                 trunc_any_env |= trunc_a
                 done_any_env |= (term_a | trunc_a)
-            
-            masks_flat_t = masks.repeat(self.num_agents, 1)
-            term_mask_env = (~term_any_env).float()
-            term_masks_flat_t = term_mask_env.repeat(self.num_agents, 1)
-            
+
+            # Masks used for PPO/RNN:
+            masks_flat_t = masks.repeat(self.num_agents, 1)  # [N,1] (N=E*A)
+            term_mask_env = (~term_any_env).float()          # [E,1]
+            term_masks_flat_t = term_mask_env.repeat(self.num_agents, 1)  # [N,1]
+
             (
                 override_mask_vl_flat_t,
                 override_vl_flat_t,
@@ -326,38 +480,61 @@ class EpigraphTrainer:
                 term_any_env=term_any_env,
                 trunc_any_env=trunc_any_env,
             )
-            
+
+            # Ensure rewards have shape [E, 1]
+            rewards_formatted = {}
+            for agent in self.agent_ids:
+                rew_agent = rewards[agent]
+                if rew_agent.dim() == 1:
+                    rew_agent = rew_agent.unsqueeze(-1)
+                rewards_formatted[agent] = rew_agent
+
+            # Write step t into rollout buffer (agent-major order)
             self.buffer.insert(
-                obs=self._flatten_per_agent(obs),
-                share_obs=self._replicate_global_for_agents(share_obs),
-                actions=self._flatten_per_agent(actions),
-                action_log_probs=self._flatten_per_agent(action_log_probs),
-                rewards=self._flatten_per_agent(rewards),
-                rewards_task=self._flatten_per_agent(r_task),
-                costs_safe=self._flatten_per_agent(r_safe),
-                values_vl=self._replicate_global_for_agents(vl),
-                values_vh=self._flatten_per_agent(vh),
-                z=self._replicate_global_for_agents(z_global),
-                masks=masks_flat_t,
-                term_masks=term_masks_flat_t,
-                override_bootstrap_mask_vl=override_mask_vl_flat_t,
-                override_bootstrap_vl=override_vl_flat_t,
-                override_bootstrap_mask_vh=override_mask_vh_flat_t,
-                override_bootstrap_vh=override_vh_flat_t,
-                rnn_states_actor=torch.cat([self.rnn_states[a]["actor"] for a in self.agent_ids], dim=0),
-                rnn_states_critic=self.rnn_states_vl.repeat(self.num_agents, 1),
-                rnn_states_vh=torch.cat([self.rnn_states[a]["vh"] for a in self.agent_ids], dim=0),
+                obs=self._flatten_per_agent(obs),                           # [N, obs_dim]
+                share_obs=self._replicate_global_for_agents(share_obs),     # [N, share_obs_dim]
+                actions=self._flatten_per_agent(actions),                   # [N, act_dim]
+                action_log_probs=self._flatten_per_agent(action_log_probs), # [N, 1]
+                rewards=self._flatten_per_agent(rewards_formatted),         # [N, 1] raw env reward
+                rewards_task=self._flatten_per_agent(r_task),               # [N, 1] task part
+                costs_safe=self._flatten_per_agent(r_safe),                 # [N, 1] safety cost
+                values_vl=self._replicate_global_for_agents(vl),            # [N, 1]
+                values_vh=self._flatten_per_agent(vh),                      # [N, 1]
+                z=self._replicate_global_for_agents(z_global),              # [N, 1]
+                masks=masks_flat_t,                                         # [N, 1] alive going into t
+                term_masks=term_masks_flat_t,                               # [N, 1] alive after t
+                override_bootstrap_mask_vl=override_mask_vl_flat_t,         # [N, 1]
+                override_bootstrap_vl=override_vl_flat_t,                   # [N, 1]
+                override_bootstrap_mask_vh=override_mask_vh_flat_t,         # [N, 1]
+                override_bootstrap_vh=override_vh_flat_t,                   # [N, 1]
+                rnn_states_actor=torch.cat(
+                    [self.rnn_states[a]["actor"] for a in self.agent_ids],
+                    dim=0
+                ),                                                          # [N, H]
+                rnn_states_critic=self.rnn_states_vl.repeat(self.num_agents, 1),  # [N, H]
+                rnn_states_vh=torch.cat(
+                    [self.rnn_states[a]["vh"] for a in self.agent_ids],
+                    dim=0
+                ),                                                          # [N, H]
             )
-            
-            # FIX 1: No gamma in z dynamics
-            z_global = update_z_epigraph(z_global, r_team, self.z_min, self.z_max)
-            
-            r_task_mean = sum(r_task[a].squeeze(-1) for a in self.agent_ids) / self.num_agents
-            r_safe_mean = sum(r_safe[a].squeeze(-1) for a in self.agent_ids) / self.num_agents
+
+            # Z update: source-style z_{t+1} = (z_t + r_team) / gamma
+            z_global = update_z_epigraph(
+                z_global,
+                r_team,
+                self.gamma,
+                self.z_min,
+                self.z_max,
+            )
+
+            # Episode return bookkeeping (for logging only)
+            r_task_mean = sum(r_task[a].squeeze(-1) for a in self.agent_ids) / self.num_agents  # [E]
+            r_safe_mean = sum(r_safe[a].squeeze(-1) for a in self.agent_ids) / self.num_agents  # [E]
             current_returns_task += r_task_mean
             current_returns_safe += r_safe_mean
             current_lengths += 1
-            
+
+            # Finalize stats for envs that ended
             if done_any_env.any():
                 done_indices = done_any_env.squeeze(-1).nonzero(as_tuple=True)[0]
                 episode_returns_task.extend(current_returns_task[done_indices].cpu().tolist())
@@ -367,45 +544,97 @@ class EpigraphTrainer:
                 current_returns_safe[done_indices] = 0.0
                 current_lengths[done_indices] = 0
                 self.episodes_done += len(done_indices)
-            
+                self.global_episodes += len(done_indices)
+
+            # Advance loop state
             obs = obs_next
-            masks = (~done_any_env).float()
-            self.global_step += self.num_envs
-        
-        z_enc_last = self.z_encoder(z_global)
+            masks = (~done_any_env).float()  # [E,1] 1 for still-running envs
+            self.global_step += self.num_envs  # Count only *training* env steps
+
+        # Bootstrap final values at t = T
+        z_enc_last = self.z_encoder(z_global)  # [E, nz]
         share_obs_last = self._get_share_obs(obs)
         masks_last = torch.ones(self.num_envs, 1, device=self.device)
-        
-        vl_last, _ = self.critic_vl.value_step(share_obs_last, z_enc_last, self.rnn_states_vl, masks_last)
+
+        vl_last, _ = self.critic_vl.value_step(
+            share_obs_last,
+            z_enc_last,
+            self.rnn_states_vl,
+            masks_last,
+        )
         vh_last = {}
         for agent in self.agent_ids:
             vh_last[agent], _ = self.critics_vh[agent].value_step(
-                obs[agent], z_enc_last, self.rnn_states[agent]["vh"], masks_last
+                obs[agent],
+                z_enc_last,
+                self.rnn_states[agent]["vh"],
+                masks_last,
             )
-        
+
+        # Store bootstrap slice at T (for GAE computation)
         self.buffer.insert_final_step(
             obs=self._flatten_per_agent(obs),
             share_obs=self._replicate_global_for_agents(share_obs_last),
             values_vl=self._replicate_global_for_agents(vl_last),
             values_vh=self._flatten_per_agent(vh_last),
-            z=self._replicate_global_for_agents(z_global)
+            z=self._replicate_global_for_agents(z_global),
         )
-        
-        rollout_info = {
-            "return_task_mean": np.mean(episode_returns_task) if episode_returns_task else 0.0,
-            "return_task_std": np.std(episode_returns_task) if episode_returns_task else 0.0,
-            "return_safe_mean": np.mean(episode_returns_safe) if episode_returns_safe else 0.0,
-            "return_safe_std": np.std(episode_returns_safe) if episode_returns_safe else 0.0,
-            "episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
-            "episodes_done": len(episode_returns_task),
-            "z_mean": float(self.buffer.z[:self.rollout_horizon].mean().item()),
-            "z_std": float(self.buffer.z[:self.rollout_horizon].std().item()),
-            "z_min": float(self.buffer.z[:self.rollout_horizon].min().item()),
-            "z_max": float(self.buffer.z[:self.rollout_horizon].max().item()),
-        }
-        
-        return rollout_info
-    
+
+        # Compute rollout statistics using helper function (if available)
+        if summarize_rollout_stats is not None:
+            T = self.rollout_horizon
+            E = self.num_envs
+            A = self.num_agents
+
+            r_task_tensor = self._reshape_agentmajor_to_env_agent_T(
+                self.buffer.rewards_task[:T], has_trailing_dim1=True
+            ).squeeze(-1)  # [T, E, A]
+
+            r_safe_tensor = self._reshape_agentmajor_to_env_agent_T(
+                self.buffer.costs_safe[:T], has_trailing_dim1=True
+            ).squeeze(-1)  # [T, E, A]
+
+            z_tensor = self._reshape_agentmajor_to_env_agent_T(
+                self.buffer.z[:T], has_trailing_dim1=True
+            ).squeeze(-1)  # [T, E, A]
+
+            term_masks_bool = (self.buffer.term_masks[:T] > 0.5)
+            dones_tensor = self._reshape_agentmajor_to_env_agent_T(
+                ~term_masks_bool, has_trailing_dim1=True
+            ).squeeze(-1).any(dim=2).float()  # [T, E]
+
+            info_for_stats = {}
+            if len(violations_rollout) > 0:
+                info_for_stats["is_violating"] = torch.stack(violations_rollout, dim=0)
+            if "progress_ratio" in info:
+                info_for_stats["progress_ratio"] = info["progress_ratio"]
+
+            rollout_stats = summarize_rollout_stats(
+                r_task=r_task_tensor,
+                r_safe_cost=r_safe_tensor,
+                z=z_tensor,
+                dones=dones_tensor,
+                info=info_for_stats,
+                agent_labels=self.agent_ids,
+            )
+        else:
+            rollout_stats = {
+                "return_task_mean": np.mean(episode_returns_task) if episode_returns_task else 0.0,
+                "return_task_std": np.std(episode_returns_task) if episode_returns_task else 0.0,
+                "return_safe_mean": np.mean(episode_returns_safe) if episode_returns_safe else 0.0,
+                "return_safe_std": np.std(episode_returns_safe) if episode_returns_safe else 0.0,
+                "episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+                "episodes_finished": len(episode_returns_task),
+                "z_mean": float(torch.stack(z_values_rollout).mean().item()) if z_values_rollout else 0.0,
+                "z_std": float(torch.stack(z_values_rollout).std().item()) if z_values_rollout else 0.0,
+            }
+
+        # Cache state for next rollout
+        self._cached_obs = {agent: obs[agent].clone().detach() for agent in self.agent_ids}
+        self._cached_z = z_global.clone().detach()
+        self._cached_masks = masks.clone().detach()
+
+        return rollout_stats
     def _maybe_override_bootstrap(
         self,
         obs_next,
@@ -417,6 +646,7 @@ class EpigraphTrainer:
     ):
         """
         Placeholder for override bootstrap mechanism.
+        In milestone truncation, this will be used to set custom bootstrap values.
         """
         E = self.num_envs
         A = self.num_agents
@@ -441,84 +671,23 @@ class EpigraphTrainer:
             override_vh_flat,
         )
     
-    def update(self):
+    def update(self) -> Dict[str, Any]:
         """
         Sequence-based PPO update with RNN training.
-        With proper agent-major reshape and z_encoder gradient isolation.
+        
+        Returns:
+            update_stats: Dictionary with loss and training statistics
         """
         self.set_train_mode()
         
-        T = self.rollout_horizon
-        E = self.num_envs
-        A = self.num_agents
-        N = E * A
-        
-        # FIX 2: Use proper agent-major reshape
-        rewards_task_buf = self.buffer.rewards_task[:T]
-        costs_safe_buf = self.buffer.costs_safe[:T]
-        z_buf = self.buffer.z[:T]
-        vl_buf = self.buffer.values_vl[:T+1]
-        vh_buf = self.buffer.values_vh[:T+1]
-        masks_buf = self.buffer.masks[:T]
-        term_masks_buf = self.buffer.term_masks[:T]
-        ov_mask_vl_buf = self.buffer.override_bootstrap_mask_vl[:T]
-        ov_vl_buf = self.buffer.override_bootstrap_vl[:T]
-        ov_mask_vh_buf = self.buffer.override_bootstrap_mask_vh[:T]
-        ov_vh_buf = self.buffer.override_bootstrap_vh[:T]
-        
-        # Reshape from agent-major [T,N,1] to [T,E,A]
-        rewards_team = self._reshape_agentmajor_to_env_agent_T(rewards_task_buf, has_trailing_dim1=True).mean(dim=2).squeeze(-1)  # [T,E]
-        costs_safe = self._reshape_agentmajor_to_env_agent_T(costs_safe_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E,A]
-        z_traj = self._reshape_agentmajor_to_env_agent_T(z_buf, has_trailing_dim1=True).mean(dim=2).squeeze(-1)  # [T,E]
-        vl_preds = self._reshape_agentmajor_to_env_agent_Tplus1(vl_buf, has_trailing_dim1=True).mean(dim=2).squeeze(-1)  # [T+1,E]
-        vh_preds = self._reshape_agentmajor_to_env_agent_Tplus1(vh_buf, has_trailing_dim1=True).squeeze(-1)  # [T+1,E,A]
-        masks = self._reshape_agentmajor_to_env_agent_T(masks_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E]
-        term_masks = self._reshape_agentmajor_to_env_agent_T(term_masks_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E]
-        
-        # Vl overrides are team-level, need to average agent dim
-        ov_mask_vl = self._reshape_agentmajor_to_env_agent_T(ov_mask_vl_buf, has_trailing_dim1=True).squeeze(-1).float()  # [T,E,A]
-        ov_mask_vl = ov_mask_vl.mean(dim=2)  # [T,E]
-        ov_vl = self._reshape_agentmajor_to_env_agent_T(ov_vl_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E,A]
-        ov_vl = ov_vl.mean(dim=2)  # [T,E]
-        
-        # Vh overrides are per-agent
-        ov_mask_vh = self._reshape_agentmajor_to_env_agent_T(ov_mask_vh_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E,A]
-        ov_vh = self._reshape_agentmajor_to_env_agent_T(ov_vh_buf, has_trailing_dim1=True).squeeze(-1)  # [T,E,A]
-        
-        Q_perf, Q_safe, advantages = compute_epigraph_gae(
-            rewards=rewards_team,
-            costs=costs_safe,
-            z_traj=z_traj,
-            vl_preds=vl_preds,
-            vh_preds=vh_preds,
-            masks=masks,
-            term_masks=term_masks,
-            ov_mask_vl=ov_mask_vl,
-            ov_vl=ov_vl,
-            ov_mask_vh=ov_mask_vh,
-            ov_vh=ov_vh,
+        # Let the buffer compute returns/advantages (handles normalization internally)
+        self.buffer.compute_epigraph_returns_and_advantages(
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            lambda_safe=self.lambda_safe,
+            num_envs=self.num_envs,
+            num_agents=self.num_agents,
         )
-        
-        # Convert back to agent-major [T,N,1]
-        # Q_perf [T,E] -> [T,E,A] -> agent-major -> [T,N,1]
-        Q_perf_expanded = Q_perf.unsqueeze(-1).expand(T, E, A)  # [T,E,A]
-        Q_perf_agentmajor = Q_perf_expanded.permute(0, 2, 1).reshape(T, N, 1)
-        
-        # Q_safe [T,E,A] -> agent-major
-        Q_safe_agentmajor = Q_safe.permute(0, 2, 1).reshape(T, N, 1)
-        
-        # advantages [T,E,A] -> agent-major
-        adv_agentmajor = advantages.permute(0, 2, 1).reshape(T, N, 1)
-        
-        # Normalize advantages
-        adv_agentmajor = normalize_advantages(adv_agentmajor, masks_buf, eps=1e-8)
-        
-        # Store back
-        self.buffer.returns_vl = Q_perf_agentmajor
-        self.buffer.returns_vh = Q_safe_agentmajor
-        self.buffer.advantages = adv_agentmajor
         
         # Prepare data for sequence training
         update_info = {
@@ -538,129 +707,142 @@ class EpigraphTrainer:
         
         for epoch in range(self.ppo_epoch):
             generator = self._recurrent_generator(L)
-            
+
             for mb in generator:
-                # Extract mini-batch data
-                obs_flat = mb["obs_flat"]
-                share_obs_flat = mb["share_obs_flat"]
-                act_flat = mb["act_flat"]
-                old_logp_flat = mb["old_logp_flat"]
-                adv_flat = mb["adv_flat"]
-                ret_vl_flat = mb["ret_vl_flat"]
-                ret_vh_flat = mb["ret_vh_flat"]
-                old_vl_flat = mb["old_vl_flat"]
-                old_vh_flat = mb["old_vh_flat"]
-                z_flat = mb["z_flat"]
-                masks_flat = mb["masks_flat"]
-                
-                h0_actor = mb["h0_actor"]
-                h0_vl = mb["h0_vl"]
-                h0_vh = mb["h0_vh"]
-                agent_idx = mb["agent_idx"]
-                
-                # FIX 3: z_encoder gradient isolation
+                # Unpack minibatch
+                obs_flat        = mb["obs_flat"]          # [L*B, obs_dim]
+                share_obs_flat  = mb["share_obs_flat"]    # [L*B, share_obs_dim]
+                act_flat        = mb["act_flat"]          # [L*B, act_dim]
+                old_logp_flat   = mb["old_logp_flat"]     # [L*B, 1]
+                adv_flat        = mb["adv_flat"]          # [L*B, 1] (advantage after normalize)
+                ret_vl_flat     = mb["ret_vl_flat"]       # [L*B, 1] target for Vl
+                ret_vh_flat     = mb["ret_vh_flat"]       # [L*B, 1] target for Vh
+                old_vl_flat     = mb["old_vl_flat"]       # [L*B, 1] old Vl predictions
+                old_vh_flat     = mb["old_vh_flat"]       # [L*B, 1] old Vh predictions
+                z_flat          = mb["z_flat"]            # [L*B, 1] z traj
+                masks_flat      = mb["masks_flat"]        # [L*B, 1] RNN masks
+
+                h0_actor        = mb["h0_actor"]          # [B, H] init RNN state for actor
+                h0_vl           = mb["h0_vl"]             # [B, H] init RNN state for Vl critic
+                h0_vh           = mb["h0_vh"]             # [B, H] init RNN state for Vh critic
+                agent_idx       = mb["agent_idx"]         # [B] which agent each seq belongs to
+
+                # Z encoding
+                # z_enc goes into policy with grad,
+                # critics see a detached copy (no grad to z_encoder from value losses)
                 z_enc_flat = self.z_encoder(z_flat)
-                z_enc_flat_detached = z_enc_flat.detach()  # For critics only
-                
-                # Critic Vl (centralized) - uses detached z_enc
+                z_enc_flat_detached = z_enc_flat.detach()
+
+                # Centralized performance critic Vl (team value)
                 vl_pred_flat, _ = self.critic_vl.value_seq(
                     share_obs_seq=share_obs_flat,
                     z_enc_seq=z_enc_flat_detached,
                     hxs_init=h0_vl,
                     masks_seq=masks_flat,
                 )
-                
+
                 vl_clipped = old_vl_flat + torch.clamp(
-                    vl_pred_flat - old_vl_flat, -value_clip_eps, value_clip_eps
+                    vl_pred_flat - old_vl_flat,
+                    -value_clip_eps,
+                    value_clip_eps
                 )
                 vl_loss_unclipped = (vl_pred_flat - ret_vl_flat).pow(2)
-                vl_loss_clipped = (vl_clipped - ret_vl_flat).pow(2)
+                vl_loss_clipped   = (vl_clipped   - ret_vl_flat).pow(2)
                 vl_loss = 0.5 * torch.max(vl_loss_unclipped, vl_loss_clipped).mean()
-                
-                # Per-agent critics and policies
+
+                # Per-agent policy and safety critic
                 policy_loss_total = 0.0
-                entropy_total = 0.0
-                vh_loss_total = 0.0
-                approx_kl_total = 0.0
-                clipfrac_total = 0.0
-                count_total = 0.0
-                
-                B = h0_actor.size(0)
-                
+                vh_loss_total     = 0.0
+                entropy_total     = 0.0
+                approx_kl_total   = 0.0
+                clipfrac_total    = 0.0
+                count_total       = 0.0
+
+                B = h0_actor.size(0)  # number of sequences in this minibatch
+
                 for a_i, agent in enumerate(self.agent_ids):
-                    mask_agent_seq = (agent_idx == a_i)
-                    if not mask_agent_seq.any():
+                    # Pick only the sequences that belong to this agent
+                    seq_mask_b = (agent_idx == a_i)         # [B]
+                    if not seq_mask_b.any():
                         continue
-                    
-                    choose_b = mask_agent_seq.to(self.device)
-                    choose_lb = choose_b.unsqueeze(0).expand(L, B)
-                    choose_lb = choose_lb.reshape(L * B)
-                    
-                    obs_a = obs_flat[choose_lb]
-                    act_a = act_flat[choose_lb]
-                    old_logp_a = old_logp_flat[choose_lb]
-                    adv_a = adv_flat[choose_lb]
-                    masks_a = masks_flat[choose_lb]
-                    ret_vh_a = ret_vh_flat[choose_lb]
-                    old_vh_a = old_vh_flat[choose_lb]
-                    
-                    h0_actor_a = h0_actor[mask_agent_seq]
-                    h0_vh_a = h0_vh[mask_agent_seq]
-                    
-                    # z_enc for this agent: detached for critic, non-detached for actor
-                    z_enc_a = z_enc_flat[choose_lb]
-                    z_enc_a_det = z_enc_a.detach()
-                    
-                    # Vh critic - uses detached z_enc
+
+                    # Expand that mask across time steps
+                    seq_mask_lb = seq_mask_b.unsqueeze(0).expand(L, B).reshape(L * B)
+
+                    # Slice per-agent data
+                    obs_a        = obs_flat[seq_mask_lb]
+                    act_a        = act_flat[seq_mask_lb]
+                    old_logp_a   = old_logp_flat[seq_mask_lb]
+                    adv_a        = adv_flat[seq_mask_lb]
+                    masks_a      = masks_flat[seq_mask_lb]
+                    ret_vh_a     = ret_vh_flat[seq_mask_lb]
+                    old_vh_a     = old_vh_flat[seq_mask_lb]
+
+                    h0_actor_a   = h0_actor[seq_mask_b]
+                    h0_vh_a      = h0_vh[seq_mask_b]
+
+                    # Per-agent z features:
+                    # actor sees non-detached z_enc; critic sees detached
+                    z_enc_a      = z_enc_flat[seq_mask_lb]
+                    z_enc_a_det  = z_enc_a.detach()
+
+                    # Safety critic Vh (per agent)
                     vh_pred_a, _ = self.critics_vh[agent].value_seq(
                         obs_seq=obs_a,
                         z_enc_seq=z_enc_a_det,
                         hxs_init=h0_vh_a,
                         masks_seq=masks_a,
                     )
-                    
+
                     vh_clipped_a = old_vh_a + torch.clamp(
-                        vh_pred_a - old_vh_a, -value_clip_eps, value_clip_eps
+                        vh_pred_a - old_vh_a,
+                        -value_clip_eps,
+                        value_clip_eps
                     )
                     vh_loss_unclipped_a = (vh_pred_a - ret_vh_a).pow(2)
-                    vh_loss_clipped_a = (vh_clipped_a - ret_vh_a).pow(2)
+                    vh_loss_clipped_a   = (vh_clipped_a - ret_vh_a).pow(2)
                     vh_loss_a = 0.5 * torch.max(vh_loss_unclipped_a, vh_loss_clipped_a).mean()
-                    
-                    # Policy - uses non-detached z_enc
+
+                    # Policy loss (per agent)
+                    # evaluate_actions_seq returns new log prob and entropy under current policy
                     logp_new_a, entropy_a, _ = self.actors[agent].evaluate_actions_seq(
                         obs_seq=obs_a,
-                        z_enc_seq=z_enc_a,  # NOT detached
+                        z_enc_seq=z_enc_a,     # NOT detached -> actor + z_encoder get grad
                         hxs_init=h0_actor_a,
                         masks_seq=masks_a,
                         act_seq=act_a,
                     )
-                    
-                    ratio = torch.exp(logp_new_a - old_logp_a)
+
+                    ratio = torch.exp(logp_new_a - old_logp_a)  # PPO ratio
                     surr1 = ratio * adv_a
                     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_a
                     policy_loss_a = -torch.min(surr1, surr2).mean() - ent_coef * entropy_a.mean()
-                    
+
                     with torch.no_grad():
-                        approx_kl_a = ((ratio - 1) - torch.log(ratio)).mean()
-                        clipfrac_a = (torch.abs(ratio - 1) > clip_eps).float().mean()
-                    
+                        # Approx KL and clip fraction for logging/debug
+                        approx_kl_a  = ((ratio - 1) - torch.log(ratio)).mean()
+                        clipfrac_a   = (torch.abs(ratio - 1) > clip_eps).float().mean()
+
+                    # Accumulate stats across agents in this minibatch
                     policy_loss_total += policy_loss_a
-                    entropy_total += entropy_a.mean()
-                    vh_loss_total += vh_loss_a
-                    approx_kl_total += approx_kl_a
-                    clipfrac_total += clipfrac_a
-                    count_total += 1.0
-                
+                    vh_loss_total     += vh_loss_a
+                    entropy_total     += entropy_a.mean()
+                    approx_kl_total   += approx_kl_a
+                    clipfrac_total    += clipfrac_a
+                    count_total       += 1.0
+
                 if count_total < 1e-8:
                     continue
-                    
+
+                # Average across all agents that contributed data
                 policy_loss = policy_loss_total / count_total
-                vh_loss = vh_loss_total / count_total
-                entropy = entropy_total / count_total
-                approx_kl = approx_kl_total / count_total
-                clipfrac = clipfrac_total / count_total
-                
-                # Backward pass
+                vh_loss     = vh_loss_total     / count_total
+                entropy     = entropy_total     / count_total
+                approx_kl   = approx_kl_total   / count_total
+                clipfrac    = clipfrac_total    / count_total
+
+                # Backprop / update
+                # Actor + shared z_encoder
                 self.optimizer_actor.zero_grad()
                 policy_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -669,7 +851,8 @@ class EpigraphTrainer:
                     self.max_grad_norm_actor
                 )
                 self.optimizer_actor.step()
-                
+
+                # Centralized Vl critic
                 self.optimizer_vl.zero_grad()
                 vl_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -677,7 +860,8 @@ class EpigraphTrainer:
                     self.max_grad_norm_critic
                 )
                 self.optimizer_vl.step()
-                
+
+                # Per-agent Vh critics
                 for ag in self.agent_ids:
                     self.optimizers_vh[ag].zero_grad()
                 vh_loss.backward()
@@ -687,16 +871,17 @@ class EpigraphTrainer:
                         self.max_grad_norm_critic
                     )
                     self.optimizers_vh[ag].step()
-                
-                update_info["loss_policy"] += policy_loss.item()
-                update_info["loss_value_vl"] += vl_loss.item()
-                update_info["loss_value_vh"] += vh_loss.item()
-                update_info["entropy"] += entropy.item()
-                update_info["approx_kl"] += approx_kl.item()
-                update_info["clipfrac"] += clipfrac.item()
-                
+
+                # Logging accumulators
+                update_info["loss_policy"]     += policy_loss.item()
+                update_info["loss_value_vl"]   += vl_loss.item()
+                update_info["loss_value_vh"]   += vh_loss.item()
+                update_info["entropy"]         += entropy.item()
+                update_info["approx_kl"]       += approx_kl.item()
+                update_info["clipfrac"]        += clipfrac.item()
+
                 num_updates += 1
-        
+
         for k in update_info:
             update_info[k] /= max(1, num_updates)
         
@@ -706,173 +891,346 @@ class EpigraphTrainer:
     
     def _recurrent_generator(self, chunk_length: int):
         """
-        Generate mini-batches for sequence-based RNN training.
-        Fixed with proper agent-major indexing.
+        Build RNN training minibatches.
+        We:
+        1. Split each (env, agent) trajectory into fixed-length chunks of length L=chunk_length.
+        2. Sample a set of these chunks to form a minibatch.
+        3. Pack them so the RNN can be unrolled on [L*B] time steps with initial hidden states per sequence.
         """
         T = self.rollout_horizon
         E = self.num_envs
         A = self.num_agents
         N = E * A
-        
+
         assert T % chunk_length == 0, f"T {T} not divisible by chunk_length {chunk_length}"
         num_chunks = T // chunk_length
-        
-        # Flatten all data
-        obs_all = self.buffer.obs[:T].reshape(T * N, -1)
-        share_obs_all = self.buffer.share_obs[:T].reshape(T * N, -1)
-        actions_all = self.buffer.actions[:T].reshape(T * N, -1)
-        z_all = self.buffer.z[:T].reshape(T * N, -1)
-        old_logp_all = self.buffer.action_log_probs[:T].reshape(T * N, 1)
-        
-        returns_vl_all = self.buffer.returns_vl.reshape(T * N, 1)
-        returns_vh_all = self.buffer.returns_vh.reshape(T * N, 1)
-        advantages_all = self.buffer.advantages.reshape(T * N, 1)
-        
-        values_vl_all = self.buffer.values_vl[:T].reshape(T * N, 1)
-        values_vh_all = self.buffer.values_vh[:T].reshape(T * N, 1)
-        
-        masks_all = self.buffer.masks[:T].reshape(T * N, 1)
-        
-        rnn_states_actor_all = self.buffer.rnn_states_actor[:T].reshape(T, N, -1)
+        L = chunk_length
+
+        # Flatten time/env/agent into [T*N, ...]
+        obs_all           = self.buffer.obs[:T].reshape(T * N, -1)
+        share_obs_all     = self.buffer.share_obs[:T].reshape(T * N, -1)
+        actions_all       = self.buffer.actions[:T].reshape(T * N, -1)
+        z_all             = self.buffer.z[:T].reshape(T * N, -1)
+        old_logp_all      = self.buffer.action_log_probs[:T].reshape(T * N, 1)
+
+        returns_vl_all    = self.buffer.returns_vl.reshape(T * N, 1)
+        returns_vh_all    = self.buffer.returns_vh.reshape(T * N, 1)
+        advantages_all    = self.buffer.advantages.reshape(T * N, 1)
+
+        values_vl_all     = self.buffer.values_vl[:T].reshape(T * N, 1)
+        values_vh_all     = self.buffer.values_vh[:T].reshape(T * N, 1)
+
+        masks_all         = self.buffer.masks[:T].reshape(T * N, 1)
+
+        # RNN hidden states at the start of each time step
+        rnn_states_actor_all  = self.buffer.rnn_states_actor[:T].reshape(T, N, -1)
         rnn_states_critic_all = self.buffer.rnn_states_critic[:T].reshape(T, N, -1)
-        rnn_states_vh_all = self.buffer.rnn_states_vh[:T].reshape(T, N, -1)
-        
-        # Create (chunk_id, env_id, agent_id) indices
+        rnn_states_vh_all     = self.buffer.rnn_states_vh[:T].reshape(T, N, -1)
+
+        # Build list of (chunk_id, env_id, agent_id) for all segments
         indices = []
         for chunk_id in range(num_chunks):
             for env_id in range(E):
                 for agent_id in range(A):
                     indices.append((chunk_id, env_id, agent_id))
-        
+
         total_samples = len(indices)
         batch_size = total_samples // self.num_mini_batch
-        
+
         for _ in range(self.num_mini_batch):
-            # Sample mini-batch
+            # Sample which (chunk, env, agent) tuples go in this minibatch
             perm = torch.randperm(total_samples)
             mb_indices = perm[:batch_size].tolist()
-            
-            mb_data = []
+
+            seq_list = []
             for idx in mb_indices:
                 chunk_id, env_id, agent_id = indices[idx]
-                t0 = chunk_id * chunk_length
-                
-                # FIX 2: Agent-major indexing
+                t0 = chunk_id * L
+
+                # Agent-major index in [0..N)
                 n_idx = agent_id * E + env_id
-                
-                # Extract sequence [t0:t0+L] for this (env, agent)
-                seq_indices = [t * N + n_idx for t in range(t0, t0 + chunk_length)]
+
+                # Collect time indices for this L-step window
+                seq_indices = [t * N + n_idx for t in range(t0, t0 + L)]
                 seq_indices = torch.tensor(seq_indices, device=self.device, dtype=torch.long)
-                
-                mb_data.append({
-                    "obs": obs_all[seq_indices],
-                    "share_obs": share_obs_all[seq_indices],
-                    "actions": actions_all[seq_indices],
-                    "z": z_all[seq_indices],
-                    "old_logp": old_logp_all[seq_indices],
-                    "ret_vl": returns_vl_all[seq_indices],
-                    "ret_vh": returns_vh_all[seq_indices],
+
+                seq_list.append({
+                    "obs":        obs_all[seq_indices],
+                    "share_obs":  share_obs_all[seq_indices],
+                    "actions":    actions_all[seq_indices],
+                    "z":          z_all[seq_indices],
+                    "old_logp":   old_logp_all[seq_indices],
+                    "ret_vl":     returns_vl_all[seq_indices],
+                    "ret_vh":     returns_vh_all[seq_indices],
                     "advantages": advantages_all[seq_indices],
-                    "old_vl": values_vl_all[seq_indices],
-                    "old_vh": values_vh_all[seq_indices],
-                    "masks": masks_all[seq_indices],
-                    "h0_actor": rnn_states_actor_all[t0, n_idx],
-                    "h0_vl": rnn_states_critic_all[t0, n_idx],
-                    "h0_vh": rnn_states_vh_all[t0, n_idx],
-                    "agent_id": agent_id,
+                    "old_vl":     values_vl_all[seq_indices],
+                    "old_vh":     values_vh_all[seq_indices],
+                    "masks":      masks_all[seq_indices],
+
+                    # RNN initial hidden state is taken from the first timestep t0
+                    "h0_actor":   rnn_states_actor_all[t0, n_idx],
+                    "h0_vl":      rnn_states_critic_all[t0, n_idx],
+                    "h0_vh":      rnn_states_vh_all[t0, n_idx],
+
+                    "agent_id":   agent_id,
                 })
-            
-            # Stack mini-batch
-            B = len(mb_data)
-            L = chunk_length
-            
+
+            B = len(seq_list)
+
             yield {
-                "obs_flat": torch.cat([d["obs"] for d in mb_data], dim=0),
-                "share_obs_flat": torch.cat([d["share_obs"] for d in mb_data], dim=0),
-                "act_flat": torch.cat([d["actions"] for d in mb_data], dim=0),
-                "old_logp_flat": torch.cat([d["old_logp"] for d in mb_data], dim=0),
-                "adv_flat": torch.cat([d["advantages"] for d in mb_data], dim=0),
-                "ret_vl_flat": torch.cat([d["ret_vl"] for d in mb_data], dim=0),
-                "ret_vh_flat": torch.cat([d["ret_vh"] for d in mb_data], dim=0),
-                "old_vl_flat": torch.cat([d["old_vl"] for d in mb_data], dim=0),
-                "old_vh_flat": torch.cat([d["old_vh"] for d in mb_data], dim=0),
-                "z_flat": torch.cat([d["z"] for d in mb_data], dim=0),
-                "masks_flat": torch.cat([d["masks"] for d in mb_data], dim=0),
-                "h0_actor": torch.stack([d["h0_actor"] for d in mb_data], dim=0),
-                "h0_vl": torch.stack([d["h0_vl"] for d in mb_data], dim=0),
-                "h0_vh": torch.stack([d["h0_vh"] for d in mb_data], dim=0),
-                "agent_idx": torch.tensor([d["agent_id"] for d in mb_data], device=self.device, dtype=torch.long),
+                # Concat over sequences -> [L*B, ...]
+                "obs_flat":        torch.cat([d["obs"]        for d in seq_list], dim=0),
+                "share_obs_flat":  torch.cat([d["share_obs"]  for d in seq_list], dim=0),
+                "act_flat":        torch.cat([d["actions"]    for d in seq_list], dim=0),
+                "old_logp_flat":   torch.cat([d["old_logp"]   for d in seq_list], dim=0),
+                "adv_flat":        torch.cat([d["advantages"] for d in seq_list], dim=0),
+                "ret_vl_flat":     torch.cat([d["ret_vl"]     for d in seq_list], dim=0),
+                "ret_vh_flat":     torch.cat([d["ret_vh"]     for d in seq_list], dim=0),
+                "old_vl_flat":     torch.cat([d["old_vl"]     for d in seq_list], dim=0),
+                "old_vh_flat":     torch.cat([d["old_vh"]     for d in seq_list], dim=0),
+                "z_flat":          torch.cat([d["z"]          for d in seq_list], dim=0),
+                "masks_flat":      torch.cat([d["masks"]      for d in seq_list], dim=0),
+
+                # Stack per-sequence init states -> [B, H]
+                "h0_actor":        torch.stack([d["h0_actor"] for d in seq_list], dim=0),
+                "h0_vl":           torch.stack([d["h0_vl"]    for d in seq_list], dim=0),
+                "h0_vh":           torch.stack([d["h0_vh"]    for d in seq_list], dim=0),
+
+                # Which agent each of the B sequences belongs to -> [B]
+                "agent_idx":       torch.tensor(
+                                    [d["agent_id"] for d in seq_list],
+                                    device=self.device,
+                                    dtype=torch.long
+                                ),
             }
     
-    def evaluate(self, num_episodes: int = 10) -> Dict[str, Any]:
-        """Evaluate trained policy."""
+    @torch.no_grad()
+    def run_single_eval_episode(self, deterministic: bool = True) -> Dict[str, Any]:
+        """
+        Run a single evaluation episode using root_finder for safe z*.
+        
+        Args:
+            deterministic: If True, use deterministic policy (no exploration noise)
+            
+        Returns:
+            Dictionary with episode statistics:
+                - task_return: Total task reward
+                - safe_cost_sum: Total safety cost
+                - length: Episode length
+                - success: Task success flag
+                - violations: Number of safety violations
+                - z_mean: Average z value used
+        """
         self.set_eval_mode()
         
-        episode_returns = []
-        episode_lengths = []
-        episode_successes = []
-        z_values = []
+        obs, _ = self.env.reset()
+        self._init_rnn_states()
         
-        for ep in range(num_episodes):
-            obs, _ = self.env.reset()
-            self._init_rnn_states()
+        episode_task_return = 0.0
+        episode_safe_cost = 0.0
+        episode_length = 0
+        episode_violations = 0
+        z_values = []
+        done = False
+        
+        while not done and episode_length < 2000:
+            # Use root_finder to compute safe z*
+            z_candidates = []
             
-            z_global = torch.zeros(self.num_envs, 1, device=self.device)
-            
-            episode_return = 0.0
-            episode_length = 0
-            done = False
-            
-            while not done and episode_length < 2000:
-                z_enc = self.z_encoder(z_global)
-                z_values.append(z_global.mean().item())
-                
-                actions = {}
-                masks = torch.ones(self.num_envs, 1, device=self.device)
-                
-                for agent in self.agent_ids:
-                    act, _, rnn_h, _ = self.actors[agent].act_step(
-                        obs[agent], z_enc, self.rnn_states[agent]["actor"], masks, deterministic=True
+            for agent in self.agent_ids:
+                # Define vh evaluation function for this agent
+                def vh_eval_fn(z_query: torch.Tensor):
+                    # z_query: [E, 1]
+                    z_enc_query = self.z_encoder(z_query)
+                    vh_pred, _ = self.critics_vh[agent].value_step(
+                        obs[agent],
+                        z_enc_query,
+                        self.rnn_states[agent]["vh"],
+                        torch.ones(self.num_envs, 1, device=self.device),
                     )
-                    actions[agent] = act
-                    self.rnn_states[agent]["actor"] = rnn_h
+                    return vh_pred  # [E, 1]
                 
-                obs, rewards, terminated, truncated, info = self.env.step(actions)
+                # Solve for safe z_i* for this agent
+                z_i_star = self.root_finder.solve(
+                    vh_eval_fn=vh_eval_fn,
+                    obs=obs[agent],
+                    h_tgt=0.0,  # Safety threshold
+                )  # -> [E, 1]
                 
-                for agent in self.agent_ids:
-                    episode_return += rewards[agent].mean().item()
-                episode_length += 1
-                
-                done_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-                for agent in self.agent_ids:
-                    agent_done = terminated[agent] | truncated[agent]
-                    if agent_done.dim() > 1:
-                        agent_done = agent_done.squeeze(-1)
-                    done_any |= agent_done
-                
-                if done_any.any():
-                    done = True
+                z_candidates.append(z_i_star)
             
-            episode_returns.append(episode_return)
-            episode_lengths.append(episode_length)
+            # Take maximum over all agents (most conservative)
+            z_global = torch.max(torch.stack(z_candidates, dim=0), dim=0)[0]
+            z_values.append(z_global.mean().item())
             
-            if "progress_ratio" in info:
-                progress = info["progress_ratio"].mean().item()
-                episode_successes.append(1.0 if progress >= 0.95 else 0.0)
-            else:
-                episode_successes.append(0.0)
+            # Encode z and get actions
+            z_enc = self.z_encoder(z_global)
+            
+            actions = {}
+            masks = torch.ones(self.num_envs, 1, device=self.device)
+            
+            for agent in self.agent_ids:
+                act, _, next_h, _ = self.actors[agent].act_step(
+                    obs[agent],
+                    z_enc,
+                    self.rnn_states[agent]["actor"],
+                    masks,
+                    deterministic=deterministic,
+                )
+                actions[agent] = act
+                self.rnn_states[agent]["actor"] = next_h
+            
+            # Step environment
+            obs, rewards, terminated, truncated, info = self.env.step(actions)
+            
+            # Accumulate statistics
+            if "r_task" in info:
+                for agent in self.agent_ids:
+                    episode_task_return += info["r_task"][agent].mean().item()
+            
+            if "r_safe" in info:
+                for agent in self.agent_ids:
+                    episode_safe_cost += info["r_safe"][agent].mean().item()
+            
+            if "is_violating" in info and info["is_violating"] is not None:
+                episode_violations += info["is_violating"].sum().item()
+            
+            episode_length += 1
+            
+            # Check done
+            done_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for agent in self.agent_ids:
+                agent_done = terminated[agent] | truncated[agent]
+                if agent_done.dim() > 1:
+                    agent_done = agent_done.squeeze(-1)
+                done_any |= agent_done
+            
+            if done_any.any():
+                done = True
+        
+        # Check success
+        success = False
+        if "progress_ratio" in info:
+            progress = info["progress_ratio"].mean().item()
+            success = (progress >= 0.95)
         
         return {
-            "return_mean": np.mean(episode_returns),
-            "return_std": np.std(episode_returns),
-            "episode_length": np.mean(episode_lengths),
-            "success_rate": np.mean(episode_successes),
-            "z_global_mean": np.mean(z_values),
-            "z_global_std": np.std(z_values),
+            "task_return": episode_task_return,
+            "safe_cost_sum": episode_safe_cost,
+            "length": episode_length,
+            "success": success,
+            "violations": episode_violations,
+            "z_mean": np.mean(z_values) if z_values else 0.0,
         }
     
+    def evaluate(self, num_episodes: int = 10) -> Dict[str, Any]:
+        """
+        Run multiple evaluation episodes and aggregate statistics.
+        
+        Args:
+            num_episodes: Number of episodes to evaluate
+            
+        Returns:
+            Aggregated evaluation statistics
+        """
+        self.set_eval_mode()
+        
+        all_episode_returns = []
+        all_episode_safe_costs = []
+        all_episode_success = []
+        all_episode_lengths = []
+        all_z_values = []
+        
+        print(f"[EVAL] Starting evaluation: {num_episodes} episodes")
+        
+        for ep in range(num_episodes):
+            ep_stats = self.run_single_eval_episode(deterministic=True)
+            
+            all_episode_returns.append(ep_stats["task_return"])
+            all_episode_safe_costs.append(ep_stats["safe_cost_sum"])
+            all_episode_success.append(ep_stats["success"])
+            all_episode_lengths.append(ep_stats["length"])
+            all_z_values.append(ep_stats["z_mean"])
+            
+            print(f"[EVAL] Episode {ep + 1}/{num_episodes}: "
+                  f"return={ep_stats['task_return']:.2f}, "
+                  f"length={ep_stats['length']}, "
+                  f"success={ep_stats['success']}")
+        
+        # Aggregate statistics using helper function if available
+        if summarize_eval_stats is not None:
+            eval_stats = summarize_eval_stats(
+                episode_returns=all_episode_returns,
+                episode_safe_costs=all_episode_safe_costs,
+                episode_success=all_episode_success,
+                episode_lengths=all_episode_lengths,
+                z_values=all_z_values,
+            )
+        else:
+            # Fallback to basic stats
+            eval_stats = {
+                "return_mean": np.mean(all_episode_returns),
+                "return_std": np.std(all_episode_returns),
+                "episode_length": np.mean(all_episode_lengths),
+                "success_rate": np.mean(all_episode_success),
+                "z_global_mean": np.mean(all_z_values),
+                "z_global_std": np.std(all_z_values),
+            }
+        
+        self._mark_env_reset_needed()
+        return eval_stats
+    
+    def maybe_milestone_eval_and_save(self):
+        """
+        Check if milestone reached. If yes:
+        1. Mark milestone truncation in buffer (if mid-rollout)
+        2. Set eval mode
+        3. Run evaluation
+        4. Log to wandb
+        5. Save checkpoint
+        6. Reset env and RNN, back to train mode
+        
+        This is the ROUTE B core method.
+        """
+        if len(self.milestones) == 0:
+            return
+        
+        # Check if we've reached the next milestone
+        if self.global_episodes >= self.milestones[0]:
+            milestone = self.milestones.popleft()
+            
+            print(f"\n{'='*80}")
+            print(f"MILESTONE REACHED: {milestone} episodes")
+            print(f"{'='*80}\n")
+            
+            # Run evaluation
+            num_eval_episodes = self.full_config.get("training_monitor", {}).get("eval_episodes", 10)
+            eval_stats = self.evaluate(num_episodes=num_eval_episodes)
+            
+            # Log to wandb if enabled
+            if self.wandb_logger is not None:
+                self.wandb_logger.log_eval(self.global_step, eval_stats)
+            
+            # Save checkpoint
+            os.makedirs(self.ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(self.ckpt_dir, f"epigraph_milestone_{milestone}.pth")
+            self.save_checkpoint(ckpt_path)
+            print(f"[MILESTONE] Checkpoint saved: {ckpt_path}")
+            
+            # Print evaluation summary
+            print(f"\n[MILESTONE EVAL] Milestone {milestone}:")
+            print(f"  Return:       {eval_stats.get('return_mean', 0):.2f} ± {eval_stats.get('return_std', 0):.2f}")
+            print(f"  Success Rate: {eval_stats.get('success_rate', 0):.2%}")
+            print(f"  Ep Length:    {eval_stats.get('episode_length', 0):.1f}")
+            print(f"  Z Mean:       {eval_stats.get('z_global_mean', 0):.4f}\n")
+            
+            # Back to training mode
+            self.set_train_mode()
+            self._mark_env_reset_needed()
+            print(f"[MILESTONE] Resuming training...\n")
+    
     def save_checkpoint(self, path: str, global_step: Optional[int] = None, update_count: Optional[int] = None):
-        """Save checkpoint."""
+        """Save checkpoint with all networks, optimizers, and training state."""
         checkpoint = {
             "actors": {agent: self.actors[agent].state_dict() for agent in self.agent_ids},
             "critics_vh": {agent: self.critics_vh[agent].state_dict() for agent in self.agent_ids},
@@ -882,7 +1240,9 @@ class EpigraphTrainer:
             "optimizer_vl": self.optimizer_vl.state_dict(),
             "optimizers_vh": {agent: self.optimizers_vh[agent].state_dict() for agent in self.agent_ids},
             "global_step": global_step if global_step is not None else self.global_step,
-            "episodes_done": self.episodes_done,
+            "global_episodes": self.global_episodes,
+            "episodes_done": self.episodes_done,  # Legacy compatibility
+            "milestones": list(self.milestones),  # Save remaining milestones
         }
         
         if update_count is not None:
@@ -892,9 +1252,10 @@ class EpigraphTrainer:
         print(f"[CHECKPOINT] Saved to {path}")
     
     def load_checkpoint(self, path: str):
-        """Load checkpoint."""
+        """Load checkpoint with all networks, optimizers, and training state."""
         checkpoint = torch.load(path, map_location=self.device)
         
+        # Load networks
         for agent in self.agent_ids:
             self.actors[agent].load_state_dict(checkpoint["actors"][agent])
             self.critics_vh[agent].load_state_dict(checkpoint["critics_vh"][agent])
@@ -902,15 +1263,24 @@ class EpigraphTrainer:
         self.critic_vl.load_state_dict(checkpoint["critic_vl"])
         self.z_encoder.load_state_dict(checkpoint["z_encoder"])
         
+        # Load optimizers
         self.optimizer_actor.load_state_dict(checkpoint["optimizer_actor"])
         self.optimizer_vl.load_state_dict(checkpoint["optimizer_vl"])
         for agent in self.agent_ids:
             self.optimizers_vh[agent].load_state_dict(checkpoint["optimizers_vh"][agent])
         
+        # Load training state
         self.global_step = checkpoint["global_step"]
-        self.episodes_done = checkpoint["episodes_done"]
+        self.global_episodes = checkpoint.get("global_episodes", checkpoint.get("episodes_done", 0))
+        self.episodes_done = self.global_episodes  # Legacy compatibility
+        
+        # Load remaining milestones
+        if "milestones" in checkpoint:
+            self.milestones = deque(checkpoint["milestones"])
         
         print(f"[CHECKPOINT] Loaded from {path}")
+        print(f"[CHECKPOINT] Resumed at global_step={self.global_step}, global_episodes={self.global_episodes}")
+        self._mark_env_reset_needed()
     
     def set_train_mode(self):
         """Set all networks to train mode."""

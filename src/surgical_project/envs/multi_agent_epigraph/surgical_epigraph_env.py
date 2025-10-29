@@ -1,10 +1,13 @@
 """
 Human-robot collaborative surgical MARL environment for Epigraph algorithm.
 Features physics-based constraints, four-zone rewards with task/safe decomposition.
-FULLY INDEPENDENT: Does not depend on surgical_direct_marl_env.py.
 
-FIXED: step() now returns standard Gym format (obs, rewards, terminated, truncated, info)
-       with r_task/r_safe in info dict.
+KEY DESIGN (Pure Epigraph: Self-Contained):
+- Environment maintains its own step counter for logging (no trainer dependency)
+- step() returns standard Gym format with r_task/r_safe in info dict
+- StepTracer is initialized and controlled by env based on YAML config
+- Configuration injected by trainer/play script ensures train-eval consistency
+- Clean separation: env handles physics/rewards/logging, trainer handles training
 """
 
 from __future__ import annotations
@@ -36,9 +39,12 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
     - Potential field reward for trajectory guidance
     - Per-agent reward decomposition for Epigraph algorithm
     
-    Key difference from rMAPPO environment:
+    Key design principles (Pure Epigraph):
+    - Environment maintains own step counter (_env_debug_step_counter)
     - step() returns standard Gym format with r_task/r_safe in info dict
-    - Supports epigraph_env YAML configuration for reward composition
+    - StepTracer self-prints based on YAML config (no trainer control needed)
+    - Configuration injected ensures train-eval consistency
+    - Completely independent from RMAPPO or other algorithms
     """
     
     cfg: SurgicalEpigraphEnvCfg
@@ -47,35 +53,66 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         """Initialize Epigraph surgical MARL environment."""
         super().__init__(cfg, render_mode, **kwargs)
         
+        # Environment's own step counter (for self-contained logging)
+        self._env_debug_step_counter = 0
+        
         self._setup_core_configuration()
         self._initialize_state_variables()
         self._initialize_components()
         self._setup_gymnasium_spaces()
         
-        self._trainer_global_step = None
-        self.global_step = 0  # Environment's own step counter
+        # Initialize StepTracer based on YAML config
+        enable_console_logging = bool(
+            self.params.get("logging", {}).get("enable_console_logging", False)
+        )
+        print_every_steps = self.params.get("logging", {}).get("print_every_steps", 10)
+        max_envs_to_print = self.params.get("logging", {}).get("max_envs_to_print", 2)
+        
+        self.step_tracer = StepTracer(
+            num_envs=self.num_envs,
+            device=self.device,
+            enable_console_logging=enable_console_logging,
+            print_every_steps=print_every_steps,
+            max_envs_to_print=max_envs_to_print,
+        )
+        
+        if enable_console_logging:
+            print(f"[ENV/EPIGRAPH] StepTracer enabled (print_every={print_every_steps})")
+        else:
+            print("[ENV/EPIGRAPH] StepTracer disabled (set logging.enable_console_logging=true to enable)")
     
     def _setup_core_configuration(self) -> None:
-        """Setup core configuration from trainer injection or direct YAML reading."""
-        if hasattr(self, "params") and isinstance(getattr(self, "params", None), dict):
-            print("[ENV/EPIGRAPH] Using configuration injected by trainer")
+        """
+        Setup core configuration from injected params or default YAML.
+        
+        Priority:
+        1. Use self.params if injected by trainer/play script
+        2. Fall back to default YAML in same directory
+        """
+        cfg_params = getattr(self.cfg, "params", None)
+        if not hasattr(self, "params") or not isinstance(getattr(self, "params", None), dict):
+            if isinstance(cfg_params, dict):
+                self.params = cfg_params
+                print("[ENV/EPIGRAPH] Using configuration injected via cfg.params")
+            else:
+                self.params = None
+
+        if isinstance(getattr(self, "params", None), dict):
+            print("[ENV/EPIGRAPH] Using configuration injected by trainer/play script")
         else:
-            print("[ENV/EPIGRAPH] Configuration not injected by trainer, loading from YAML")
-            try:
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                yaml_file = os.path.join(current_dir, "agents", "training_params_epigraph.yaml")
-                
-                if not os.path.exists(yaml_file):
-                    raise FileNotFoundError(f"[ENV/EPIGRAPH] YAML not found: {yaml_file}")
-                
-                with open(yaml_file, 'r') as f:
-                    self.params = yaml.safe_load(f)
-                print(f"[ENV/EPIGRAPH] Loaded configuration from: {yaml_file}")
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to load YAML configuration: {e}")
-                raise RuntimeError(f"Could not load configuration: {e}")
+            print("[ENV/EPIGRAPH] No injected config, loading default YAML")
+            default_cfg_path = os.path.join(
+                os.path.dirname(__file__),
+                "agents",
+                "training_params_epigraph.yaml",
+            )
+            if not os.path.exists(default_cfg_path):
+                raise FileNotFoundError(f"[ENV/EPIGRAPH] Config file not found at {default_cfg_path}")
             
+            with open(default_cfg_path, "r") as f:
+                self.params = yaml.safe_load(f)
+            print(f"[ENV/EPIGRAPH] Loaded default params from {default_cfg_path}")
+        
         self.dt = self.cfg.sim.dt * self.cfg.decimation
         
         self._load_constraint_parameters()
@@ -198,10 +235,6 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             ) for agent in self.cfg.possible_agents
         })
     
-    def set_trainer_global_step(self, global_step: int) -> None:
-        """Set the current global step from trainer for unified logging."""
-        self._trainer_global_step = global_step
-        
     def _setup_scene(self):
         """Setup the simulation scene with robot and constraint objects."""
         self._omni_robot = Articulation(self.cfg.phantom_omni)
@@ -361,10 +394,15 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
         self.normal_t1 = self.constraint_results_t1['normal_vectors']
 
+        # Get scaling factors from YAML config (ensures train-eval consistency)
+        scale_cfg = self.params.get("obs_scaling", {}).get("factors", [5.0, 16.7])
+        pos_scale = float(scale_cfg[0])
+        vel_scale = float(scale_cfg[1])
+        
         obs_dict = {}
         for agent in self.cfg.possible_agents:
-            pos_scaled = self.stylus_pos_t1 * 5.0
-            vel_scaled = self.stylus_vel_t1 * 16.7
+            pos_scaled = self.stylus_pos_t1 * pos_scale
+            vel_scaled = self.stylus_vel_t1 * vel_scale
             obs_agent = torch.cat([pos_scaled, vel_scaled], dim=-1)
             obs_dict[agent] = obs_agent
 
@@ -647,9 +685,20 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             if key not in self.reward_components:
                 self.reward_components[key] = torch.zeros(self.num_envs, device=self.device)
 
-        if hasattr(self, "step_tracer") and self.step_tracer is not None:
-            current_step = self._trainer_global_step if self._trainer_global_step is not None else 0
-            self.step_tracer.maybe_print_step(self, rewards, current_step)
+        # StepTracer: Use environment's own step counter (self-contained logging)
+        if (
+            hasattr(self, "step_tracer") and
+            self.step_tracer is not None and
+            self.step_tracer.enable_console_logging
+        ):
+            self.step_tracer.maybe_print_step(
+                env=self,
+                r_task=rewards,  # Dict[agent, tensor[E]]
+                r_safe_cost=None,  # Not needed for basic debug
+                z=None,  # Not tracked in env
+                global_step=self._env_debug_step_counter,  # Use env's own counter
+                force_print=False,
+            )
         
         return rewards
 
@@ -746,8 +795,8 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         """
         Execute one environment step with Epigraph reward decomposition.
         
-        FIXED: Returns standard Gym format (obs, rewards, terminated, truncated, info)
-               with r_task/r_safe in info dict.
+        Returns standard Gym format (obs, rewards, terminated, truncated, info)
+        with info carrying r_task / r_safe for Epigraph training.
         
         Returns:
             obs: Dict[agent, tensor] - Observations
@@ -758,13 +807,10 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 - info["r_task"]: Dict[agent, [N,1]] - Task quality rewards
                 - info["r_safe"]: Dict[agent, [N,1]] - Safety costs (>=0)
         """
-        # Call parent DirectMARLEnv.step() to handle physics and standard processing
+        # 1. Call parent DirectMARLEnv.step() to handle physics and standard processing
         obs, rewards, terminated, truncated, info = super().step(actions)
         
-        # Increment global step counter
-        self.global_step += 1
-        
-        # Decompose rewards for Epigraph using compose_task_safe_from_rc
+        # 2. Decompose rewards for Epigraph using compose_task_safe_from_rc
         r_task_robot, r_safe_risk_robot = compose_task_safe_from_rc(
             rc=self.reward_components,
             agent="robot",
@@ -786,14 +832,13 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         r_task_robot = r_task_robot.view(self.num_envs, 1)
         r_task_human = r_task_human.view(self.num_envs, 1)
         
-        # Convert safety risk (negative=dangerous) to safety cost (positive=dangerous)
+        # 3. Convert safety risk (negative=dangerous) to safety cost (positive=dangerous)
         r_safe_cost_robot = torch.relu(-r_safe_risk_robot).view(self.num_envs, 1)
         r_safe_cost_human = torch.relu(-r_safe_risk_human).view(self.num_envs, 1)
         
-        # Prepare info dict with r_task and r_safe
+        # 4. Prepare info dict with r_task and r_safe (trainer will extract these)
         info = dict(info) if info is not None else {}
         info.update({
-            # ⭐ KEY FIX: Put r_task and r_safe in info dict (per-agent format)
             "r_task": {
                 "robot": r_task_robot,   # [num_envs, 1]
                 "human": r_task_human,   # [num_envs, 1]
@@ -802,7 +847,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 "robot": r_safe_cost_robot,  # [num_envs, 1], >=0 (cost)
                 "human": r_safe_cost_human,  # [num_envs, 1], >=0 (cost)
             },
-            # Additional debugging information
+            # Additional debugging information for logging / tracer
             "is_violating": self.is_violating_t1.clone(),
             "safety_distance": self.safety_distances_t1.clone(),
             "rejoin_streak": self.rejoin_streak.clone(),
@@ -811,6 +856,9 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 torch.zeros(self.num_envs, device=self.device)
             ).clone(),
         })
+        
+        # 5. Increment environment's own step counter (for self-contained logging)
+        self._env_debug_step_counter += 1
         
         # Return standard Gym format
         return obs, rewards, terminated, truncated, info
