@@ -75,8 +75,8 @@ algorithms:
 # ==============================================================================
 epigraph:
   z:
-    min: -0.05                        # Lower bound for z values
-    max: 0.05                         # Upper bound for z values
+    min: -1.0                        # Lower bound for z values
+    max: 1.0                         # Upper bound for z values
     init:
       mode: uniform                     # Initialization mode: uniform/extreme/mixed
       p_extreme: 0.15                  # Probability of extreme values (for mixed mode)

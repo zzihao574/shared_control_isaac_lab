@@ -21,8 +21,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
 from utils.training_helpers_maddpg import (
-    WandBLogger, TrainingConfiguration, create_argument_parser, 
-    MetricsHub, TopKModelManager, TrainingRunner, MilestoneEvaluator, save_final_shared_networks
+    WandBLogger,
+    TrainingConfiguration,
+    create_argument_parser,
+    MetricsHub,
+    TrainingRunner,
+    MilestoneEvaluator,
+    resume_from_checkpoint_maddpg,
 )
 
 
@@ -114,6 +119,7 @@ class MADDPGTrainer:
         self._setup_logging_and_wandb()
         self._setup_training_components()
         self._setup_runners_and_evaluators()
+        self._resume_if_requested()
         self._setup_milestone_management()
         
         print(f"[TRAINER] MADDPGTrainer initialized successfully")
@@ -186,15 +192,18 @@ class MADDPGTrainer:
     def _setup_logging_and_wandb(self):
         """Setup logging directory and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = f"logs/maddpg_final/{timestamp}"
+        self.log_dir = f"logs/maddpg_dual/{timestamp}"
         os.makedirs(self.log_dir, exist_ok=True)
+        self.checkpoint_dir = os.path.join(self.log_dir, "checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         print(f"[SETUP] Log directory created: {self.log_dir}")
+        print(f"[SETUP] Checkpoints will be stored in: {self.checkpoint_dir}")
 
         # Initialize WandB
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
             run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_final_{self.args.num_envs}envs_{timestamp}"
+            run_name = f"maddpg_dual_{self.args.num_envs}envs_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
             print(f"[SETUP] WandB initialized with run name: {run_name}")
         else:
@@ -214,9 +223,6 @@ class MADDPGTrainer:
         
         # Create MADDPG algorithm
         self.maddpg = initialize_maddpg_algorithm(self.env, self.config, self.args)
-        
-        # Create TopK manager
-        self.top_k_manager = TopKModelManager(k=self.args.top_k_models, mode="max")
         
         # Unified max_global_steps logic: CLI takes priority over YAML
         maddpg_cfg = self.config.params.get('maddpg_config', {})
@@ -239,13 +245,12 @@ class MADDPGTrainer:
         
         print(f"[SETUP] Training components configured:")
         print(f"  Max global steps: {self.max_global_steps}")
-        print(f"  Top-K models: {self.args.top_k_models}")
         print(f"  Milestone episodes: {self.milestone_episodes}")
 
     def _setup_runners_and_evaluators(self):
         """Initialize training runner and milestone evaluator."""
         print(f"[SETUP] Creating TrainingRunner and MilestoneEvaluator...")
-        
+
         # Pass the resolved max_global_steps to TrainingRunner
         self.runner = TrainingRunner(
             env=self.env,
@@ -261,13 +266,25 @@ class MADDPGTrainer:
         self.evaluator = MilestoneEvaluator(
             env=self.env,
             maddpg=self.maddpg,
-            topk_mgr=self.top_k_manager,
             metrics_hub=self.metrics_hub,
             log_dir=self.log_dir,
-            agent_ids=self.maddpg.agent_ids
+            agent_ids=self.maddpg.agent_ids,
+            runner=self.runner,
         )
         
         print(f"[SETUP] TrainingRunner and MilestoneEvaluator created successfully")
+
+    def _resume_if_requested(self):
+        """Resume training from checkpoint if --checkpoint supplied."""
+        if not getattr(self.args, "checkpoint", None):
+            return
+        resume_from_checkpoint_maddpg(
+            self.args.checkpoint,
+            self.maddpg,
+            runner=self.runner,
+            device=self.config.get_compute_device(),
+        )
+        print(f"[SETUP] Resumed from checkpoint: {self.args.checkpoint}")
 
     def _setup_milestone_management(self):
         """Initialize milestone tracking variables."""
@@ -345,7 +362,7 @@ class MADDPGTrainer:
         """Main training loop with milestone evaluation and exit tracking."""
         print(f"[TRAIN] Starting training with persistent generators and noise scheduling:")
         print(f"  - TrainingRunner: rollout→replay→update→log→count + exponential noise decay")
-        print(f"  - MilestoneEvaluator: milestone→eval→topk→log")
+        print(f"  - MilestoneEvaluator: milestone→evaluation→checkpoint")
         print(f"  - Network layers configurable via YAML")
         print(f"  - Noise schedule: σ_start={self.runner.sigma_start} → σ_end={self.runner.sigma_end}")
         print(f"  - Max steps: {self.max_global_steps}")
@@ -381,9 +398,6 @@ class MADDPGTrainer:
                 # Progress reporting
                 if self.runner.global_step % 2000 == 0:
                     print(f"[Step {self.runner.global_step}] Episodes so far: {self.runner.global_episodes}")
-                    if self.top_k_manager.top_models:
-                        scores = [m[0] for m in self.top_k_manager.top_models]
-                        print(f"  Top-{len(scores)} Score Range: {min(scores):.2f} ~ {max(scores):.2f}")
                 
                 # Periodic sanity check
                 if (self.runner.global_step % 1000) == 0:
@@ -405,21 +419,7 @@ class MADDPGTrainer:
             print(f"  Final noise scale: {self.runner._calculate_noise_scale():.4f}")
             
             print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
-            print("\nFinal Top-K Models:")
-            for i, (performance, _, milestone) in enumerate(self.top_k_manager.get_top_models()):
-                print(f"  #{i+1} Milestone {milestone}: {performance:.2f}")
             print(f"\nResults saved in: {self.log_dir}")
-            
-            # Save final model
-            save_final_shared_networks(
-                log_directory=self.log_dir,
-                maddpg=self.maddpg,
-                global_step=self.runner.global_step,
-                global_episodes=self.runner.global_episodes,
-                max_milestone_triggered=self.max_milestone_triggered
-            )
-            
-            print(f"[TRAIN] Final results saved successfully")
         
         except KeyboardInterrupt:
             reason = "KEYBOARD_INTERRUPT"

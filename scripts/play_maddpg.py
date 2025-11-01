@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluation script for rMAPPO dual-network checkpoints.
+Evaluation script for MADDPG shared-network checkpoints.
 
-Key features:
-  * Unified CLI (aligned with Epigraph/MADDPG play scripts)
-  * Deterministic/stochastic toggle
+Features:
+  * Unified CLI aligned with rMAPPO/Epigraph play scripts
+  * Deterministic vs stochastic evaluation toggle
   * Shared evaluation recorder for progress/safety/force statistics
+  * Support for flat dual checkpoints, final_shared_networks, and legacy top-k saves
   * Optional WandB logging
 """
 
 import argparse
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -26,11 +27,12 @@ for _path in (REPO_ROOT, SRC_ROOT):
 from isaaclab.app import AppLauncher
 
 from scripts.utils.eval_logging import EvalRecorder, EvalWandBLogger, wandb_available
-from scripts.utils.training_helpers_rmappo import TrainingConfiguration, MetricsHub
-from train_rmappo import (
-    setup_global_reproducibility,
+from scripts.utils.training_helpers_maddpg import TrainingConfiguration
+from train_maddpg import (
     setup_environment,
-    initialize_rmappo_algorithm,
+    initialize_maddpg_algorithm,
+    inject_step_tracer,
+    setup_global_reproducibility,
 )
 
 DEFAULT_CONFIG_PATH = os.path.abspath(
@@ -42,13 +44,24 @@ DEFAULT_CONFIG_PATH = os.path.abspath(
         "envs",
         "multi_agent",
         "agents",
-        "training_params_rmappo.yaml",
+        "training_params_maddpg.yaml",
     )
 )
 
 
+def str2bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def resolve_config_path(explicit_path: Optional[str], checkpoint_path: str) -> str:
-    """Locate configuration file using explicit path, checkpoint directory, or default."""
+    """Locate configuration file: explicit path, neighbouring checkpoint, or default."""
     candidates = []
     if explicit_path:
         candidates.append(explicit_path)
@@ -58,7 +71,7 @@ def resolve_config_path(explicit_path: Optional[str], checkpoint_path: str) -> s
             [
                 os.path.join(ckpt_dir, name)
                 for name in (
-                    "training_params_rmappo.yaml",
+                    "training_params_maddpg.yaml",
                     "config.yaml",
                     "env_config.yaml",
                 )
@@ -73,67 +86,79 @@ def resolve_config_path(explicit_path: Optional[str], checkpoint_path: str) -> s
     )
 
 
-def resolve_save_dir(requested: Optional[str], checkpoint_path: str) -> str:
-    if requested:
-        return requested
+def resolve_save_dir(save_dir: Optional[str], checkpoint_path: str) -> str:
+    if save_dir:
+        return save_dir
     ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
     return ckpt_dir if ckpt_dir else "."
 
 
-def get_hidden_size(config: TrainingConfiguration, default: int = 256) -> int:
-    try:
-        return int(config.params["algorithms"]["rmappo"]["hidden_size"])
-    except Exception:
-        print(f"[WARN] 'algorithms.rmappo.hidden_size' missing. Using default={default}.")
-        return default
+def load_maddpg_checkpoint(maddpg, checkpoint_path: str):
+    """
+    Load shared-network MADDPG checkpoint.
 
+    Supports:
+      * Flat dual checkpoints (recommended)
+      * final_shared_networks.pth
+      * Legacy top-k checkpoints (uses rank_1 networks)
+    """
+    print(f"[LOAD] Loading MADDPG checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=maddpg.device)
+    agent_ids = maddpg.agent_ids
 
-def load_checkpoint(rmappo_wrapper, checkpoint_path: str):
-    """Load flat dual-network checkpoint into wrapper."""
-    print(f"[LOAD] Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=rmappo_wrapper.device, weights_only=False)
-    flat_keys = {"human_actor", "human_critic", "robot_actor", "robot_critic"}
-    if not flat_keys.issubset(ckpt.keys()):
+    def has_flat_keys(prefix: str = "") -> bool:
+        return all(f"{prefix}{aid}_actor" in ckpt and f"{prefix}{aid}_critic" in ckpt for aid in agent_ids)
+
+    loaded_type = None
+
+    if has_flat_keys():
+        for aid in agent_ids:
+            agent = maddpg.agents[aid]
+            agent.actor.load_state_dict(ckpt[f"{aid}_actor"])
+            agent.critic.load_state_dict(ckpt[f"{aid}_critic"])
+            if f"{aid}_actor_target" in ckpt and f"{aid}_critic_target" in ckpt:
+                agent.actor_target.load_state_dict(ckpt[f"{aid}_actor_target"])
+                agent.critic_target.load_state_dict(ckpt[f"{aid}_critic_target"])
+        loaded_type = "flat"
+    elif has_flat_keys("rank_1_"):
+        print("[LOAD] Detected legacy top-k checkpoint; using rank_1 weights.")
+        for aid in agent_ids:
+            agent = maddpg.agents[aid]
+            agent.actor.load_state_dict(ckpt[f"rank_1_{aid}_actor"])
+            agent.critic.load_state_dict(ckpt[f"rank_1_{aid}_critic"])
+            if f"rank_1_{aid}_actor_target" in ckpt and f"rank_1_{aid}_critic_target" in ckpt:
+                agent.actor_target.load_state_dict(ckpt[f"rank_1_{aid}_actor_target"])
+                agent.critic_target.load_state_dict(ckpt[f"rank_1_{aid}_critic_target"])
+        loaded_type = "topk"
+    else:
         raise KeyError(
-            f"Checkpoint missing required keys. Expected: {flat_keys}. "
-            f"Found: {list(ckpt.keys())[:20]}..."
+            "Checkpoint does not contain expected MADDPG keys. "
+            "Expected flat dual checkpoint (human/robot actor/critic)."
         )
-    rmappo_wrapper.policies["human"].actor.load_state_dict(ckpt["human_actor"])
-    rmappo_wrapper.policies["human"].critic.load_state_dict(ckpt["human_critic"])
-    rmappo_wrapper.policies["robot"].actor.load_state_dict(ckpt["robot_actor"])
-    rmappo_wrapper.policies["robot"].critic.load_state_dict(ckpt["robot_critic"])
+
+    if "params" in ckpt and isinstance(ckpt["params"], dict):
+        maddpg.params = ckpt["params"]
+        print("[LOAD] MADDPG params updated from checkpoint.")
+
+    # Optional metadata
     for key in ("milestone", "score", "global_steps_total", "episodes_done_total"):
         if key in ckpt:
             print(f"[LOAD] {key}: {ckpt[key]}")
 
-
-def inject_step_tracer(env, config, num_envs):
-    """Inject StepTracer for detailed console logging (controlled by YAML)."""
-    actual_env = getattr(env, "unwrapped", env)
-    from surgical_project.envs.multi_agent.utils import StepTracer
-
-    enable_logging = config.params.get("logging", {}).get("enable_console_logging", False)
-    actual_env.step_tracer = StepTracer(
-        num_envs=num_envs,
-        device=getattr(actual_env, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
-        enable_console_logging=enable_logging,
-        print_every_steps=1,
-    )
-    status = "Enabled" if enable_logging else "Disabled"
-    print(f"[STEPTRACER] {status} (controlled by logging.enable_console_logging)")
+    print(f"[LOAD] Checkpoint type: {loaded_type}")
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate trained rMAPPO dual-network policy.")
+    parser = argparse.ArgumentParser(description="Evaluate trained MADDPG shared-network policy.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pth).")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file.")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0", help="Environment task name.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments (default: 1).")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of evaluation episodes.")
     parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps per episode (0 = unlimited).")
     parser.add_argument("--deterministic", dest="deterministic", action="store_true", help="Use deterministic actions (default).")
-    parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Enable stochastic action sampling.")
+    parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Enable stochastic actions with exploration noise.")
     parser.set_defaults(deterministic=True)
     parser.add_argument("--save_dir", type=str, default=None, help="Directory to store evaluation outputs.")
     parser.add_argument("--wandb", action="store_true", default=False, help="Enable WandB logging.")
@@ -141,62 +166,61 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def evaluate(args, simulation_app):
+def evaluate(args):
     config_path = resolve_config_path(args.config, args.checkpoint)
     print(f"[SETUP] Using config: {config_path}")
     config = TrainingConfiguration.from_yaml(config_path)
 
     setup_global_reproducibility(args.seed, strict_determinism=True)
 
-    eval_num_envs = max(1, args.num_envs)
-
-    # prepare minimal namespace for environment helpers
+    # Align evaluation args with training helper expectations
     class EvalArgs:
         pass
 
-    env_args = EvalArgs()
-    env_args.num_envs = eval_num_envs
-    env_args.task = args.task
-    env_args.seed = args.seed
-    env_args.checkpoint = args.checkpoint  # for logging compatibility
+    eval_args = EvalArgs()
+    eval_args.num_envs = max(1, args.num_envs)
+    eval_args.task = args.task
+    eval_args.seed = args.seed
 
-    print(f"[SETUP] Creating environment with num_envs={eval_num_envs} ...")
-    env, _ = setup_environment(env_args, config)
+    env, _ = setup_environment(eval_args, config)
     actual_env = getattr(env, "unwrapped", env)
     if hasattr(actual_env, "params"):
         actual_env.params = config.params
         print("[SETUP] Injected params into environment.")
 
-    inject_step_tracer(env, config, eval_num_envs)
+    inject_step_tracer(env, config, eval_args.num_envs)
 
-    metrics_hub = MetricsHub()
-    rmappo = initialize_rmappo_algorithm(env, config, env_args, metrics_hub)
-    rmappo.set_eval_mode(True)
+    maddpg = initialize_maddpg_algorithm(env, config, eval_args)
+    maddpg.set_eval_mode(True)
 
-    load_checkpoint(rmappo, args.checkpoint)
+    load_maddpg_checkpoint(maddpg, args.checkpoint)
 
-    hidden_size = get_hidden_size(config)
-    completion_threshold = config.params.get("reward_parameters", {}).get("completion_threshold", 0.01)
-    recorder = EvalRecorder(rmappo.agent_ids, mode="rmappo", completion_threshold=completion_threshold)
+    completion_threshold = (
+        config.params.get("reward_parameters", {}).get("completion_threshold", 0.01)
+    )
+    recorder = EvalRecorder(maddpg.agent_ids, mode="maddpg", completion_threshold=completion_threshold)
+
+    expl_cfg = maddpg.params.get("exploration", {}) if isinstance(maddpg.params, dict) else {}
+    eval_noise_scale = 0.0 if args.deterministic else float(expl_cfg.get("sigma_start", 0.7))
 
     wandb_logger = None
     if args.wandb:
         if wandb_available():
-            run_name = f"rmappo_eval_{os.path.basename(args.checkpoint)}"
+            run_name = f"maddpg_eval_{os.path.basename(args.checkpoint)}"
             wandb_logger = EvalWandBLogger(
-                project="rmappo_evaluation",
+                project="maddpg_evaluation",
                 run_name=run_name,
                 config={
                     "checkpoint": args.checkpoint,
                     "config_path": config_path,
                     "task": args.task,
-                    "num_envs": eval_num_envs,
+                    "num_envs": eval_args.num_envs,
                     "deterministic": args.deterministic,
                 },
             )
             print("[WANDB] Logging enabled.")
         else:
-            print("[WANDB] wandb not available; logging disabled.")
+            print("[WANDB] wandb not available; disabling logging.")
 
     max_steps = args.max_steps if args.max_steps > 0 else float("inf")
 
@@ -205,35 +229,25 @@ def evaluate(args, simulation_app):
         recorder.start_episode(ep)
         obs, _ = env.reset()
 
-        # Initialize RNN states
-        for aid in rmappo.agent_ids:
-            rmappo.rnn_states[aid]["actor"] = torch.zeros(1, hidden_size, device=rmappo.device)
-            rmappo.rnn_states[aid]["critic"] = torch.zeros(1, hidden_size, device=rmappo.device)
-
         step = 0
         done_any = False
-        while simulation_app.is_running() and step < max_steps and not done_any:
-            actions, detail = rmappo.select_actions(obs, deterministic=args.deterministic)
-            if hasattr(actual_env, "set_detail_actor_info"):
-                actual_env.set_detail_actor_info(detail)
-
-            obs, rewards, terminated, truncated, info = env.step(actions)
-
-            if hasattr(actual_env, "step_tracer") and actual_env.step_tracer is not None:
-                actual_env.step_tracer.maybe_print_step(
-                    actual_env,
-                    rewards,
-                    global_step=step,
-                    force_print=True,
-                )
-
+        while step < max_steps and not done_any:
+            actions, detail = maddpg.select_actions(
+                obs,
+                add_noise=not args.deterministic,
+                noise_scale=eval_noise_scale,
+            )
+            actual_env.set_detail_actor_info(detail)
+            next_obs, rewards, terminated, truncated, info = env.step(actions)
             recorder.record_step(step, env, rewards, info, detail)
 
             done_mask = None
-            for aid in rmappo.agent_ids:
+            for aid in maddpg.agent_ids:
                 term = (terminated[aid] | truncated[aid]).to(torch.bool)
                 done_mask = term if done_mask is None else (done_mask | term)
             done_any = bool(done_mask is not None and done_mask.any().item())
+
+            obs = next_obs
             step += 1
 
         summary = recorder.end_episode()
@@ -259,24 +273,12 @@ def evaluate(args, simulation_app):
             }
             wandb_logger.log_episode(ep, {k: v for k, v in wandb_payload.items() if v is not None})
 
-        if not simulation_app.is_running():
-            print("[WARN] Simulation app stopped running; terminating evaluation early.")
-            break
-
     save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
     recorder.save(save_dir)
-    print(f"[SAVE] Evaluation artifacts written to: {save_dir}")
-
-    aggregates = recorder._build_aggregates()
-    if aggregates:
-        print("\n[EVALUATION SUMMARY]")
-        for key, stats in aggregates.items():
-            print(
-                f"  {key}: mean={stats['mean']:.3f} std={stats['std']:.3f} "
-                f"min={stats['min']:.3f} max={stats['max']:.3f}"
-            )
+    print(f"[SAVE] Evaluation results written to: {save_dir}")
 
     if wandb_logger:
+        # Upload per-step table
         table_data = [
             [
                 rec.episode,
@@ -321,7 +323,7 @@ def main():
     simulation_app = app_launcher.app
 
     try:
-        evaluate(args, simulation_app)
+        evaluate(args)
     finally:
         print("[CLEANUP] Closing simulation app...")
         simulation_app.close()

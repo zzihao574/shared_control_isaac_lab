@@ -59,7 +59,7 @@ parser.add_argument("--max_global_steps", type=int, default=150000,
                     help="Training stops when trainer.global_step >= this value.")
 parser.add_argument("--ckpt_dir", type=str, default="logs/epigraph/checkpoints",
                     help="Directory to save checkpoints.")
-parser.add_argument("--resume", type=str, default="", 
+parser.add_argument("--checkpoint", type=str, default="",
                     help="Path to checkpoint to resume training from.")
 parser.add_argument(
     "--wandb",
@@ -175,8 +175,8 @@ def main():
     print(f"Seed:             {args.seed}")
     print(f"Max Global Steps: {args.max_global_steps}")
     print(f"Checkpoint Dir:   {args.ckpt_dir}")
-    if args.resume:
-        print(f"Resume from:      {args.resume}")
+    if args.checkpoint:
+        print(f"Resume from:      {args.checkpoint}")
     print("=" * 80 + "\n")
     
     # ===== 1. Load Configuration =====
@@ -233,9 +233,9 @@ def main():
     print(f"[TRAINER] EpigraphTrainer initialized\n")
     
     # ===== 7. Resume from Checkpoint (optional) =====
-    if args.resume and os.path.isfile(args.resume):
-        print(f"[RESUME] Loading checkpoint from: {args.resume}")
-        trainer.load_checkpoint(args.resume)
+    if args.checkpoint and os.path.isfile(args.checkpoint):
+        print(f"[RESUME] Loading checkpoint from: {args.checkpoint}")
+        trainer.load_checkpoint(args.checkpoint)
         print(f"[RESUME] Resumed at global_step={trainer.global_step}\n")
     
     # ===== 8. Training Loop =====

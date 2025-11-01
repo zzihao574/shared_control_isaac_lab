@@ -10,10 +10,10 @@ import os
 import yaml
 import torch
 import numpy as np
-import pickle
 import math
+import random
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable, DefaultDict, Deque
+from typing import Dict, List, Optional, Union, Any, Callable, DefaultDict, Deque
 from collections import defaultdict, deque
 
 # WandB support
@@ -205,17 +205,19 @@ class TrainingRunner:
 
 class MilestoneEvaluator:
     """
-    Milestone evaluator with single environment evaluation and TopK model management.
-    Features normalized return calculation and proper action masking.
+    Milestone evaluator with single environment evaluation.
+    Saves unified checkpoints compatible with resume/play.
     """
     
-    def __init__(self, env, maddpg, topk_mgr, metrics_hub, log_dir, agent_ids):
+    def __init__(self, env, maddpg, metrics_hub, log_dir, agent_ids, runner=None):
         self.env = env
         self.maddpg = maddpg
-        self.topk = topk_mgr
         self.metrics = metrics_hub
         self.log_dir = log_dir
         self.agent_ids = agent_ids
+        self.runner = runner
+        self.checkpoint_dir = os.path.join(self.log_dir, "checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
 
     def run_evaluation(self, milestone: int, global_step: int) -> dict:
         """Handle milestone evaluation and model saving."""
@@ -227,24 +229,22 @@ class MilestoneEvaluator:
         
         print(f"[EVAL] Milestone {milestone}: return_norm={return_norm:.4f}, scaled={milestone_return:.2f}")
 
-        # Extract model weights
-        model_state = self._extract_model_state()
-
-        # Update TopK and save (using scaled return)
-        self.topk.update(milestone_return, model_state, milestone)
-        ckpt_path = os.path.join(self.log_dir, f"topk_milestone_{milestone}.pth")
-        self.topk.save_checkpoint(ckpt_path, self.agent_ids)
+        ckpt_path = save_milestone_checkpoint_maddpg(
+            self.maddpg,
+            self.runner,
+            milestone_return,
+            milestone,
+            self.checkpoint_dir,
+        )
 
         # Push milestone logs with return_norm*1000 to replace previous return metrics
         payload = {
             "eval/return_mean": float(milestone_return),  # This maps to milestone/actor_return
             "eval/num_episodes": int(num_eps),
-            "milestone/topk_best_score": float(milestone_return),  # This maps to milestone/topk_best_return
-            "milestone/topk_avg_score": float(milestone_return),
-            "milestone/topk_count": 1,
             "milestone/latest_completed": int(milestone),
             # Additional debug info
             "eval/return_norm": float(return_norm),  # Original normalized return for reference
+            "milestone/checkpoint_path": ckpt_path,
         }
         self.metrics.push_milestone(global_step, milestone, payload)
         
@@ -365,20 +365,6 @@ class MilestoneEvaluator:
         
         return avg_return_norm, len(final_return_norms)
 
-    def _extract_model_state(self):
-        """Extract model state for checkpoint saving."""
-        model_state = {}
-        for agent_id in self.agent_ids:
-            agent = self.maddpg.agents[agent_id]
-            prefix = f'{agent_id}'
-            model_state.update({
-                f'{prefix}_actor': agent.actor.state_dict(),
-                f'{prefix}_critic': agent.critic.state_dict(),
-                f'{prefix}_actor_target': agent.actor_target.state_dict(),
-                f'{prefix}_critic_target': agent.critic_target.state_dict()
-            })
-        return model_state
-
 class MetricsHub:
     """
     Simplified single-exit metrics bus for unified data pipeline.
@@ -436,7 +422,6 @@ class WandBLogger:
         "training/critic_updates": "train/critic_updates",
         "training/actor_updates": "train/actor_updates",
         "eval/return_mean": "milestone/actor_return",
-        "milestone/topk_best_score": "milestone/topk_best_return",
         "milestone/latest_completed": "milestone/latest_completed",
         # Force statistics
         "forces/robot_fx_mean": "forces/robot_fx_mean",
@@ -512,8 +497,6 @@ class WandBLogger:
             payload_to_log = {}
             if "eval/return_mean" in ms:
                 payload_to_log["eval/return_mean"] = ms["eval/return_mean"]
-            if "milestone/topk_best_score" in ms:
-                payload_to_log["milestone/topk_best_score"] = ms["milestone/topk_best_score"]
             if "milestone" in ms:
                 payload_to_log["milestone/latest_completed"] = ms["milestone"]
 
@@ -583,85 +566,140 @@ class TrainingConfiguration:
         return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-class TopKModelManager:
-    """
-    Manages top-K model collection and checkpoint saving.
-    Features raw performance tracking and automatic sorting by performance.
-    """
-    
-    def __init__(self, k: int = 10, mode: str = "max"):
-        self.k = k  # Number of top models to keep
-        self.mode = mode  # Ranking mode
-        self.top_models: List[Tuple[float, Dict, int]] = []  # (performance, model_state, milestone)
-    
-    def update(self, performance: float, model_state: Dict[str, Any], milestone: int) -> None:
-        """Update top-K models with new performance data."""
-        # Add new model
-        if len(self.top_models) < self.k:
-            self.top_models.append((performance, model_state, milestone))
-        elif performance > self.top_models[-1][0]:
-            self.top_models[-1] = (performance, model_state, milestone)
-        
-        # Sort by performance descending
-        self.top_models.sort(key=lambda x: x[0], reverse=True)
-    
-    def get_top_models(self) -> List[Tuple[float, Dict, int]]:
-        """Get list of top-K models."""
-        return self.top_models
-    
-    def save_checkpoint(self, filepath: str, agent_ids: List[str]) -> None:
-        """Save checkpoint with top-K models."""
-        checkpoint = {
-            'agent_ids': agent_ids,
-            'top_k_count': len(self.top_models),
-            'top_k_models': []
-        }
-        
-        for i, (performance, model_state, milestone) in enumerate(self.top_models):
-            model_info = {
-                'rank': i + 1,
-                'performance': performance,
-                'milestone': milestone
-            }
-            checkpoint['top_k_models'].append(model_info)
-            
-            # Save model state with rank prefix
-            for key, value in model_state.items():
-                checkpoint[f'rank_{i+1}_{key}'] = value
-        
-        torch.save(checkpoint, filepath)
-        if self.top_models:
-            scores = [m[0] for m in self.top_models]
-            print(f"[TOP-K] Saved {len(self.top_models)} best models, scores: "
-                  f"{scores[0]:.2f} ~ {scores[-1]:.2f}")
+def save_milestone_checkpoint_maddpg(
+    maddpg,
+    runner,
+    score: float,
+    milestone: int,
+    ckpt_dir: str,
+):
+    """Save flat dual-network checkpoint for MADDPG (resume + evaluation)."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    fname = f"ckpt_milestone_{milestone:06d}_score_{score:.6f}.pth"
+    fpath = os.path.join(ckpt_dir, fname)
 
-
-def save_final_shared_networks(log_directory: str, maddpg, global_step: int, global_episodes: int, max_milestone_triggered: Optional[int]) -> None:
-    """Save final shared networks to checkpoint file."""
-    final_path = os.path.join(log_directory, "final_shared_networks.pth")
-    
-    final_checkpoint = {
-        'params': maddpg.params,
-        'agent_ids': maddpg.agent_ids,
-        'global_steps_total': global_step,
-        'episodes_done_total': global_episodes,
-        'max_milestone_triggered': max_milestone_triggered or 0,
-        'shared_networks': True,
-        'network_config': maddpg.params.get('networks', {}),
-        'exploration_config': maddpg.params.get('exploration', {}),
+    checkpoint = {
+        "algorithm": "maddpg_shared",
+        "agent_ids": maddpg.agent_ids,
+        "score": float(score),
+        "milestone": int(milestone),
+        "params": maddpg.params,
+        "global_steps_total": int(getattr(runner, "global_step", 0)),
+        "episodes_done_total": int(getattr(runner, "global_episodes", 0)),
+        "training_steps_total": int(getattr(maddpg, "training_steps", 0)),
+        "actor_update_count": int(getattr(maddpg, "actor_update_count", 0)),
+        "critic_update_count": int(getattr(maddpg, "critic_update_count", 0)),
     }
-    
+
     for agent_id in maddpg.agent_ids:
         agent = maddpg.agents[agent_id]
-        final_checkpoint.update({
-            f'{agent_id}_actor': agent.actor.state_dict(),
-            f'{agent_id}_critic': agent.critic.state_dict(),
-            f'{agent_id}_actor_target': agent.actor_target.state_dict(),
-            f'{agent_id}_critic_target': agent.critic_target.state_dict()
-        })
-    
-    torch.save(final_checkpoint, final_path)
-    print(f"[CHECKPOINT] Final shared networks saved: {final_path}")
+        checkpoint[f"{agent_id}_actor"] = agent.actor.state_dict()
+        checkpoint[f"{agent_id}_critic"] = agent.critic.state_dict()
+        checkpoint[f"{agent_id}_actor_target"] = agent.actor_target.state_dict()
+        checkpoint[f"{agent_id}_critic_target"] = agent.critic_target.state_dict()
+
+    optim_state = {}
+    for agent_id in maddpg.agent_ids:
+        agent = maddpg.agents[agent_id]
+        optim_state[f"{agent_id}_actor"] = agent.actor_optimizer.state_dict()
+        optim_state[f"{agent_id}_critic"] = agent.critic_optimizer.state_dict()
+    checkpoint["optim_state"] = optim_state
+
+    checkpoint["rng_state"] = {
+        "py": random.getstate(),
+        "np": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+    torch.save(checkpoint, fpath)
+    _append_milestone_index_maddpg(
+        os.path.join(ckpt_dir, "milestones_index.txt"),
+        milestone,
+        score,
+        fname,
+    )
+    print(f"[CKPT] Saved milestone {milestone} (score={score:.4f}) -> {fpath}")
+    return fpath
+
+
+def _append_milestone_index_maddpg(index_path: str, milestone: int, score: float, fname: str):
+    record = f"{datetime.now().isoformat()}\tmilestone={milestone:06d}\tscore={score:.6f}\tpath={fname}"
+    records: List[str] = []
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(line)
+    records.append(record)
+
+    def _milestone_key(entry: str) -> int:
+        for part in entry.split("\t"):
+            if part.startswith("milestone="):
+                try:
+                    return int(part.split("=", 1)[1])
+                except ValueError:
+                    return 0
+        return 0
+
+    records_sorted = sorted(records, key=_milestone_key)
+    with open(index_path, "w", encoding="utf-8") as f:
+        for rec in records_sorted:
+            f.write(rec + "\n")
+
+
+def resume_from_checkpoint_maddpg(path: str, maddpg, runner=None, device: Optional[str] = None):
+    """Resume MADDPG training from flat dual checkpoint."""
+    print(f"[RESUME] Loading checkpoint: {path}")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    agent_ids = maddpg.agent_ids
+    for agent_id in agent_ids:
+        agent = maddpg.agents[agent_id]
+        agent.actor.load_state_dict(ckpt[f"{agent_id}_actor"])
+        agent.critic.load_state_dict(ckpt[f"{agent_id}_critic"])
+        if f"{agent_id}_actor_target" in ckpt and f"{agent_id}_critic_target" in ckpt:
+            agent.actor_target.load_state_dict(ckpt[f"{agent_id}_actor_target"])
+            agent.critic_target.load_state_dict(ckpt[f"{agent_id}_critic_target"])
+        if device is not None:
+            agent.actor.to(device)
+            agent.critic.to(device)
+            agent.actor_target.to(device)
+            agent.critic_target.to(device)
+    print("[RESUME] Loaded actor/critic weights (including targets).")
+
+    if "optim_state" in ckpt:
+        for agent_id in agent_ids:
+            agent = maddpg.agents[agent_id]
+            if f"{agent_id}_actor" in ckpt["optim_state"]:
+                agent.actor_optimizer.load_state_dict(ckpt["optim_state"][f"{agent_id}_actor"])
+            if f"{agent_id}_critic" in ckpt["optim_state"]:
+                agent.critic_optimizer.load_state_dict(ckpt["optim_state"][f"{agent_id}_critic"])
+        print("[RESUME] Optimizer states restored.")
+
+    if "params" in ckpt and isinstance(ckpt["params"], dict):
+        maddpg.params = ckpt["params"]
+        print("[RESUME] Updated maddpg.params from checkpoint.")
+
+    maddpg.training_steps = int(ckpt.get("training_steps_total", getattr(maddpg, "training_steps", 0)))
+    maddpg.actor_update_count = int(ckpt.get("actor_update_count", getattr(maddpg, "actor_update_count", 0)))
+    maddpg.critic_update_count = int(ckpt.get("critic_update_count", getattr(maddpg, "critic_update_count", 0)))
+
+    if runner is not None:
+        runner.global_step = int(ckpt.get("global_steps_total", runner.global_step))
+        runner.global_episodes = int(ckpt.get("episodes_done_total", runner.global_episodes))
+        print(f"[RESUME] Runner counters -> steps={runner.global_step} episodes={runner.global_episodes}")
+
+    if "rng_state" in ckpt:
+        random.setstate(ckpt["rng_state"]["py"])
+        np.random.set_state(ckpt["rng_state"]["np"])
+        torch.set_rng_state(ckpt["rng_state"]["torch"])
+        if torch.cuda.is_available() and ckpt["rng_state"]["cuda"] is not None:
+            torch.cuda.set_rng_state_all(ckpt["rng_state"]["cuda"])
+        print("[RESUME] RNG states restored.")
+
+    print("[RESUME] MADDPG checkpoint restoration complete.")
 
 
 def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
@@ -687,10 +725,10 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
         help="Stop after this many global training steps; if >0, it becomes the primary stop condition."
     )
     
-    # Model management
-    parser.add_argument("--top_k_models", type=int, default=10)
-    
     # Logging
     parser.add_argument("--wandb", action="store_true", default=False)
+    
+    # Resume
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for resume training.")
     
     return parser

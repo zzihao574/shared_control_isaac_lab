@@ -28,14 +28,14 @@ networks:
 # ==============================================================================
 obs_scaling:
   # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
-  factors: [10.0, 10.0, 10.0, 50.0, 50.0, 50.0, 10.0]
+  factors: [5.0, 16.7, 16.7, 16.7, 5.0, 1.0]
 
 # ==============================================================================
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.6   # Initial noise = 0.6 × max_action
-  sigma_end: 0.1     # Final noise = 0.1 × max_action
+  sigma_start: 1.0   # Initial noise = 0.6 × max_action
+  sigma_end: 0.2     # Final noise = 0.1 × max_action
   decay_k: 3.0       # Decay rate for exponential schedule
 
 # ==============================================================================
@@ -97,58 +97,58 @@ reward_parameters:
   
   weights:
     # ===== ROBOT (Active Agent) =====
-    zoneA_weight_robot: 2.4
+    zoneA_weight_robot: 0.6
     zoneA_progress_robot: 3.0
-    zoneA_deviation_robot: 1.5
+    zoneA_deviation_robot: 2.0
 
-    zoneB_weight_robot: 2.4
-    zoneB_gap_robot: 1.0
-    zoneB_surftangent_robot: 1.0
-    zoneB_inward_robot: 1.0
+    zoneB_weight_robot: 0.7
+    zoneB_gap_robot: 1.2
+    zoneB_surftangent_robot: 1.8
+    zoneB_inward_robot: 0.5
 
-    zoneC_weight_robot: 4.0
+    zoneC_weight_robot: 1.0
     zoneC_offpen_robot: 1.0
     zoneC_inward_robot: 1.0
-    zoneC_overlap_robot: 1.0          # Collision penalty weight
+    zoneC_overlap_robot: 1.0
 
-    zoneD_weight_robot: 2.4
-    zoneD_progress_robot: 1.0
-    zoneD_deviation_robot: 1.5
+    zoneD_weight_robot: 0.6
+    zoneD_progress_robot: 0.8
+    zoneD_deviation_robot: 2.0
     zoneD_inward_robot: 1.0
 
     zpenalty_robot: 0.0
-    completion_robot: 4.0
+    completion_robot: 1.0
     timeeff_robot: 0.0
-    potential_robot: 0.4              # Potential reward weight for robot
-    forceeff_robot: 0.7
-    humanaware_robot: 0.7
+    potential_robot: 0.2
+    forceeff_robot: 0.27
+    humanaware_robot: 0.27
 
-    # ===== HUMAN (Disabled in Single-Agent Mode) =====  
-    zoneA_weight_human: 2.4
+    # ===== HUMAN (Independent Network) =====  
+    zoneA_weight_human: 0.6
     zoneA_progress_human: 3.0
-    zoneA_deviation_human: 1.5
+    zoneA_deviation_human: 2.0
 
-    zoneB_weight_human: 2.4
-    zoneB_gap_human: 1.0
-    zoneB_surftangent_human: 1.0
-    zoneB_inward_human: 1.0
+    zoneB_weight_human: 0.7
+    zoneB_gap_human: 1.2
+    zoneB_surftangent_human: 1.8
+    zoneB_inward_human: 0.5
 
-    zoneC_weight_human: 4.0
+    zoneC_weight_human: 1.0
     zoneC_offpen_human: 1.0
     zoneC_inward_human: 1.0
     zoneC_overlap_human: 1.0 
 
-    zoneD_weight_human: 2.4
-    zoneD_progress_human: 1.0
-    zoneD_deviation_human: 1.5
+    zoneD_weight_human: 0.6
+    zoneD_progress_human: 0.8
+    zoneD_deviation_human: 2.0
     zoneD_inward_human: 1.0
 
     zpenalty_human: 0.0
-    completion_human: 4.0
+    completion_human: 1.0
     timeeff_human: 0.0
-    potential_human: 0.4              # Potential reward weight for human
-    forceeff_human: 0.7
-    robotaware_human: 0.7
+    potential_human: 0.2
+    forceeff_human: 0.27
+    robotaware_human: 0.27
 
 # ==============================================================================
 # Termination Conditions
@@ -167,10 +167,10 @@ maddpg_config:
   gamma: 0.99                        # Discount factor
   batch_size: 1024                    # Training batch size (increased for stability)
   max_global_steps: 200000           # Primary termination condition: stop after this many training steps
-  update_interval: 10                 # Updates every N steps
+  update_interval: 5                 # Updates every N steps
   min_buffer_size: 6000              # Minimum buffer size to start training (per-env baseline)
-  tau: 0.002                         # Target network update rate (slower for stability)
-  max_replay_buffer_len: 7200       # Maximum replay buffer size (per-env baseline)
+  tau: 0.005                         # Target network update rate (slower for stability)
+  max_replay_buffer_len: 8400       # Maximum replay buffer size (per-env baseline)
 
 # ==============================================================================
 # Training Monitoring
