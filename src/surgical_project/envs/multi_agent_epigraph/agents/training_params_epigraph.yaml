@@ -11,6 +11,10 @@ training:
   lr_decay:
     enabled: true               # Enable cosine learning rate decay
     final_factor: 0.1          # Final learning rate = initial * 0.1
+  entropy_schedule:
+    enabled: true
+    start: 0.007
+    end: 0.003
 
 # ==============================================================================
 # Logging Configuration
@@ -36,13 +40,10 @@ algorithms:
     gae_lambda: 0.95                  # GAE lambda
     
     # PPO specific
-    clip_param: 0.1                   # PPO clipping parameter
+    clip_param: 0.15                   # PPO clipping parameter
     ppo_epoch: 4                      # Number of PPO epochs per update
     num_mini_batch: 8                 # Number of mini-batches per epoch
-    
-    # Loss coefficients
-    entropy_coef: 0.01               # Entropy regularization coefficient
-    
+
     # Gradient clipping
     max_grad_norm_actor: 5.0          # Actor gradient clipping threshold
     max_grad_norm_critic: 10.0        # Critic gradient clipping threshold
@@ -56,43 +57,37 @@ algorithms:
     recurrent_N: 1                    # Number of RNN layers
     use_orthogonal: true              # Use orthogonal initialization
     gain: 0.01                        # Initialization gain
-    
+
     # Value normalization
-    use_popart: false                 # Use PopArt normalization
     use_clipped_value_loss: true      # Use clipped value loss
     huber_delta: 1.0                  # Huber loss delta
-    
+
     # Training termination
     max_global_steps: 200000          # Primary termination condition
+
+    per_actor:
+      entropy_multiplier:
+        human: 1.0
+        robot: 1.0
 
 # ==============================================================================
 # Epigraph-Specific Configuration
 # ==============================================================================
 epigraph:
   z:
-    min: -0.2                         # Lower bound for z values
-    max: 0.2                          # Upper bound for z values
+    min: -0.05                        # Lower bound for z values
+    max: 0.05                         # Upper bound for z values
     init:
-      mode: mixed                     # Initialization mode: uniform/extreme/mixed
-      p_extreme: 0.3                  # Probability of extreme values (for mixed mode)
+      mode: uniform                     # Initialization mode: uniform/extreme/mixed
+      p_extreme: 0.15                  # Probability of extreme values (for mixed mode)
     encode:
-      nz: 8                           # Z encoding dimension
+      nz: 6                           # Z encoding dimension
       mean: 0.0                       # Normalization mean
       scale: 0.3                      # Normalization scale
-  
-  losses:
-    lambda_safe: 1.0                  # Weight for safety advantage in combined advantage
   
   root_finder:
     max_iter: 32                      # Maximum iterations for bisection
     tol: 0.0001                       # Convergence tolerance (1e-4)
-
-# ==============================================================================
-# Epigraph Environment Configuration (Reward Composition)
-# ==============================================================================
-epigraph_env:
-  use_timeeff_in_task: 0              # 0/1 flag: Include time efficiency in task rewards
-  include_zpenalty_in_safe: 1         # 0/1 flag: Include z-penalty in safety rewards
 
 # ==============================================================================
 # Physics Constraints (Runtime Constraints)
@@ -146,59 +141,66 @@ reward_parameters:
   completion_threshold: 0.01          # Distance threshold for task completion (meters)
   
   weights:
-    # ===== ROBOT (Active Agent) =====
-    zoneA_weight_robot: 0.6
-    zoneA_progress_robot: 3.0
-    zoneA_deviation_robot: 2.0
-
-    zoneB_weight_robot: 0.7
-    zoneB_gap_robot: 1.2
-    zoneB_surftangent_robot: 1.8
-    zoneB_inward_robot: 0.5
-
-    zoneC_weight_robot: 1.0
-    zoneC_offpen_robot: 1.0
-    zoneC_inward_robot: 1.0
-    zoneC_overlap_robot: 1.0
-
-    zoneD_weight_robot: 0.6
-    zoneD_progress_robot: 0.8
-    zoneD_deviation_robot: 2.0
-    zoneD_inward_robot: 1.0
-
-    zpenalty_robot: 0.0
-    completion_robot: 1.0
-    timeeff_robot: 0.0
-    potential_robot: 0.2
-    forceeff_robot: 0.27
-    humanaware_robot: 0.27
-
-    # ===== HUMAN (Independent Network) =====  
-    zoneA_weight_human: 0.6
-    zoneA_progress_human: 3.0
-    zoneA_deviation_human: 2.0
-
-    zoneB_weight_human: 0.7
-    zoneB_gap_human: 1.2
-    zoneB_surftangent_human: 1.8
-    zoneB_inward_human: 0.5
-
-    zoneC_weight_human: 1.0
-    zoneC_offpen_human: 1.0
-    zoneC_inward_human: 1.0
-    zoneC_overlap_human: 1.0 
-
-    zoneD_weight_human: 0.6
-    zoneD_progress_human: 0.8
-    zoneD_deviation_human: 2.0
-    zoneD_inward_human: 1.0
-
-    zpenalty_human: 0.0
-    completion_human: 1.0
-    timeeff_human: 0.0
-    potential_human: 0.2
-    forceeff_human: 0.27
-    robotaware_human: 0.27
+    robot:
+      task:
+        zoneA:
+          weight: 0.6
+          progress: 3.0
+          deviation: 2.0
+        zoneB:
+          weight: 0.7
+          gap: 1.2
+          surftangent: 1.8
+        zoneD:
+          weight: 0.6
+          progress: 0.8
+          deviation: 2.0
+        completion: 1.0
+        timeeff: 0.0
+        potential: 0.2
+        forceeff: 0.27
+        humanaware: 0.27
+      safe:
+        zoneB:
+          inward: 0.5
+        zoneC:
+          weight: 1.0
+          offpen: 1.0
+          inward: 1.0
+          overlap: 1.0
+        zoneD:
+          inward: 1.0
+        zpenalty: 0.0
+    human:
+      task:
+        zoneA:
+          weight: 0.6
+          progress: 3.0
+          deviation: 2.0
+        zoneB:
+          weight: 0.7
+          gap: 1.2
+          surftangent: 1.8
+        zoneD:
+          weight: 0.6
+          progress: 0.8
+          deviation: 2.0
+        completion: 1.0
+        timeeff: 0.0
+        potential: 0.2
+        forceeff: 0.27
+        robotaware: 0.27
+      safe:
+        zoneB:
+          inward: 0.5
+        zoneC:
+          weight: 1.0
+          offpen: 1.0
+          inward: 1.0
+          overlap: 1.0
+        zoneD:
+          inward: 1.0
+        zpenalty: 0.0
 
 # ==============================================================================
 # Termination Conditions

@@ -57,7 +57,6 @@ class TrainingConfiguration:
             "logging", 
             "algorithms",
             "epigraph",
-            "epigraph_env",
             "constraints",
             "trajectory",
             "reward_parameters",

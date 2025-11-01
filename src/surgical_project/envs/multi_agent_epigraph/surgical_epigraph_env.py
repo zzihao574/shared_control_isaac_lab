@@ -13,10 +13,11 @@ KEY DESIGN (Pure Epigraph: Self-Contained):
 from __future__ import annotations
 
 import os
+import copy
 import yaml
 import torch
 import numpy as np
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from collections import defaultdict
 
 import isaaclab.sim as sim_utils
@@ -55,6 +56,8 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         
         # Environment's own step counter (for self-contained logging)
         self._env_debug_step_counter = 0
+        # Trainer-provided step counter (optional override)
+        self._trainer_global_step = 0
         
         self._setup_core_configuration()
         self._initialize_state_variables()
@@ -67,6 +70,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         )
         print_every_steps = self.params.get("logging", {}).get("print_every_steps", 10)
         max_envs_to_print = self.params.get("logging", {}).get("max_envs_to_print", 2)
+        strict_masks = bool(self.params.get("logging", {}).get("strict_masks", False))
         
         self.step_tracer = StepTracer(
             num_envs=self.num_envs,
@@ -74,10 +78,14 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             enable_console_logging=enable_console_logging,
             print_every_steps=print_every_steps,
             max_envs_to_print=max_envs_to_print,
+            strict_masks=strict_masks,
         )
+        self._last_z_snapshot = None
+        self._current_zone_masks = None
         
         if enable_console_logging:
-            print(f"[ENV/EPIGRAPH] StepTracer enabled (print_every={print_every_steps})")
+            strict_msg = " (strict_masks=True)" if strict_masks else ""
+            print(f"[ENV/EPIGRAPH] StepTracer enabled (print_every={print_every_steps}){strict_msg}")
         else:
             print("[ENV/EPIGRAPH] StepTracer disabled (set logging.enable_console_logging=true to enable)")
     
@@ -113,14 +121,76 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 self.params = yaml.safe_load(f)
             print(f"[ENV/EPIGRAPH] Loaded default params from {default_cfg_path}")
         
+        self._normalize_reward_weights_schema()
+
         self.dt = self.cfg.sim.dt * self.cfg.decimation
-        
+
         self._load_constraint_parameters()
         self._load_safety_parameters()
         self._load_termination_parameters()
         
         print(f"[ENV/EPIGRAPH] Episode length: {self.cfg.episode_length_s}s")
-    
+
+    def _normalize_reward_weights_schema(self) -> None:
+        """Flatten structured reward weights into legacy per-agent keys."""
+        reward_params = self.params.get("reward_parameters") if isinstance(self.params, dict) else None
+        if not isinstance(reward_params, dict):
+            return
+
+        weights = reward_params.get("weights")
+        if not isinstance(weights, dict):
+            return
+
+        if "robot" not in weights or "human" not in weights:
+            return
+
+        structured_weights = copy.deepcopy(weights)
+
+        key_map = {
+            "zoneA_weight": ("task", "zoneA", "weight"),
+            "zoneA_progress": ("task", "zoneA", "progress"),
+            "zoneA_deviation": ("task", "zoneA", "deviation"),
+            "zoneB_weight": ("task", "zoneB", "weight"),
+            "zoneB_gap": ("task", "zoneB", "gap"),
+            "zoneB_surftangent": ("task", "zoneB", "surftangent"),
+            "zoneB_inward": ("safe", "zoneB", "inward"),
+            "zoneC_weight": ("safe", "zoneC", "weight"),
+            "zoneC_offpen": ("safe", "zoneC", "offpen"),
+            "zoneC_inward": ("safe", "zoneC", "inward"),
+            "zoneC_overlap": ("safe", "zoneC", "overlap"),
+            "zoneD_weight": ("task", "zoneD", "weight"),
+            "zoneD_progress": ("task", "zoneD", "progress"),
+            "zoneD_deviation": ("task", "zoneD", "deviation"),
+            "zoneD_inward": ("safe", "zoneD", "inward"),
+            "zpenalty": ("safe", "zpenalty"),
+            "completion": ("task", "completion"),
+            "timeeff": ("task", "timeeff"),
+            "potential": ("task", "potential"),
+            "forceeff": ("task", "forceeff"),
+            "humanaware": ("task", "humanaware"),
+            "robotaware": ("task", "robotaware"),
+        }
+
+        flattened: Dict[str, float] = {}
+
+        for agent in ("robot", "human"):
+            agent_data = structured_weights.get(agent, {})
+
+            def fetch(path: Tuple[str, ...]) -> float:
+                value: Any = agent_data
+                for part in path:
+                    if isinstance(value, dict) and part in value:
+                        value = value[part]
+                    else:
+                        return 0.0
+                return float(value) if isinstance(value, (int, float)) else 0.0
+
+            for base_key, path in key_map.items():
+                flattened[f"{base_key}_{agent}"] = fetch(path)
+
+        reward_params["weights_structured"] = structured_weights
+        reward_params["weights"] = flattened
+
     def _load_constraint_parameters(self) -> None:
         """Load constraint-related parameters from configuration."""
         constraints = self.params['constraints']
@@ -196,7 +266,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
 
     def _initialize_reward_state_caches(self) -> None:
         """Initialize reward system state caches."""
-        self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self._goal_point = None
     
     def _initialize_components(self) -> None:
@@ -418,23 +488,44 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         return obs_dict
 
     def _build_zone_masks(self) -> Dict[str, torch.Tensor]:
-        """Build boolean masks for four-zone reward system."""
-        N = self.num_envs
-        dev = self.device
-        
-        prog = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-        viol = self.is_violating_t1
-        
-        before_line = prog < 0.0
-        on_line = (prog >= 0.0) & (prog <= 1.0)
-        after_line = prog > 1.0
-        
-        A = on_line & ~viol
-        B = on_line & viol
-        C = (before_line | after_line) & viol
-        D = (before_line | after_line) & ~viol
-        
-        return {'A': A, 'B': B, 'C': C, 'D': D}
+        """Build four-zone masks aligned with rMAPPO definition."""
+        D, O = 0.0075, 0.015
+        distances = self.safety_distances_t1
+
+        outside = distances >= O
+        surface = (distances > D) & (distances < O)
+        danger = distances <= D
+
+        t = self.trajectory_manager.line_direction  # unit vector
+        if self._goal_point is not None:
+            goal_vec = self._goal_point.unsqueeze(0) - self.stylus_pos_t1
+            g = goal_vec / torch.norm(goal_vec, dim=-1, keepdim=True).clamp(min=1e-8)
+        else:
+            g = t.unsqueeze(0).expand_as(self.stylus_pos_t1)
+
+        # Alignment thresholds (taken from rMAPPO env)
+        c1, c2 = 0.90, 0.866
+        align_goal = (g * t.unsqueeze(0)).sum(dim=-1) >= c1
+        oppose_norm = (self.normal_t1 * t.unsqueeze(0)).sum(dim=-1) <= -c2
+        rejoin_geom = surface & align_goal & oppose_norm
+
+        if not hasattr(self, "rejoin_streak"):
+            self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
+        self.rejoin_streak = torch.where(
+            rejoin_geom,
+            self.rejoin_streak + 1,
+            torch.zeros_like(self.rejoin_streak),
+        )
+        rejoin = self.rejoin_streak >= 10
+
+        masks = {
+            "A": outside,
+            "B": surface & (~rejoin),
+            "C": danger,
+            "D": rejoin,
+        }
+        return masks
 
     def _zone_A_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
         """Zone A: On trajectory, no collision - progress reward."""
@@ -565,20 +656,21 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         
         prog_raw = self._progress_raw_signed_by_velocity()
         
-        dev_raw, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        deviations, _ = self.trajectory_manager.get_deviation(self.stylus_pos_t1)
+        dev_raw = -torch.clamp(deviations * 5.0, min=0.0, max=0.3)
         
-        n = self.normal_t1
         v = self.stylus_vel_t1
-        inward_component = torch.clamp((v * n).sum(dim=-1), min=0.0)
-        inward_raw = -inward_component
-        
-        self.rejoin_streak = torch.where(mask, self.rejoin_streak + 1, torch.zeros_like(self.rejoin_streak))
-        streak_factor = torch.clamp(self.rejoin_streak.float() * 0.01, min=0.0, max=1.0)
-        
-        dev_rew = -torch.abs(dev_raw) * (1.0 + streak_factor)
+        n = self.normal_t1
+        v_dot_n = (v * n).sum(dim=-1)
+        lam = 2.0
+        inward_raw = torch.where(
+            v_dot_n >= 0.0,
+            -lam * v_dot_n,
+            lam * (-v_dot_n)
+        )
         
         prog_contrib = torch.where(mask, prog_raw * wp, torch.zeros_like(prog_raw))
-        dev_contrib = torch.where(mask, dev_rew * wd, torch.zeros_like(dev_rew))
+        dev_contrib = torch.where(mask, dev_raw * wd, torch.zeros_like(dev_raw))
         inw_contrib = torch.where(mask, inward_raw * wi, torch.zeros_like(inward_raw))
         
         out = (prog_contrib + dev_contrib + inw_contrib) * zw
@@ -644,6 +736,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         """Four-zone reward system with robot/human symmetric rewards."""
         self.reward_components = {}
         masks = self._build_zone_masks()
+        self._current_zone_masks = masks
 
         def _agent_zone_sum(agent: str):
             """Calculate total zone rewards for specific agent."""
@@ -720,12 +813,14 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 }
             else:
                 z_for_tracer = None
+            trainer_step = getattr(self, "_trainer_global_step", None)
+            global_step = self._env_debug_step_counter if trainer_step is None else trainer_step
             self.step_tracer.maybe_print_step(
                 env=self,
                 r_task=r_task_for_tracer,
                 r_safe_cost=r_safe_cost,
                 z=z_for_tracer,
-                global_step=self._env_debug_step_counter,
+                global_step=global_step,
                 force_print=False,
             )
 
@@ -777,14 +872,6 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
     # EPIGRAPH-SPECIFIC: Reward decomposition into task/safe
     # ============================================================================
     
-    def _get_flag(self, key: str, default: int = 0) -> bool:
-        """Read 0/1 flag from epigraph_env YAML section."""
-        try:
-            v = self.params.get("epigraph_env", {}).get(key, default)
-            return bool(int(v))
-        except Exception:
-            return bool(default)
-    
     def _compose_task_and_safe(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Decompose reward_components into r_task and r_safe for each agent.
@@ -797,10 +884,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             zeros = torch.zeros(self.num_envs, device=self.device)
             return ({ag: zeros for ag in self.cfg.possible_agents},
                     {ag: zeros for ag in self.cfg.possible_agents})
-        
-        use_time_eff_in_task = self._get_flag("use_timeeff_in_task", default=0)
-        include_zpenalty_in_safe = self._get_flag("include_zpenalty_in_safe", default=1)
-        
+
         r_task, r_safe = {}, {}
         for agent in self.cfg.possible_agents:
             t, s = compose_task_safe_from_rc(
@@ -808,12 +892,10 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
                 agent=agent,
                 device=self.device,
                 num_envs=self.num_envs,
-                use_time_eff_in_task=use_time_eff_in_task,
-                include_zpenalty_in_safe=include_zpenalty_in_safe,
             )
             r_task[agent] = t
             r_safe[agent] = s
-        
+
         return r_task, r_safe
 
     # ============================================================================
@@ -845,16 +927,12 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             agent="robot",
             device=self.device,
             num_envs=self.num_envs,
-            use_time_eff_in_task=self._get_flag("use_timeeff_in_task", default=0),
-            include_zpenalty_in_safe=self._get_flag("include_zpenalty_in_safe", default=1),
         )
         r_task_human, r_safe_risk_human = compose_task_safe_from_rc(
             rc=self.reward_components,
             agent="human",
             device=self.device,
             num_envs=self.num_envs,
-            use_time_eff_in_task=self._get_flag("use_timeeff_in_task", default=0),
-            include_zpenalty_in_safe=self._get_flag("include_zpenalty_in_safe", default=1),
         )
         
         # Ensure shape is [num_envs, 1]
@@ -922,6 +1000,11 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             env_ids = torch.arange(self.num_envs, device=self.device)
 
         super()._reset_idx(env_ids)
+
+        if hasattr(self, "_last_z_snapshot"):
+            self._last_z_snapshot = None
+        self._trainer_global_step = 0
+        self._current_zone_masks = None
         
         if self.stylus_body_idx is None:
             self._initialize_body_indices()

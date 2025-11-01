@@ -135,12 +135,14 @@ class TanhGaussian:
 # Initialization helper
 # =============================================================================
 
-def ortho_init(m, gain=1.0):
-    if isinstance(m, nn.Linear):
-        nn.init.orthogonal_(m.weight, gain)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.)
-    return m
+def init_linear(module: nn.Linear, gain: float = 1.0, use_orthogonal: bool = True) -> nn.Linear:
+    if use_orthogonal:
+        nn.init.orthogonal_(module.weight, gain)
+    else:
+        nn.init.xavier_uniform_(module.weight, gain=gain)
+    if module.bias is not None:
+        nn.init.constant_(module.bias, 0.0)
+    return module
 
 
 # =============================================================================
@@ -154,15 +156,15 @@ class ZEncoder(nn.Module):
     
     This is a learnable embedding that conditions the policy and critics on the risk budget.
     """
-    def __init__(self, nz, z_mean=0.0, z_scale=0.2):
+    def __init__(self, nz, z_mean=0.0, z_scale=0.2, use_orthogonal: bool = True):
         super().__init__()
         self.nz = nz
         self.z_mean = z_mean
         self.z_scale = z_scale
         self.fc = nn.Sequential(
-            ortho_init(nn.Linear(1, nz), 1.0),
+            init_linear(nn.Linear(1, nz), gain=1.0, use_orthogonal=use_orthogonal),
             nn.Tanh(),
-            ortho_init(nn.Linear(nz, nz), 1.0),
+            init_linear(nn.Linear(nz, nz), gain=1.0, use_orthogonal=use_orthogonal),
         )
 
     def forward(self, z):
@@ -180,21 +182,21 @@ class ActorRNN(nn.Module):
     - act_step(): single-step for environment interaction
     - evaluate_actions_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, obs_dim, act_dim, hidden_size, nz, recurrent_N):
+    def __init__(self, obs_dim, act_dim, hidden_size, nz, recurrent_N, use_orthogonal: bool = True, gain: float = 0.01):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.hidden_size = hidden_size
         self.nz = nz
 
-        self.fc1 = ortho_init(nn.Linear(obs_dim + nz, hidden_size), 1.0)
-        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
-        self.fc_mean = ortho_init(nn.Linear(hidden_size, act_dim), 0.01)
+        self.fc1 = init_linear(nn.Linear(obs_dim + nz, hidden_size), gain=1.0, use_orthogonal=use_orthogonal)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=use_orthogonal)
+        self.fc_mean = init_linear(nn.Linear(hidden_size, act_dim), gain=gain, use_orthogonal=use_orthogonal)
         self.log_std = nn.Parameter(torch.zeros(1, act_dim))
 
     def _dist_from_latent(self, h):
         mean = self.fc_mean(h)
-        log_std = self.log_std.expand_as(mean)
+        log_std = torch.clamp(self.log_std.expand_as(mean), -3.0, 2.0)
         return TanhGaussian(mean, log_std)
 
     def act_step(self, obs, z_enc, hxs, masks, deterministic=False):
@@ -263,15 +265,15 @@ class CriticVlRNN(nn.Module):
     - value_step(): single-step for rollout
     - value_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, share_obs_dim, hidden_size, nz, recurrent_N):
+    def __init__(self, share_obs_dim, hidden_size, nz, recurrent_N, use_orthogonal: bool = True):
         super().__init__()
         self.share_obs_dim = share_obs_dim
         self.hidden_size = hidden_size
         self.nz = nz
 
-        self.fc1 = ortho_init(nn.Linear(share_obs_dim + nz, hidden_size), 1.0)
-        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
-        self.fc_value = ortho_init(nn.Linear(hidden_size, 1), 1.0)
+        self.fc1 = init_linear(nn.Linear(share_obs_dim + nz, hidden_size), gain=1.0, use_orthogonal=use_orthogonal)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=use_orthogonal)
+        self.fc_value = init_linear(nn.Linear(hidden_size, 1), gain=1.0, use_orthogonal=use_orthogonal)
 
     def value_step(self, share_obs, z_enc, hxs, masks):
         """
@@ -324,15 +326,15 @@ class CriticVhRNN(nn.Module):
     - value_step(): single-step for rollout
     - value_seq(): sequence evaluation for PPO training
     """
-    def __init__(self, obs_dim, hidden_size, nz, recurrent_N):
+    def __init__(self, obs_dim, hidden_size, nz, recurrent_N, use_orthogonal: bool = True):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_size = hidden_size
         self.nz = nz
 
-        self.fc1 = ortho_init(nn.Linear(obs_dim + nz, hidden_size), 1.0)
-        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=True)
-        self.fc_value = ortho_init(nn.Linear(hidden_size, 1), 1.0)
+        self.fc1 = init_linear(nn.Linear(obs_dim + nz, hidden_size), gain=1.0, use_orthogonal=use_orthogonal)
+        self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=use_orthogonal)
+        self.fc_value = init_linear(nn.Linear(hidden_size, 1), gain=1.0, use_orthogonal=use_orthogonal)
 
     def value_step(self, obs, z_enc, hxs, masks):
         """

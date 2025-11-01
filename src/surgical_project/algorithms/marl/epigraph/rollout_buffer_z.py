@@ -7,6 +7,8 @@ Enhanced with milestone truncation support.
 import torch
 from typing import Optional
 
+from .utils import compute_dec_efocp_gae_dp, normalize_advantages
+
 
 class RolloutBufferZ:
     """
@@ -235,7 +237,6 @@ class RolloutBufferZ:
         self,
         gamma: float,
         gae_lambda: float,
-        lambda_safe: float,
         num_envs: int,
         num_agents: int,
     ):
@@ -244,18 +245,16 @@ class RolloutBufferZ:
         
         This method:
         1. Reshapes agent-major buffer data to [T, E, A] format
-        2. Calls compute_epigraph_gae from utils.py
+        2. Calls compute_dec_efocp_gae_dp from utils.py
         3. Normalizes advantages
         4. Stores results back to buffer
         
         Args:
             gamma: Discount factor
             gae_lambda: GAE lambda parameter
-            lambda_safe: Safety weighting parameter for advantages
             num_envs: Number of parallel environments (E)
             num_agents: Number of agents (A)
         """
-        from .utils import compute_epigraph_gae, normalize_advantages
         
         T = self.T
         E = num_envs
@@ -264,7 +263,7 @@ class RolloutBufferZ:
         
         # ========== Reshape data from agent-major [T, N, 1] to [T, E, A] ==========
         # Buffer stores in agent-major order: [agent0_env0...agent0_envE-1, agent1_env0...]
-        # We need [T, E, A] for compute_epigraph_gae
+        # We need [T, E, A] for compute_dec_efocp_gae_dp
         
         # Task rewards: average over agents to get team reward [T, E]
         # rewards_task shape: [T, N, 1] -> [T, A, E, 1] -> [T, E, A, 1]
@@ -293,8 +292,8 @@ class RolloutBufferZ:
         ov_mask_vh = self.override_bootstrap_mask_vh.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
         ov_vh = self.override_bootstrap_vh.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
         
-        # ========== Call Epigraph GAE ==========
-        Q_perf, Q_safe, advantages = compute_epigraph_gae(
+        # ========== Call Dec-EFOCP GAE ==========
+        Q_perf, Q_safe, advantages = compute_dec_efocp_gae_dp(
             rewards=team_task_reward,     # [T, E]
             costs=costs_safe_reshaped,    # [T, E, A]
             z_traj=z_traj,                # [T, E]
@@ -308,7 +307,6 @@ class RolloutBufferZ:
             ov_vh=ov_vh,                  # [T, E, A]
             gamma=gamma,
             gae_lambda=gae_lambda,
-            lambda_safe=lambda_safe,
         )
         
         # ========== Normalize Advantages ==========

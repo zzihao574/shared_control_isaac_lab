@@ -216,12 +216,14 @@ class StepTracer:
     def __init__(self, num_envs: int, device: torch.device,
                  enable_console_logging: bool = False,
                  print_every_steps: int = 10,
-                 max_envs_to_print: int = 2):
+                 max_envs_to_print: int = 2,
+                 strict_masks: bool = False):
         self.num_envs = num_envs
         self.device = device
         self.enable_console_logging = enable_console_logging
         self.print_every_steps = print_every_steps
         self.max_envs_to_print = max_envs_to_print
+        self.strict_masks = strict_masks
 
     def maybe_print_step(
         self,
@@ -254,6 +256,7 @@ class StepTracer:
             return
 
         agent_order = getattr(getattr(env, 'cfg', None), 'possible_agents', ['robot', 'human'])
+        zone_masks = getattr(env, "_current_zone_masks", None)
 
         try:
             r_task_mat = self._agent_matrix(r_task, agent_order, label='r_task')
@@ -277,7 +280,7 @@ class StepTracer:
 
             print("\n[TASK/SAFE/Z SUMMARY]")
             for env_id in to_show:
-                zone_label = self._get_zone_label(env, env_id)
+                zone_label, _, _ = self._resolve_zone_label(env, env_id, zone_masks)
                 task_robot = r_task_mat[env_id, idx_robot].item()
                 task_human = r_task_mat[env_id, idx_human].item()
                 safe_robot = r_safe_mat[env_id, idx_robot].item()
@@ -296,10 +299,26 @@ class StepTracer:
                 )
 
             print("\n[DETAILED SNAPSHOT]")
+            detailed_agents: List[str] = []
+            # Prefer explicit robot/human ordering when available
+            if 'robot' in agent_order:
+                detailed_agents.append('robot')
+            if 'human' in agent_order:
+                detailed_agents.append('human')
+            # Append any remaining agents (while preserving cfg order)
+            for agent_name in agent_order:
+                if agent_name not in detailed_agents:
+                    detailed_agents.append(agent_name)
+
             for env_id in to_show:
-                self._print_env_snapshot(env, env_id)
-                self._print_agent_rewards(env, env_id, 'ROBOT')
-                self._print_agent_rewards(env, env_id, 'HUMAN')
+                self._print_env_snapshot(env, env_id, zone_masks)
+                printed_agents = set()
+                for agent_name in detailed_agents:
+                    label = agent_name.upper()
+                    if label in printed_agents:
+                        continue
+                    printed_agents.add(label)
+                    self._print_agent_rewards(env, env_id, label)
         except Exception as exc:
             print('[STEPTRACER][ERROR] Exception during maybe_print_step:', repr(exc))
             print(f'  agent_order: {agent_order}')
@@ -373,7 +392,7 @@ class StepTracer:
             return stacked
 
         raise TypeError(f"{label} has unsupported type {type(data)}")
-    def _print_env_snapshot(self, env, env_id: int):
+    def _print_env_snapshot(self, env, env_id: int, zone_masks: Optional[Dict[str, torch.Tensor]] = None):
         """Print detailed environment state snapshot."""
         stylus = env.stylus_pos_t1[env_id]
         safety = float(env.safety_distances_t1[env_id].item())
@@ -391,86 +410,219 @@ class StepTracer:
 
         print(f"Deviation: {dev:.4f}m | Progress: {prog:.1%} | Distance to End: {dist:.4f}m")
 
-        active_zone = self._get_zone_label(env, env_id)
-        print(f"Active Zone: {active_zone}")
-
-        self._print_agent_rewards(env, env_id, "ROBOT")
-        self._print_agent_rewards(env, env_id, "HUMAN")
+        zone_label, hits, fallback_used = self._resolve_zone_label(env, env_id, zone_masks)
+        print(f"Active Zone: {zone_label}")
+        if zone_masks is not None:
+            status_entries = []
+            for zone in ("A", "B", "C", "D"):
+                mask_tensor = zone_masks.get(zone)
+                flag = bool(mask_tensor[env_id].item()) if mask_tensor is not None else False
+                status_entries.append(f"{zone}={flag}")
+            mask_status = ", ".join(status_entries)
+            print(f"Zone Masks: {mask_status}")
+            if len(hits) > 1:
+                print(f"[STEPTRACER][WARN] Multiple zone masks active for env {env_id}: {hits}")
+            if fallback_used and not hits:
+                print(f"[STEPTRACER][INFO] Fallback zone label used for env {env_id} (no mask active).")
 
     def _print_agent_rewards(self, env, env_id: int, agent_label: str):
         """Print detailed reward breakdown for specified agent."""
         agent_key = agent_label.lower()
         RC = env.reward_components
-        is_colliding = env.is_violating_t1[env_id].item()
-        
-        print(f"\n[{agent_label}] ZONE REWARDS:")
 
         def _val(x):
+            if x is None:
+                return 0.0
             if torch.is_tensor(x):
-                return float(x[env_id].item()) if x.ndim > 0 else float(x.item())
+                if x.ndim == 0:
+                    return float(x.item())
+                if env_id < x.shape[0]:
+                    return float(x[env_id].item())
+                return 0.0
             return float(x)
 
-        for Z in ['A', 'B', 'C', 'D']:
-            zone_w = _val(RC[f'zone{Z}_weight_{agent_key}'])
-            zone_total = _val(RC[f'zone{Z}_total_{agent_key}'])
-            
-            if Z == 'C':
-                mode = "Overlapping" if is_colliding else "Outside"
-                print(f"  C Danger-{mode} (zone_w={zone_w:.2f}): {zone_total:+.3f}")
-                
-                if is_colliding:
-                    raw = _val(RC[f'zoneC_overlap_{agent_key}_raw'])
-                    weight = _val(RC[f'zoneC_overlap_{agent_key}_weight'])
-                    contrib = _val(RC[f'zoneC_overlap_{agent_key}_contrib'])
-                    print(f"    {'Overlap_Pen':<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
-                else:
-                    for comp_key, comp_label in [('offpen', 'Off_Penalty'), ('inward', 'Inward_Pen')]:
-                        raw = _val(RC[f'zoneC_{comp_key}_{agent_key}_raw'])
-                        weight = _val(RC[f'zoneC_{comp_key}_{agent_key}_weight'])
-                        contrib = _val(RC[f'zoneC_{comp_key}_{agent_key}_contrib'])
-                        print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
-                continue
-            
-            zone_names = {'A': 'A Track   ', 'B': 'B Surface ', 'D': 'D Rejoin  '}
-            components = {
-                'A': [('progress', 'Progress'), ('deviation', 'Deviation')],
-                'B': [('gap', 'Gap'), ('surftangent', 'Surf_Tangent'), ('inward', 'Inward_Pen')],
-                'D': [('progress', 'Progress'), ('deviation', 'Deviation'), ('inward', 'Inward_Pen')],
-            }
-            
-            print(f"  {zone_names[Z]} (zone_w={zone_w:.2f}): {zone_total:+.3f}")
-            
-            for comp_key, comp_label in components[Z]:
-                raw = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_raw'])
-                weight = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_weight'])
-                contrib = _val(RC[f'zone{Z}_{comp_key}_{agent_key}_contrib'])
-                print(f"    {comp_label:<12} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
+        def _triplet(base: str) -> Tuple[float, float, float]:
+            raw = _val(RC.get(f"{base}_raw"))
+            weight = _val(RC.get(f"{base}_weight"))
+            contrib = _val(RC.get(f"{base}_contrib"))
+            return raw, weight, contrib
 
-        print("  Global Rewards:")
-        globals_list = [
-            ('zpenalty', 'Z Penalty      '),
-            ('completion', 'Completion     '),
-            ('timeeff', 'Time Efficiency'),
-            ('potential', 'Potential      '),
-        ]
-        
-        for gk, glabel in globals_list:
-            raw = _val(RC[f'global_{gk}_{agent_key}_raw'])
-            weight = _val(RC[f'global_{gk}_{agent_key}_weight'])
-            contrib = _val(RC[f'global_{gk}_{agent_key}_contrib'])
-            print(f"    {glabel:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
+        def _safe_cost(value: float) -> float:
+            return max(0.0, -value)
 
-        raw = _val(RC[f'{agent_key}force_raw'])
-        weight = _val(RC[f'{agent_key}force_weight'])
-        contrib = _val(RC[f'{agent_key}force_contrib'])
-        print(f"    {agent_label} Force   {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
+        # Zone A (task)
+        a_prog = _triplet(f'zoneA_progress_{agent_key}')
+        a_dev = _triplet(f'zoneA_deviation_{agent_key}')
+        a_weight = _val(RC.get(f'zoneA_weight_{agent_key}'))
+        a_total = _val(RC.get(f'zoneA_total_{agent_key}'))
+        a_sum = a_prog[2] + a_dev[2]
 
+        # Zone B task / safe
+        b_gap = _triplet(f'zoneB_gap_{agent_key}')
+        b_surf = _triplet(f'zoneB_surftangent_{agent_key}')
+        b_inward = _triplet(f'zoneB_inward_{agent_key}')
+        b_weight = _val(RC.get(f'zoneB_weight_{agent_key}'))
+        b_task_raw = b_gap[2] + b_surf[2]
+        b_safe_raw = b_inward[2]
+        b_task_total = b_task_raw * b_weight
+        b_safe_total = b_safe_raw * b_weight
+
+        # Zone C safe components
+        c_off = _triplet(f'zoneC_offpen_{agent_key}')
+        c_inward = _triplet(f'zoneC_inward_{agent_key}')
+        c_overlap = _triplet(f'zoneC_overlap_{agent_key}')
+        c_weight = _val(RC.get(f'zoneC_weight_{agent_key}'))
+        c_total = _val(RC.get(f'zoneC_total_{agent_key}'))
+        c_raw_sum = c_off[2] + c_inward[2] + c_overlap[2]
+
+        # Zone D task / safe
+        d_prog = _triplet(f'zoneD_progress_{agent_key}')
+        d_dev = _triplet(f'zoneD_deviation_{agent_key}')
+        d_inward = _triplet(f'zoneD_inward_{agent_key}')
+        d_weight = _val(RC.get(f'zoneD_weight_{agent_key}'))
+        d_task_raw = d_prog[2] + d_dev[2]
+        d_safe_raw = d_inward[2]
+        d_task_total = d_task_raw * d_weight
+        d_safe_total = d_safe_raw * d_weight
+
+        # Global task / safe
+        g_potential = _triplet(f'global_potential_{agent_key}')
+        g_completion = _triplet(f'global_completion_{agent_key}')
+        g_timeeff = _triplet(f'global_timeeff_{agent_key}')
+        g_force = _triplet(f'{agent_key}force')
         aware_key = 'humanaware' if agent_key == 'robot' else 'robotaware'
-        raw = _val(RC[f'{aware_key}_raw'])
-        weight = _val(RC[f'{aware_key}_weight'])
-        contrib = _val(RC[f'{aware_key}_contrib'])
-        label = "Human Aware" if agent_key == 'robot' else "Robot Aware"
-        print(f"    {label:<15} {raw:.3f} * {weight:.2f} = {contrib:+.3f}")
+        g_aware = _triplet(aware_key)
+        g_task_sum = (
+            g_potential[2] +
+            g_completion[2] +
+            g_timeeff[2] +
+            g_force[2] +
+            g_aware[2]
+        )
+
+        g_zpenalty = _triplet(f'global_zpenalty_{agent_key}')
+
+        task_total = a_total + b_task_total + d_task_total + g_task_sum
+        safe_total_risk = b_safe_total + c_total + d_safe_total + g_zpenalty[2]
+        safe_total_cost = _safe_cost(safe_total_risk)
+
+        print(f"\n[{agent_label}] TASK COMPONENTS:")
+        self._print_task_zone(
+            "A Track",
+            a_sum,
+            a_weight,
+            a_total,
+            [
+                ("Progress", a_prog),
+                ("Deviation", a_dev),
+            ],
+        )
+        self._print_task_zone(
+            "B Surface",
+            b_task_raw,
+            b_weight,
+            b_task_total,
+            [
+                ("Gap", b_gap),
+                ("Surf_Tangent", b_surf),
+            ],
+        )
+        self._print_task_zone(
+            "D Rejoin",
+            d_task_raw,
+            d_weight,
+            d_task_total,
+            [
+                ("Progress", d_prog),
+                ("Deviation", d_dev),
+            ],
+        )
+        self._print_task_zone(
+            "Global",
+            g_task_sum,
+            1.0,
+            g_task_sum,
+            [
+                ("Potential", g_potential),
+                ("Completion", g_completion),
+                ("Time Efficiency", g_timeeff),
+                (f"{agent_label} Force", g_force),
+                ("Awareness", g_aware),
+            ],
+        )
+
+        print(f"\n[{agent_label}] SAFE COMPONENTS (risk, cost=relu(-risk)):")
+        self._print_safe_zone(
+            "B Surface",
+            b_safe_raw,
+            b_weight,
+            b_safe_total,
+            [
+                ("Inward Pen", b_inward),
+            ],
+        )
+        c_mode = "Overlap" if float(env.safety_distances_t1[env_id].item()) <= 0.0 else "Outside"
+        self._print_safe_zone(
+            f"C Danger-{c_mode}",
+            c_raw_sum,
+            c_weight,
+            c_total,
+            [
+                ("Off_Penalty", c_off),
+                ("Inward_Pen", c_inward),
+                ("Overlap_Pen", c_overlap),
+            ],
+        )
+        self._print_safe_zone(
+            "D Rejoin",
+            d_safe_raw,
+            d_weight,
+            d_safe_total,
+            [
+                ("Inward_Pen", d_inward),
+            ],
+        )
+        self._print_safe_zone(
+            "Global",
+            g_zpenalty[2],
+            1.0,
+            g_zpenalty[2],
+            [
+                ("Z Penalty", g_zpenalty),
+            ],
+        )
+
+        print(f"\n  -> Task total: {task_total:+.3f}")
+        print(f"  -> Safe risk total: {safe_total_risk:+.3f}")
+        print(f"     Safe cost total (relu(-risk)): {safe_total_cost:+.3f}  [summary value]")
+
+    def _print_task_zone(
+        self,
+        title: str,
+        contrib_sum: float,
+        zone_weight: float,
+        zone_total: float,
+        items: List[Tuple[str, Tuple[float, float, float]]],
+    ) -> None:
+        zone_contrib = contrib_sum
+        total = zone_total if zone_weight != 0 else zone_contrib
+        print(f"  {title}: {zone_contrib:+.3f} * {zone_weight:.2f} = {total:+.3f}")
+        for name, (raw, weight, contrib) in items:
+            print(f"    {name:<24}{raw:+.3f} * {weight:.2f} = {contrib:+.3f}")
+
+    def _print_safe_zone(
+        self,
+        title: str,
+        raw_sum: float,
+        zone_weight: float,
+        zone_total: float,
+        items: List[Tuple[str, Tuple[float, float, float]]],
+    ) -> None:
+        cost_value = max(0.0, -zone_total)
+        print(f"  {title}: {raw_sum:+.3f} * {zone_weight:.2f} = {zone_total:+.3f} (cost={cost_value:+.3f})")
+        for name, (raw, weight, contrib) in items:
+            cost = max(0.0, -contrib)
+            print(f"    {name:<24}{raw:+.3f} * {weight:.2f} = {contrib:+.3f} (cost={cost:+.3f})")
 
     def _print_actor_forces(self, env, env_id: int):
         """Print current actor force outputs for both agents."""
@@ -498,8 +650,70 @@ class StepTracer:
            
         return float(component[env_id].item())
 
-    def _get_zone_label(self, env, env_id: int) -> str:
-        """Return human-readable zone label for summary output."""
+    def _resolve_zone_label(
+        self,
+        env,
+        env_id: int,
+        zone_masks: Optional[Dict[str, torch.Tensor]]
+    ) -> Tuple[str, List[str], bool]:
+        """Resolve zone label using training masks; fall back to safety heuristic."""
+        hits: List[str] = []
+        label: Optional[str] = None
+        fallback_used = False
+
+        if zone_masks is None:
+            if self.strict_masks:
+                raise RuntimeError(
+                    "[STEPTRACER] strict_masks=True but env._current_zone_masks is missing."
+                )
+            fallback_used = True
+            return self._get_zone_label_fallback(env, env_id), hits, fallback_used
+
+        try:
+            for zone in ("A", "B", "C", "D"):
+                mask_tensor = zone_masks.get(zone)
+                if mask_tensor is not None and bool(mask_tensor[env_id].item()):
+                    hits.append(zone)
+        except Exception as exc:
+            if self.strict_masks:
+                raise RuntimeError(
+                    f"[STEPTRACER] strict_masks=True but failed to inspect zone masks for env {env_id}: {exc}"
+                ) from exc
+            print(f"[STEPTRACER][WARN] Failed to inspect zone masks for env {env_id}: {exc}")
+            hits = []
+
+        if hits:
+            label = self._format_zone_label_from_masks(env, env_id, hits)
+            return label, hits, fallback_used
+
+        if self.strict_masks:
+            raise RuntimeError(
+                f"[STEPTRACER] strict_masks=True but no active zone mask detected for env {env_id}."
+            )
+
+        fallback_used = True
+        label = self._get_zone_label_fallback(env, env_id)
+        return label, hits, fallback_used
+
+    def _format_zone_label_from_masks(self, env, env_id: int, hits: List[str]) -> str:
+        """Format zone label string from training masks."""
+        labels = []
+        for zone in hits:
+            if zone == "A":
+                labels.append("A (Track)")
+            elif zone == "B":
+                labels.append("B (Surface)")
+            elif zone == "C":
+                safety = float(env.safety_distances_t1[env_id].item())
+                is_colliding = bool(env.is_violating_t1[env_id].item())
+                mode = "Danger-Overlap" if safety <= 0.0 and is_colliding else "Danger"
+                labels.append(f"C ({mode})")
+            elif zone == "D":
+                labels.append("D (Rejoin)")
+        return " / ".join(labels) if labels else "Unknown"
+
+    def _get_zone_label_fallback(self, env, env_id: int) -> str:
+        """Fallback zone label based on safety distance thresholds."""
         safety = float(env.safety_distances_t1[env_id].item())
         is_colliding = bool(env.is_violating_t1[env_id].item())
         rejoin = env.rejoin_streak[env_id] >= 10
@@ -583,12 +797,22 @@ def compose_task_safe_from_rc(
     aware_key = "humanaware" if agent == "robot" else "robotaware"
 
     # Task quality reward (for Vl critic)
+    zoneA_total = z(f"zoneA_total_{agent}")
+
+    zoneB_weight = z(f"zoneB_weight_{agent}")
+    zoneB_gap = z(f"zoneB_gap_{agent}_contrib")
+    zoneB_surf = z(f"zoneB_surftangent_{agent}_contrib")
+    zoneB_task = zoneB_weight * (zoneB_gap + zoneB_surf)
+
+    zoneD_weight = z(f"zoneD_weight_{agent}")
+    zoneD_prog = z(f"zoneD_progress_{agent}_contrib")
+    zoneD_dev = z(f"zoneD_deviation_{agent}_contrib")
+    zoneD_task = zoneD_weight * (zoneD_prog + zoneD_dev)
+
     r_task = (
-        z(f"zoneA_total_{agent}")
-        + z(f"zoneB_gap_{agent}_contrib")
-        + z(f"zoneB_surftangent_{agent}_contrib")
-        + z(f"zoneD_progress_{agent}_contrib")
-        + z(f"zoneD_deviation_{agent}_contrib")
+        zoneA_total
+        + zoneB_task
+        + zoneD_task
         + z(f"global_potential_{agent}_contrib")
         + z(f"global_completion_{agent}_contrib")
         + (z(f"global_timeeff_{agent}_contrib") if use_time_eff_in_task else _zeros(device, num_envs))
@@ -598,10 +822,18 @@ def compose_task_safe_from_rc(
 
     # Safety risk (NEGATIVE when dangerous, for Vh critic)
     # Trainer converts to positive cost: cost = relu(-r_safe_risk)
+    zoneB_inward = z(f"zoneB_inward_{agent}_contrib")
+    zoneB_safe = zoneB_weight * zoneB_inward
+
+    zoneC_total = z(f"zoneC_total_{agent}")
+
+    zoneD_inward = z(f"zoneD_inward_{agent}_contrib")
+    zoneD_safe = zoneD_weight * zoneD_inward
+
     r_safe_risk = (
-        z(f"zoneC_total_{agent}")
-        + z(f"zoneB_inward_{agent}_contrib")
-        + z(f"zoneD_inward_{agent}_contrib")
+        zoneC_total
+        + zoneB_safe
+        + zoneD_safe
         + (z(f"global_zpenalty_{agent}_contrib") if include_zpenalty_in_safe else _zeros(device, num_envs))
     )
     
