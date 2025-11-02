@@ -34,9 +34,9 @@ obs_scaling:
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 1.0   # Initial noise = 0.6 × max_action
-  sigma_end: 0.2     # Final noise = 0.1 × max_action
-  decay_k: 3.0       # Decay rate for exponential schedule
+  sigma_start: 0.8   # Initial noise = 0.6 × max_action
+  sigma_end: 0.1     # Final noise = 0.1 × max_action
+  decay_k: 4.0       # Decay rate for exponential schedule
 
 # ==============================================================================
 # Logging Configuration
