@@ -15,6 +15,7 @@ ROUTE B MODIFICATIONS:
 
 import os
 import math
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -176,6 +177,19 @@ class EpigraphTrainer:
         self.act_dim = env.unwrapped.cfg.action_spaces[self.agent_ids[0]]
         self.hidden_size = algo_cfg["hidden_size"]
         self.recurrent_N = algo_cfg.get("recurrent_N", 1)
+
+        # Observation scaling (align with rMAPPO wrapper behavior)
+        obs_scaling_cfg = full_config.get("obs_scaling", {})
+        scale_factors = obs_scaling_cfg.get("factors", [1.0] * self.obs_dim)
+        if len(scale_factors) != self.obs_dim:
+            print(
+                f"[WARN] obs_scaling.factors length {len(scale_factors)} != obs_dim {self.obs_dim}; "
+                "falling back to no scaling."
+            )
+            scale_factors = [1.0] * self.obs_dim
+        scale_tensor = torch.tensor(scale_factors, device=self.device, dtype=torch.float32)
+        self.obs_scale_factors = {agent: scale_tensor for agent in self.agent_ids}
+        print(f"[TRAINER] Observation scaling factors loaded (len={len(scale_factors)}): {scale_factors}")
         
         # Training hyperparameters
         self.rollout_horizon = algo_cfg["rollout_horizon"]
@@ -347,17 +361,29 @@ class EpigraphTrainer:
         for agent in self.agent_ids:
             actor_params.extend(self.actors[agent].parameters())
         self.actor_parameters = actor_params
+        actor_lr = float(self.algo_cfg["actor_lr"])
+        opt_eps = float(self.algo_cfg.get("opt_eps", 1e-5))
+
         self.optimizer_actor = optim.Adam(
             self.actor_parameters,
-            lr=self.algo_cfg["actor_lr"],
-            eps=self.algo_cfg["opt_eps"],
+            lr=actor_lr,
+            eps=opt_eps,
         )
+
+        if "vl_lr" not in self.algo_cfg or "vh_lr" not in self.algo_cfg:
+            raise KeyError(
+                "[CONFIG] Missing 'vl_lr' or 'vh_lr' in algorithms.rmappo section "
+                "for Epigraph training. Please specify both learning rates."
+            )
+
+        vl_lr = float(self.algo_cfg["vl_lr"])
+        vh_lr = float(self.algo_cfg["vh_lr"])
 
         self.vl_parameters = list(self.critic_vl.parameters()) + list(self.z_encoder_vl.parameters())
         self.optimizer_vl = optim.Adam(
             self.vl_parameters,
-            lr=self.algo_cfg["critic_lr"],
-            eps=self.algo_cfg["opt_eps"],
+            lr=vl_lr,
+            eps=opt_eps,
         )
 
         vh_params = list(self.z_encoder_vh.parameters())
@@ -366,8 +392,8 @@ class EpigraphTrainer:
         self.vh_parameters = vh_params
         self.optimizer_vh = optim.Adam(
             self.vh_parameters,
-            lr=self.algo_cfg["critic_lr"],
-            eps=self.algo_cfg["opt_eps"],
+            lr=vh_lr,
+            eps=opt_eps,
         )
 
         self.actor_lr_init = self.optimizer_actor.param_groups[0]["lr"]
@@ -414,7 +440,11 @@ class EpigraphTrainer:
         if not self.lr_decay_enabled:
             return
 
-        progress = min(1.0, update_idx / 1000.0)
+        if self.max_global_steps is not None and self.max_global_steps > 0:
+            progress = min(1.0, float(self.global_step) / float(self.max_global_steps))
+        else:
+            progress = min(1.0, update_idx / 1000.0)
+
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
 
         actor_min = self.actor_lr_init * self.lr_final_factor
@@ -534,6 +564,17 @@ class EpigraphTrainer:
     def _get_share_obs(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Concatenate all agent observations."""
         return torch.cat([obs_dict[agent] for agent in self.agent_ids], dim=-1)
+
+    def _scale_obs(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Apply per-dimension scaling factors to observations."""
+        scaled = {}
+        for agent in self.agent_ids:
+            if agent not in obs_dict:
+                raise KeyError(f"Observation for agent '{agent}' missing from env output.")
+            obs = obs_dict[agent]
+            scale = self.obs_scale_factors[agent].to(obs.device)
+            scaled[agent] = obs * scale.unsqueeze(0)
+        return scaled
     
     def _reshape_agentmajor_to_env_agent_T(self, x, has_trailing_dim1: bool):
         """
@@ -586,6 +627,7 @@ class EpigraphTrainer:
 
         if self._needs_env_reset or self._cached_obs is None:
             obs, _ = self.env.reset()
+            obs = self._scale_obs(obs)
             z_global = self._init_z_training()
             self._init_rnn_states()
             masks = torch.ones(self.num_envs, 1, device=self.device)
@@ -612,7 +654,7 @@ class EpigraphTrainer:
         z_values_rollout = []
         violations_rollout = []
 
-        episodes_window = 0
+        rollout_episode_count = 0
         evaluation_done_this_rollout = False
         force_sums = {agent: torch.zeros(3, device=self.device) for agent in self.agent_ids}
         steps_collected = 0
@@ -632,6 +674,7 @@ class EpigraphTrainer:
                     self.rnn_states_actor[agent],
                     masks,
                     deterministic=False,
+                    generator=self._train_generator,
                 )
                 actions[agent] = act_a
                 action_log_probs[agent] = logp_a
@@ -682,6 +725,7 @@ class EpigraphTrainer:
             }
 
             obs_next, rewards, terminated, truncated, info = self.env.step(env_actions)
+            obs_next = self._scale_obs(obs_next)
             progress_rollout.append(
                 actual_env.reward_components.get(
                     "progress_ratio",
@@ -711,6 +755,7 @@ class EpigraphTrainer:
             term_masks_flat_t = term_mask_env.repeat(self.num_agents, 1)
 
             episode_increment = int(done_any_env.sum().item())
+            rollout_episode_count += episode_increment
             z_next = update_z_epigraph(
                 z_global,
                 r_team,
@@ -727,7 +772,7 @@ class EpigraphTrainer:
             milestone_to_trigger = None
 
             if not evaluation_done_this_rollout:
-                future_episodes = self.global_episodes + episodes_window + episode_increment
+                future_episodes = self.global_episodes + rollout_episode_count
                 milestone_to_trigger = self._check_milestone_crossed(future_episodes)
                 if milestone_to_trigger is not None:
                     (
@@ -800,16 +845,15 @@ class EpigraphTrainer:
                 current_returns_safe[done_indices] = 0.0
                 current_lengths[done_indices] = 0
                 self.episodes_done += len(done_indices)
-                self.global_episodes += len(done_indices)
-
+            
             if milestone_to_trigger is not None:
                 self._apply_truncation_masks(buffer_step_idx, ongoing_env_mask)
-                episodes_window += episode_increment
                 self._run_milestone_evaluation(milestone_to_trigger)
                 self.milestones.popleft()
                 evaluation_done_this_rollout = True
 
                 obs, _ = self.env.reset()
+                obs = self._scale_obs(obs)
                 if hasattr(actual_env, "_last_z_snapshot"):
                     actual_env._last_z_snapshot = None
                 z_global = self._init_z_training()
@@ -822,7 +866,6 @@ class EpigraphTrainer:
                 continue
             else:
                 z_global = z_next
-                episodes_window += episode_increment
 
             obs = obs_next
             masks = (~done_any_env).float()
@@ -914,6 +957,8 @@ class EpigraphTrainer:
         self._cached_obs = {agent: obs[agent].clone().detach() for agent in self.agent_ids}
         self._cached_z = z_global.clone().detach()
         self._cached_masks = masks.clone().detach()
+
+        self.global_episodes += rollout_episode_count
 
         self._log_rollout_stats(self.global_step, rollout_stats)
 
@@ -1030,6 +1075,8 @@ class EpigraphTrainer:
 
         if self.wandb_logger is not None and getattr(self.wandb_logger, "enabled", False):
             payload = {
+                "score_mean": eval_stats.get("eval_score_mean"),
+                "score_std": eval_stats.get("eval_score_std"),
                 "return_mean": eval_stats.get("eval_return_mean"),
                 "return_std": eval_stats.get("eval_return_std"),
                 "num_episodes": eval_stats.get("eval_num_episodes"),
@@ -1045,7 +1092,7 @@ class EpigraphTrainer:
 
         # Derive score for checkpoint naming (fallback to 0.0 if unavailable)
         score = None
-        for key in ("eval_return_mean", "return_mean"):
+        for key in ("eval_score_mean", "score_mean", "eval_return_mean", "return_mean"):
             val = eval_stats.get(key)
             if val is not None:
                 score = float(val)
@@ -1453,6 +1500,7 @@ class EpigraphTrainer:
         self.set_eval_mode()
         
         obs, _ = self.env.reset()
+        obs = self._scale_obs(obs)
         self._init_rnn_states()
         
         episode_task_return = 0.0
@@ -1496,7 +1544,7 @@ class EpigraphTrainer:
                     z_i_star = self.root_finder.solve(
                         vh_eval_fn=vh_eval_fn,
                         obs=obs[agent],
-                        h_tgt=-0.05,
+                        h_tgt=0.0,
                     )
                     z_candidates.append(z_i_star)
 
@@ -1513,12 +1561,20 @@ class EpigraphTrainer:
                         ones_mask,
                         deterministic=deterministic,
                     )
-                    masked_action = torch.zeros_like(act_a)
-                    masked_action[0] = act_a[0]
-                    actions[agent] = masked_action
+                    actions[agent] = act_a
                     self.rnn_states_actor[agent] = next_h_a
 
-                env_actions = self._scale_actions(actions)
+                # Only act on environment 0; other envs receive zero actions to remain idle.
+                masked_actions = {}
+                for agent, act in actions.items():
+                    if act.dim() == 2 and act.size(0) == self.num_envs:
+                        zeros = torch.zeros_like(act)
+                        zeros[0] = act[0]
+                        masked_actions[agent] = zeros
+                    else:
+                        masked_actions[agent] = act
+
+                env_actions = self._scale_actions(masked_actions)
                 detail_payload = {
                     "applied_forces": {aid: env_actions[aid].clone() for aid in self.agent_ids},
                     "mean_actions": {aid: env_actions[aid].clone() for aid in self.agent_ids},
@@ -1533,6 +1589,7 @@ class EpigraphTrainer:
                 actual_env._last_z_snapshot = z_global.clone().detach()
 
                 obs, rewards, terminated, truncated, info = self.env.step(env_actions)
+                obs = self._scale_obs(obs)
 
                 # Aggregate statistics (env0 only, averaged over agents)
                 step_task_vals = []
@@ -1753,12 +1810,20 @@ class EpigraphTrainer:
         if update_count is not None:
             checkpoint["update_count"] = update_count
         
+        checkpoint["rng_state"] = {
+            "py": random.getstate(),
+            "np": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "train_generator": self._train_generator.get_state() if hasattr(self, "_train_generator") and self._train_generator is not None else None,
+        }
+        
         torch.save(checkpoint, path)
         print(f"[CHECKPOINT] Saved to {path}")
     
     def load_checkpoint(self, path: str):
         """Load checkpoint with all networks, optimizers, and training state."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # Load networks
         for agent in self.agent_ids:
@@ -1783,6 +1848,20 @@ class EpigraphTrainer:
         # Load remaining milestones
         if "milestones" in checkpoint:
             self.milestones = deque(checkpoint["milestones"])
+
+        if "rng_state" in checkpoint:
+            rng_state = checkpoint["rng_state"]
+            try:
+                random.setstate(rng_state["py"])
+                np.random.set_state(rng_state["np"])
+                torch.set_rng_state(rng_state["torch"])
+                if torch.cuda.is_available() and rng_state.get("cuda") is not None:
+                    torch.cuda.set_rng_state_all(rng_state["cuda"])
+                train_gen_state = rng_state.get("train_generator")
+                if train_gen_state is not None and hasattr(self, "_train_generator") and self._train_generator is not None:
+                    self._train_generator.set_state(train_gen_state)
+            except Exception as exc:
+                print(f"[CHECKPOINT][WARN] Failed to restore RNG state: {exc}")
         
         print(f"[CHECKPOINT] Loaded from {path}")
         print(f"[CHECKPOINT] Resumed at global_step={self.global_step}, global_episodes={self.global_episodes}")

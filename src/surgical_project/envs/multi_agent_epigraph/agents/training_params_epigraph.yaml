@@ -10,7 +10,7 @@ training:
   seed: 42
   lr_decay:
     enabled: true               # Enable cosine learning rate decay
-    final_factor: 0.1          # Final learning rate = initial * 0.1
+    final_factor: 0.5         # Final learning rate = initial * 0.1
   entropy_schedule:
     enabled: true
     start: 0.007
@@ -20,7 +20,7 @@ training:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true # Enable detailed console logging
+  enable_console_logging: false # Enable detailed console logging
 
 # ==============================================================================
 # Algorithm Configuration (RMAPPO-compatible)
@@ -33,7 +33,8 @@ algorithms:
     
     # Learning rates
     actor_lr: 0.0003                  # Actor learning rate (3e-4)
-    critic_lr: 0.0007                 # Critic learning rate (7e-4)
+    vl_lr: 0.0007                    # Vl critic learning rate
+    vh_lr: 0.0007                   # Vh critic learning rate
     
     # Discount and GAE
     gamma: 0.99                       # Discount factor
@@ -75,10 +76,10 @@ algorithms:
 # ==============================================================================
 epigraph:
   z:
-    min: -1.0                        # Lower bound for z values
-    max: 1.0                         # Upper bound for z values
+    min: -0.5                # Lower bound for z values
+    max: 0.5                 # Upper bound for z values
     init:
-      mode: uniform                     # Initialization mode: uniform/extreme/mixed
+      mode: mixed                     # Initialization mode: uniform/extreme/mixed
       p_extreme: 0.15                  # Probability of extreme values (for mixed mode)
     encode:
       nz: 6                           # Z encoding dimension
@@ -221,4 +222,4 @@ obs_scaling:
 # ==============================================================================
 training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
-  milestone_episodes: [3, 10, 15, 20, 25, 30, 45, 60, 75, 90, 100, 115, 130, 145, 160, 175, 190, 200, 300, 400, 500]
+  milestone_episodes: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 115, 130, 145, 160, 175, 190, 200, 300, 400, 500]

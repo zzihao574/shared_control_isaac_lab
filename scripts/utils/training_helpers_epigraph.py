@@ -229,6 +229,22 @@ def summarize_eval_stats(
         stats['eval_safe_cost_mean'] = float(np.mean(episode_safe_costs))
         stats['eval_safe_cost_std'] = float(np.std(episode_safe_costs))
         stats['eval_safe_cost_sum'] = float(np.sum(episode_safe_costs))
+
+    # Epigraph score (aligned with play_epigraph)
+    if (
+        len(episode_returns) > 0
+        and len(episode_safe_costs) > 0
+        and len(episode_lengths) > 0
+    ):
+        per_episode_score = [
+            1000.0 * (ret - cost) / max(1, length)
+            for ret, cost, length in zip(episode_returns, episode_safe_costs, episode_lengths)
+        ]
+        stats['eval_score_mean'] = float(np.mean(per_episode_score))
+        stats['eval_score_std'] = float(np.std(per_episode_score))
+    else:
+        stats['eval_score_mean'] = 0.0
+        stats['eval_score_std'] = 0.0
     
     # Success rate
     if len(episode_success) > 0:

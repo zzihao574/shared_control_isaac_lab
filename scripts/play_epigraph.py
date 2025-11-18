@@ -13,7 +13,8 @@ Features:
 import argparse
 import os
 import sys
-from typing import Dict, Optional
+import traceback
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -28,10 +29,6 @@ for _path in (REPO_ROOT, SRC_ROOT):
 from isaaclab.app import AppLauncher
 
 from scripts.utils.eval_logging import EvalRecorder, EvalWandBLogger, wandb_available
-
-from surgical_project.envs.multi_agent_epigraph.surgical_epigraph_env_cfg import SurgicalEpigraphEnvCfg
-from surgical_project.envs.multi_agent_epigraph.surgical_epigraph_env import SurgicalEpigraphEnv
-from surgical_project.algorithms.marl.epigraph.trainer import EpigraphTrainer
 
 DEFAULT_CONFIG_PATH = os.path.abspath(
     os.path.join(
@@ -112,6 +109,13 @@ def load_config(checkpoint_path: str, fallback_path: str) -> dict:
 
 
 def create_env(config: dict, num_envs: int, seed: int):
+    from surgical_project.envs.multi_agent_epigraph.surgical_epigraph_env_cfg import (
+        SurgicalEpigraphEnvCfg,
+    )
+    from surgical_project.envs.multi_agent_epigraph.surgical_epigraph_env import (
+        SurgicalEpigraphEnv,
+    )
+
     env_cfg = SurgicalEpigraphEnvCfg()
     if hasattr(env_cfg, "scene") and hasattr(env_cfg.scene, "num_envs"):
         env_cfg.scene.num_envs = num_envs
@@ -124,7 +128,11 @@ def create_env(config: dict, num_envs: int, seed: int):
     return env
 
 
-def create_trainer(env, config: dict, checkpoint_path: str, device: torch.device) -> EpigraphTrainer:
+def create_trainer(
+    env, config: dict, checkpoint_path: str, device: torch.device
+) -> Any:
+    from surgical_project.algorithms.marl.epigraph.trainer import EpigraphTrainer
+
     algo_cfg = config["algorithms"]["rmappo"]
     epi_cfg = config["epigraph"]
     max_global_steps = algo_cfg.get("max_global_steps", 150000)
@@ -157,9 +165,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: int, recorder: EvalRecorder) -> Dict[str, float]:
+def run_eval_episode(trainer: Any, deterministic: bool, max_steps: int, recorder: EvalRecorder) -> Dict[str, float]:
     trainer.set_eval_mode()
-    obs, _ = trainer.env.reset()
+    obs_raw, _ = trainer.env.reset()
+    obs = trainer._scale_obs(obs_raw)
     trainer._init_rnn_states()
 
     actual_env = getattr(trainer.env, "unwrapped", trainer.env)
@@ -182,6 +191,13 @@ def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: i
     info = {}
     limit = max_steps if max_steps > 0 else 2000  # trainer default safeguard
 
+    def _flag_to_bool(val):
+        if isinstance(val, torch.Tensor):
+            if val.numel() == 0:
+                return False
+            return bool(val.reshape(-1)[0].item())
+        return bool(val)
+
     try:
         while not done and step < limit:
             z_candidates = []
@@ -200,7 +216,7 @@ def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: i
                 z_i_star = trainer.root_finder.solve(
                     vh_eval_fn=vh_eval_fn,
                     obs=obs[agent],
-                    h_tgt=-0.05,
+                    h_tgt=0.0,
                 )
                 z_candidates.append(z_i_star)
 
@@ -217,9 +233,7 @@ def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: i
                     ones_mask,
                     deterministic=deterministic,
                 )
-                masked_action = torch.zeros_like(act_a)
-                masked_action[0] = act_a[0]
-                actions[agent] = masked_action
+                actions[agent] = act_a
                 trainer.rnn_states_actor[agent] = next_h_a
 
             env_actions = trainer._scale_actions(actions)
@@ -235,7 +249,8 @@ def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: i
                 actual_env._trainer_global_step = trainer.global_step
             actual_env._last_z_snapshot = z_global.clone().detach()
 
-            obs, rewards, terminated, truncated, info = trainer.env.step(env_actions)
+            obs_raw, rewards, terminated, truncated, info = trainer.env.step(env_actions)
+            obs = trainer._scale_obs(obs_raw)
 
             recorder.record_step(step, trainer.env, rewards, info, detail_payload)
 
@@ -280,8 +295,8 @@ def run_eval_episode(trainer: EpigraphTrainer, deterministic: bool, max_steps: i
 
             done_env0 = False
             for agent in trainer.agent_ids:
-                term_flag = bool((terminated[agent]).squeeze(-1)[0].item()) if isinstance(terminated[agent], torch.Tensor) else bool(terminated[agent])
-                trunc_flag = bool((truncated[agent]).squeeze(-1)[0].item()) if isinstance(truncated[agent], torch.Tensor) else bool(truncated[agent])
+                term_flag = _flag_to_bool(terminated[agent])
+                trunc_flag = _flag_to_bool(truncated[agent])
                 done_env0 = done_env0 or term_flag or trunc_flag
             done = done_env0
 
@@ -453,12 +468,22 @@ def main():
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
+    caught_error: Optional[BaseException] = None
+
     try:
-        evaluate(args)
+        try:
+            evaluate(args)
+        except Exception as exc:
+            print("[DEBUG] Evaluation raised an exception; printing traceback:")
+            traceback.print_exc()
+            caught_error = exc
     finally:
         print("[CLEANUP] Closing simulation app...")
         simulation_app.close()
         print("[CLEANUP] Done.")
+
+    if caught_error is not None:
+        raise caught_error
 
 
 if __name__ == "__main__":

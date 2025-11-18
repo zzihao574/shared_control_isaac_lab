@@ -31,9 +31,14 @@ from utils.training_helpers_maddpg import (
 )
 
 
-def setup_global_reproducibility(seed: int, strict_determinism: bool = False):
+def setup_global_reproducibility(seed: int, strict_determinism: bool = True):
     """Setup global reproducibility for consistent training results."""
+    import os
     import random
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -134,7 +139,7 @@ class MADDPGTrainer:
         self.config = TrainingConfiguration.from_yaml(self.args.config)
         
         # Setup global reproducibility
-        setup_global_reproducibility(self.args.seed, strict_determinism=False)
+        setup_global_reproducibility(self.args.seed, strict_determinism=True)
         self.config.params['seed'] = self.args.seed
         
         print(f"[SETUP] Configuration loaded, global reproducibility set: {self.args.seed}")

@@ -103,7 +103,7 @@ def load_maddpg_checkpoint(maddpg, checkpoint_path: str):
       * Legacy top-k checkpoints (uses rank_1 networks)
     """
     print(f"[LOAD] Loading MADDPG checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=maddpg.device)
+    ckpt = torch.load(checkpoint_path, map_location=maddpg.device, weights_only=False)
     agent_ids = maddpg.agent_ids
 
     def has_flat_keys(prefix: str = "") -> bool:

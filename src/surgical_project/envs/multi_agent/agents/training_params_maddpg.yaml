@@ -27,7 +27,7 @@ networks:
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
-  # Fixed scaling factors (ordered by obs concatenation: pos[3] + vel[3] + dist[1] = 7D)
+  # Fixed scaling factors 
   factors: [5.0, 16.7, 16.7, 16.7, 5.0, 1.0]
 
 # ==============================================================================

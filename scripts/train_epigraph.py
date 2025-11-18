@@ -55,8 +55,8 @@ parser.add_argument("--num_envs", type=int, default=48,
                     help="Number of parallel environments.")
 parser.add_argument("--seed", type=int, default=42, 
                     help="Random seed for reproducibility.")
-parser.add_argument("--max_global_steps", type=int, default=150000,
-                    help="Training stops when trainer.global_step >= this value.")
+parser.add_argument("--max_global_steps", type=int, default=0,
+                    help="Training stops when trainer.global_step >= this value (0=use YAML config).")
 parser.add_argument("--ckpt_dir", type=str, default="logs/epigraph/checkpoints",
                     help="Directory to save checkpoints.")
 parser.add_argument("--checkpoint", type=str, default="",
@@ -173,7 +173,8 @@ def main():
     print(f"Config:           {args.config}")
     print(f"Num Envs:         {args.num_envs}")
     print(f"Seed:             {args.seed}")
-    print(f"Max Global Steps: {args.max_global_steps}")
+    max_steps_display = args.max_global_steps if args.max_global_steps > 0 else "YAML config"
+    print(f"Max Global Steps: {max_steps_display}")
     print(f"Checkpoint Dir:   {args.ckpt_dir}")
     if args.checkpoint:
         print(f"Resume from:      {args.checkpoint}")
@@ -214,6 +215,10 @@ def main():
     # NOTE: "algorithms.rmappo" is just a naming convention for hyperparameters
     # It does NOT mean we're using RMAPPO code/logic
     algo_cfg = config["algorithms"]["rmappo"]
+    yaml_max_steps = int(algo_cfg.get("max_global_steps", 150000))
+    max_global_steps = args.max_global_steps if args.max_global_steps > 0 else yaml_max_steps
+    source = "CLI" if args.max_global_steps > 0 else "YAML"
+    print(f"[MAX_STEPS] Using max_global_steps={max_global_steps} (source={source})")
     epi_cfg = config["epigraph"]
     
     device = get_device()
@@ -227,7 +232,7 @@ def main():
         epi_cfg=epi_cfg,
         full_config=config,              # For milestone, wandb, etc.
         ckpt_dir=args.ckpt_dir,          # Trainer manages checkpoints
-        max_global_steps=args.max_global_steps,
+        max_global_steps=max_global_steps,
     )
     
     print(f"[TRAINER] EpigraphTrainer initialized\n")
@@ -242,7 +247,7 @@ def main():
     print("[TRAIN] Starting training loop...\n")
     t0 = time.time()
     
-    while trainer.global_step < args.max_global_steps:
+    while trainer.global_step < max_global_steps:
         # Collect rollout
         rollout_stats = trainer.collect_rollout()
         
@@ -255,7 +260,7 @@ def main():
             print(f"[STEP {trainer.global_step}] Elapsed: {elapsed/60:.1f} min")
             print_training_progress(
                 global_step=trainer.global_step,
-                max_steps=args.max_global_steps,
+                max_steps=max_global_steps,
                 rollout_stats=rollout_stats,
                 update_stats=update_stats,
                 agent_labels=trainer.agent_ids,

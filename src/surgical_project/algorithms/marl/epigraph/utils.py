@@ -104,28 +104,28 @@ def normalize_advantages(
     
     if masks.ndim == 2:
         assert masks.shape == (T, E), f"masks shape mismatch: expected ({T},{E}), got {masks.shape}"
-        # Broadcast masks to [T,E,A]
         masks_broadcast = masks.unsqueeze(-1).expand(T, E, A)
     elif masks.ndim == 3:
         assert masks.shape == (T, E, 1) or masks.shape == (T, E, A), \
             f"masks shape mismatch: expected ({T},{E},1) or ({T},{E},{A}), got {masks.shape}"
-        if masks.shape[-1] == 1:
-            masks_broadcast = masks.expand(T, E, A)
-        else:
-            masks_broadcast = masks
+        masks_broadcast = masks.expand(T, E, A) if masks.shape[-1] == 1 else masks
     else:
         raise ValueError(f"masks should be 2D or 3D, got {masks.ndim}D with shape {masks.shape}")
     
-    # Masked normalization
-    masked_adv = advantages * masks_broadcast
-    num_valid = masks_broadcast.sum()
+    normalized = torch.zeros_like(advantages)
+    for env_idx in range(E):
+        mask_env = masks_broadcast[:, env_idx, :]  # [T, A]
+        adv_env = advantages[:, env_idx, :]
+        num_valid = mask_env.sum()
+        if num_valid > 0:
+            masked_adv_env = adv_env * mask_env
+            mean_env = masked_adv_env.sum() / num_valid
+            centered = adv_env - mean_env
+            var_env = ((centered ** 2) * mask_env).sum() / num_valid
+            std_env = torch.sqrt(var_env + eps)
+            normalized_env = (centered / (std_env + eps)) * mask_env
+            normalized[:, env_idx, :] = normalized_env
+        else:
+            normalized[:, env_idx, :] = 0.0
     
-    if num_valid > 0:
-        adv_mean = masked_adv.sum() / num_valid
-        adv_var = ((masked_adv - adv_mean) ** 2 * masks_broadcast).sum() / num_valid
-        adv_std = torch.sqrt(adv_var + eps)
-        
-        normalized = (advantages - adv_mean) / (adv_std + eps)
-        return normalized * masks_broadcast
-    else:
-        return advantages
+    return normalized

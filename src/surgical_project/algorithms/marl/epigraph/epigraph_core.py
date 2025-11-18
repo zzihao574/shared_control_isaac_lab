@@ -114,8 +114,19 @@ class TanhGaussian:
         self.normal = Normal(mean, self.std)
         self.eps = eps
 
-    def sample(self):
-        z = self.normal.rsample()
+    def sample(self, generator: torch.Generator | None = None):
+        if generator is None:
+            z = self.normal.rsample()
+        else:
+            eps = torch.randn(
+                self.mean.shape,
+                dtype=self.mean.dtype,
+                device="cpu",
+                generator=generator,
+            )
+            if self.mean.device.type != "cpu":
+                eps = eps.to(self.mean.device)
+            z = self.mean + self.std * eps
         return torch.tanh(z)
 
     def log_prob(self, action):
@@ -199,7 +210,7 @@ class ActorRNN(nn.Module):
         log_std = torch.clamp(self.log_std.expand_as(mean), -3.0, 2.0)
         return TanhGaussian(mean, log_std)
 
-    def act_step(self, obs, z_enc, hxs, masks, deterministic=False):
+    def act_step(self, obs, z_enc, hxs, masks, deterministic=False, generator=None):
         """
         Single-step acting for rollout/eval.
         
@@ -223,7 +234,7 @@ class ActorRNN(nn.Module):
         if deterministic:
             action = torch.tanh(dist.mean)
         else:
-            action = dist.sample()
+            action = dist.sample(generator=generator)
 
         logp = dist.log_prob(action)
         entropy = dist.entropy()
