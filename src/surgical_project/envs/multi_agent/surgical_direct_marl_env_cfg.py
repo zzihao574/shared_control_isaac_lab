@@ -161,7 +161,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/sphere.usd",
+            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/cube.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,   # Kinematic object (doesn't respond to forces)
                 disable_gravity=True,     # No gravity effect
@@ -169,7 +169,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             scale=(1, 1, 1),   # Small scale for precise constraints
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.14, -0.04, 0.0),         # Position relative to robot base
+            pos=(0.14, -0.02, 0.0),         # Position relative to robot base
             rot=(1.0, 0.0, 0.0, 0.0),     # Default orientation
         ),
     )

@@ -179,4 +179,4 @@ training_monitor:
   # Milestone episodes for policy evaluation and TopK model selection
   # Episodes are counted as sum of all environment completions
   # These are per-env baselines and will be auto-scaled by --num_envs
-  milestone_episodes: [10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 400, 500]
+  milestone_episodes: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 115, 130, 145, 160, 175, 190, 200, 300, 400, 500]

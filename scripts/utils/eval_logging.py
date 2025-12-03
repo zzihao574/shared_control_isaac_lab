@@ -113,6 +113,15 @@ class ForceRecord:
 
 
 @dataclass
+class PositionRecord:
+    episode: int
+    step: int
+    x: float
+    y: float
+    z: float
+
+
+@dataclass
 class EpisodeSummary:
     episode: int
     episode_length: int
@@ -153,6 +162,7 @@ class EvalRecorder:
         self._episode_idx: Optional[int] = None
         self._current_steps: List[StepRecord] = []
         self._current_forces: Dict[str, List[ForceRecord]] = {aid: [] for aid in self.agent_ids}
+        self._current_positions: List[PositionRecord] = []
         self._current_reward_sum = 0.0
         self._current_task_sum = 0.0
         self._current_safe_sum = 0.0
@@ -161,6 +171,7 @@ class EvalRecorder:
         self.episode_summaries: List[EpisodeSummary] = []
         self.all_step_records: List[StepRecord] = []
         self.all_force_records: Dict[str, List[ForceRecord]] = {aid: [] for aid in self.agent_ids}
+        self.all_position_records: List[PositionRecord] = []
 
     # ------------------------------------------------------------------ #
     # Episode lifecycle
@@ -169,6 +180,7 @@ class EvalRecorder:
         self._episode_idx = episode_idx
         self._current_steps = []
         self._current_forces = {aid: [] for aid in self.agent_ids}
+        self._current_positions = []
         self._current_reward_sum = 0.0
         self._current_task_sum = 0.0
         self._current_safe_sum = 0.0
@@ -284,6 +296,22 @@ class EvalRecorder:
                 )
             )
 
+        stylus_pos = getattr(actual_env, "stylus_pos_t1", None)
+        if isinstance(stylus_pos, torch.Tensor) and stylus_pos.numel() >= 3:
+            x = _to_float(stylus_pos[..., 0], 0)
+            y = _to_float(stylus_pos[..., 1], 0)
+            z = _to_float(stylus_pos[..., 2], 0)
+            if None not in (x, y, z):
+                self._current_positions.append(
+                    PositionRecord(
+                        episode=self._episode_idx,
+                        step=step_idx,
+                        x=x,
+                        y=y,
+                        z=z,
+                    )
+                )
+
     def end_episode(self) -> EpisodeSummary:
         if self._episode_idx is None:
             raise RuntimeError("start_episode must preceed end_episode.")
@@ -343,11 +371,13 @@ class EvalRecorder:
         self.all_step_records.extend(self._current_steps)
         for aid in self.agent_ids:
             self.all_force_records[aid].extend(self._current_forces[aid])
+        self.all_position_records.extend(self._current_positions)
 
         # Reset episode state
         self._episode_idx = None
         self._current_steps = []
         self._current_forces = {aid: [] for aid in self.agent_ids}
+        self._current_positions = []
         self._current_reward_sum = 0.0
         self._current_task_sum = 0.0
         self._current_safe_sum = 0.0
@@ -427,6 +457,22 @@ class EvalRecorder:
                         ]
                     )
 
+        if self.all_position_records:
+            positions_path = os.path.join(save_dir, "eval_positions.csv")
+            with open(positions_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["episode", "step", "x", "y", "z"])
+                for record in self.all_position_records:
+                    writer.writerow(
+                        [
+                            record.episode,
+                            record.step,
+                            _format(record.x),
+                            _format(record.y),
+                            _format(record.z),
+                        ]
+                    )
+
     def _build_aggregates(self) -> Dict[str, Dict[str, float]]:
         keys = [
             "score",
@@ -498,4 +544,3 @@ class EvalWandBLogger:
 
     def finish(self):
         self.wandb.finish()
-

@@ -64,7 +64,7 @@ class CompleteConstraintChecker:
         for env_id in range(num_envs):
             # Convert to world coordinates for physics query (required by Isaac Sim)
             stylus_world_pos = stylus_positions[env_id] + current_base_positions[env_id]
-            constraint_path = f"/World/envs/env_{env_id}/Constraint/Sphere"
+            constraint_path = f"/World/envs/env_{env_id}/Constraint/Cube"
             
             try:
                 result = self._analyze_single_constraint(stylus_world_pos, constraint_path)
