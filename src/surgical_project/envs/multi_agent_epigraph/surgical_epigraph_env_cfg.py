@@ -79,7 +79,7 @@ class SurgicalEpigraphEnvCfg(DirectMARLEnvCfg):
     phantom_omni = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/omni.usd",
+            usd_path="/home/zzh/workspace/shared_control_isaac_sim/assets/models/usd/omni.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_linear_velocity=0.06,
@@ -158,7 +158,7 @@ class SurgicalEpigraphEnvCfg(DirectMARLEnvCfg):
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/surgical_robot_project/assets/models/usd/cube.usd",
+            usd_path="/home/zzh/workspace/shared_control_isaac_sim/assets/models/usd/cube.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,
                 disable_gravity=True,
