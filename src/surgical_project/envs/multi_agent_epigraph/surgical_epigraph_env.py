@@ -131,6 +131,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         
         print(f"[ENV/EPIGRAPH] Episode length: {self.cfg.episode_length_s}s")
 
+    # 扁平化奖励权重
     def _normalize_reward_weights_schema(self) -> None:
         """Flatten structured reward weights into legacy per-agent keys."""
         reward_params = self.params.get("reward_parameters") if isinstance(self.params, dict) else None
@@ -191,6 +192,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         reward_params["weights_structured"] = structured_weights
         reward_params["weights"] = flattened
 
+    # 约束参数
     def _load_constraint_parameters(self) -> None:
         """Load constraint-related parameters from configuration."""
         constraints = self.params['constraints']
@@ -214,6 +216,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             self.params['initial_conditions']['joint_positions']['roll']
         ], device=self.device, dtype=torch.float32)
     
+    # 安全与终止参数
     def _load_safety_parameters(self) -> None:
         """Load safety-related parameters."""        
         self.collision_threshold = self.params['constraint_geometry']['collision_threshold']
@@ -225,6 +228,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self.enable_edge_termination = term_config.get('edge_collision', True)
         self.safety_distance_threshold = term_config.get('safety_distance_threshold', 0.0)
     
+    # 初始化环境状态
     def _initialize_state_variables(self) -> None:
         """Initialize all state variables and caches."""
         self.env_base_positions = torch.zeros(self.num_envs, 3, device=self.device)
@@ -241,6 +245,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self.reward_components = {}
         self.stylus_body_idx = None
     
+    # 初始化物理交互状态
     def _initialize_physics_state(self) -> None:
         """Initialize physics interaction state variables."""
         self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
@@ -255,6 +260,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             for agent in self.cfg.possible_agents
         }
     
+    #初始化Observation 缓存，在get obs的时候才起效果
     def _initialize_observation_cache(self) -> None:
         """Initialize observation caching variables for efficient updates."""
         self.stylus_pos_t1 = torch.zeros(self.num_envs, 3, device=self.device)
@@ -264,6 +270,7 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self.normal_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.constraint_results_t1 = None
 
+    # 初始化Reward 状态
     def _initialize_reward_state_caches(self) -> None:
         """Initialize reward system state caches."""
         self.rejoin_streak = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
@@ -364,26 +371,6 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         """Get component weight for specific zone and agent."""
         return self._get_weight(f'zone{zone_letter}_{comp}_{agent}', 0.0)
 
-    def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
-        """Calculate signed progress reward based on velocity alignment."""
-        t = self.trajectory_manager.line_direction
-        v = self.stylus_vel_t1
-        v_along = (v * t.unsqueeze(0)).sum(dim=-1)
-
-        p = self.trajectory_manager.get_progress(self.stylus_pos_t1)
-
-        MIN_REWARD, MAX_REWARD, EPS_V = 0.1, 0.2, 1e-4
-        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p
-
-        pos = (v_along >  EPS_V).float()
-        neg = (v_along < -EPS_V).float()
-        base = (pos - neg) * reward_magnitude
-
-        overrun = p > 1.0
-
-        return torch.where(overrun, -reward_magnitude, base)
-
-        
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         """Pre-physics step processing with action validation and force application."""
         if hasattr(self, '_detail_actor_info') and self._detail_actor_info is not None:
@@ -521,6 +508,25 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             "D": rejoin,
         }
         return masks
+
+    def _progress_raw_signed_by_velocity(self) -> torch.Tensor:
+        """Calculate signed progress reward based on velocity alignment."""
+        t = self.trajectory_manager.line_direction
+        v = self.stylus_vel_t1
+        v_along = (v * t.unsqueeze(0)).sum(dim=-1)
+
+        p = self.trajectory_manager.get_progress(self.stylus_pos_t1)
+
+        MIN_REWARD, MAX_REWARD, EPS_V = 0.1, 0.2, 1e-4
+        reward_magnitude = MIN_REWARD + (MAX_REWARD - MIN_REWARD) * p
+
+        pos = (v_along >  EPS_V).float()
+        neg = (v_along < -EPS_V).float()
+        base = (pos - neg) * reward_magnitude
+
+        overrun = p > 1.0
+
+        return torch.where(overrun, -reward_magnitude, base)
 
     def _zone_A_reward(self, masks: Dict[str, torch.Tensor], agent: str) -> torch.Tensor:
         """Zone A (Track): Outside obstacle boundary - Progress and deviation rewards."""

@@ -46,7 +46,7 @@ def init_z_global(num_envs: int, z_min: float, z_max: float, device, mode: str =
         z[num_envs // 2 :] = z_max
     elif mode == "mixed":
         z = torch.rand(num_envs, 1, device=device) * (z_max - z_min) + z_min
-        extreme_mask = torch.rand(num_envs, device=device) < p_extreme
+        extreme_mask = torch.rand(num_envs, device=device) < p_extreme # bool mask
         z[extreme_mask & (torch.rand(num_envs, device=device) < 0.5), 0] = z_min
         z[extreme_mask & (torch.rand(num_envs, device=device) >= 0.5), 0] = z_max
     else:
@@ -119,11 +119,11 @@ class EpigraphTrainer:
                 len(name) == 15
                 and name[8] == "_"
                 and name[:8].isdigit()
-                and name[9:].isdigit()
-            )
+                and name[9:].isdigit() # 判断是否是数字
+            ) # 判断是否是YYYYMMDD_HHMMSS时间戳目录名
 
-        ckpt_dir_norm = os.path.normpath(ckpt_dir)
-        base, last = os.path.split(ckpt_dir_norm)
+        ckpt_dir_norm = os.path.normpath(ckpt_dir) # os.path.normpath("logs//epigraph/./checkpoints") -> logs/epigraph/checkpoints
+        base, last = os.path.split(ckpt_dir_norm) # base = "logs/epigraph/20260429_153012" last = "checkpoints"
 
         run_root: Optional[str] = None
         run_dir: Optional[str] = None
@@ -150,6 +150,9 @@ class EpigraphTrainer:
 
         final_ckpt_dir = os.path.join(run_dir, "checkpoints")
         os.makedirs(final_ckpt_dir, exist_ok=True)
+        # run_root = "logs/epigraph"
+        # run_dir = "logs/epigraph/20260429_153012"
+        # final_ckpt_dir = ”logs/epigraph/20260429_153012/checkpoints“
 
         self.ckpt_root = run_root
         self.ckpt_run_dir = run_dir
@@ -162,9 +165,9 @@ class EpigraphTrainer:
         if hasattr(env.unwrapped, "params"):
             self.env_cfg = env.unwrapped.params.get("epigraph_env", {})
         else:
-            self.env_cfg = {}
+            self.env_cfg = {} # 和_setup_core_configuration()有关, 补充cfg的参数
         
-        # Environment dimensions
+        # Environment cfg SurgicalEpigraphEnvCfg 通过env.unwrapped.cfg调用 ？（具体如何调用）
         self.num_envs = env.num_envs
         self.agent_ids = list(env.unwrapped.cfg.possible_agents)
         desired_order = ["human", "robot"]
@@ -176,7 +179,7 @@ class EpigraphTrainer:
         self.share_obs_dim = self.obs_dim * self.num_agents
         self.act_dim = env.unwrapped.cfg.action_spaces[self.agent_ids[0]]
         self.hidden_size = algo_cfg["hidden_size"]
-        self.recurrent_N = algo_cfg.get("recurrent_N", 1)
+        self.recurrent_N = algo_cfg.get("recurrent_N", 1)  # algo_cfg epi_cfg 在yaml里
 
         # Observation scaling (align with rMAPPO wrapper behavior)
         obs_scaling_cfg = full_config.get("obs_scaling", {})
@@ -240,7 +243,7 @@ class EpigraphTrainer:
         self._build_optimizers()
         self._init_rnn_states()
         
-        # Training state
+        # Training configuration
         self.global_step = 0
         self.global_episodes = 0
         self.episodes_done = 0  # Legacy name for compatibility
@@ -357,10 +360,10 @@ class EpigraphTrainer:
         
     def _build_optimizers(self):
         """Build optimizers."""
-        actor_params = list(self.z_encoder_actor.parameters())
+        actor_params = list(self.z_encoder_actor.parameters()) #1
         for agent in self.agent_ids:
             actor_params.extend(self.actors[agent].parameters())
-        self.actor_parameters = actor_params
+        self.actor_parameters = actor_params # python List
         actor_lr = float(self.algo_cfg["actor_lr"])
         opt_eps = float(self.algo_cfg.get("opt_eps", 1e-5))
 
@@ -369,6 +372,20 @@ class EpigraphTrainer:
             lr=actor_lr,
             eps=opt_eps,
         )
+        # 
+        # self.optimizer_actor = optim.Adam(
+            # [
+            #     {
+            #         "params": self.z_encoder_actor.parameters(),
+            #         "lr": actor_lr * 0.5,
+            #     },
+            #     {
+            #         "params": self.actors["agent_0"].parameters(),
+            #         "lr": actor_lr,
+            #     },
+            # ],
+            # eps=opt_eps,
+            # )
 
         if "vl_lr" not in self.algo_cfg or "vh_lr" not in self.algo_cfg:
             raise KeyError(
@@ -379,17 +396,17 @@ class EpigraphTrainer:
         vl_lr = float(self.algo_cfg["vl_lr"])
         vh_lr = float(self.algo_cfg["vh_lr"])
 
-        self.vl_parameters = list(self.critic_vl.parameters()) + list(self.z_encoder_vl.parameters())
+        self.vl_parameters = list(self.critic_vl.parameters()) + list(self.z_encoder_vl.parameters()) # 2
         self.optimizer_vl = optim.Adam(
             self.vl_parameters,
             lr=vl_lr,
-            eps=opt_eps,
+            eps=opt_eps, # Adam optimizer 里的数值稳定项，全名通常叫 epsilon  参数更新量 ≈ lr * 一阶动量 / (sqrt(二阶动量) + eps)
         )
 
-        vh_params = list(self.z_encoder_vh.parameters())
+        vh_params = list(self.z_encoder_vh.parameters()) #3
         for agent in self.agent_ids:
             vh_params.extend(self.critics_vh[agent].parameters())
-        self.vh_parameters = vh_params
+        self.vh_parameters = vh_params # python List
         self.optimizer_vh = optim.Adam(
             self.vh_parameters,
             lr=vh_lr,
@@ -412,6 +429,9 @@ class EpigraphTrainer:
             for agent in self.agent_ids
         }
 
+    # -----------------------------
+    # Initialized over
+    # -----------------------------
     def _mark_env_reset_needed(self):
         """Flag that the environment should be fully reset before the next rollout."""
         self._needs_env_reset = True
@@ -419,11 +439,12 @@ class EpigraphTrainer:
         self._cached_z = None
         self._cached_masks = None
 
+    # scaled output actions
     def _scale_actions(self, actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Scale normalized actions to physical force limits."""
         scaled = {}
         for agent in self.agent_ids:
-            limit = float(self.max_forces.get(agent, 1.0))
+            limit = float(self.max_forces.get(agent, 1.0)) 
             scaled[agent] = actions[agent] * limit
         return scaled
 
@@ -432,10 +453,10 @@ class EpigraphTrainer:
         if not self.milestones:
             return None
         if future_episodes >= self.milestones[0]:
-            return self.milestones[0]
+            return self.milestones[0] # 每次完成一个milestone会popleft
         return None
 
-    def _maybe_decay_lr(self, update_idx: int):
+    def _maybe_decay_lr(self, update_idx: int):  # 一个decay lr的例子
         """Apply cosine LR decay to all optimizers."""
         if not self.lr_decay_enabled:
             return
@@ -451,6 +472,21 @@ class EpigraphTrainer:
         actor_lr = actor_min + (self.actor_lr_init - actor_min) * cosine
         for pg in self.optimizer_actor.param_groups:
             pg["lr"] = actor_lr
+        # self.optimizer_actor = optim.Adam(
+        #     self.actor_parameters,
+        #     lr=actor_lr,
+        #     eps=opt_eps,
+        # )
+        # self.optimizer_actor.param_groups = [
+        #     {
+        #         "params": [...],
+        #         "lr": actor_lr,
+        #         "eps": opt_eps,
+        #         "betas": (0.9, 0.999),
+        #         "weight_decay": 0,
+        #         ...
+        #     }
+        # ]
 
         vl_min = self.vl_lr_init * self.lr_final_factor
         vl_lr = vl_min + (self.vl_lr_init - vl_min) * cosine
@@ -470,7 +506,7 @@ class EpigraphTrainer:
             "lr/vh": self.optimizer_vh.param_groups[0]["lr"],
         }
 
-    def _get_entropy_coef(self) -> float:
+    def _get_entropy_coef(self) -> float: # entropy持续减少
         if not self.entropy_schedule_enabled or (self.max_global_steps is None) or self.max_global_steps <= 0:
             return self.base_entropy_coef
         progress = min(1.0, self.global_step / self.max_global_steps)
@@ -625,14 +661,14 @@ class EpigraphTrainer:
         self.set_eval_mode()
         actual_env = getattr(self.env, "unwrapped", self.env)
 
-        if self._needs_env_reset or self._cached_obs is None:
+        if self._needs_env_reset or self._cached_obs is None: # 情况 A：必须重新 reset 环境
             obs, _ = self.env.reset()
             obs = self._scale_obs(obs)
             z_global = self._init_z_training()
             self._init_rnn_states()
             masks = torch.ones(self.num_envs, 1, device=self.device)
             self._needs_env_reset = False
-        else:
+        else: # 情况 B：可以接着上次 rollout 继续跑
             obs = {agent: self._cached_obs[agent].clone().detach() for agent in self.agent_ids}
             cached_z = self._cached_z
             if cached_z is None or cached_z.shape[0] != self.num_envs:
@@ -693,6 +729,8 @@ class EpigraphTrainer:
             for agent in self.agent_ids:
                 force_sums[agent] += env_actions[agent].mean(dim=0)
             steps_collected += 1
+
+            
             actual_env._last_z_snapshot = z_global.clone().detach()
             # Update environment-side step tracer counters (trainer drives the step count)
             if hasattr(actual_env, "_trainer_global_step"):

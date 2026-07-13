@@ -19,13 +19,11 @@ and --wandb enables logging to Weights & Biases.
 
 You can replace train_rmappo.py with train_maddpg.py or train_epigraph.py to train the respective method.
 
-
 ## Evaluation
 
 Trained policies are evaluated with the `scripts/play_epigraph.py` script.  
 A typical evaluation command is:
 
-```bash
 python scripts/play_epigraph.py \
   --checkpoint /home/zzh/workspace/shared_control_isaac_sim/logs/epigraph/20251119_192247/checkpoints/ckpt_milestone_002400_score_119.904634.pth \
   --num_episodes 1 \

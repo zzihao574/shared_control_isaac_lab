@@ -18,7 +18,7 @@ from torch.distributions import Normal
 # RNNLayer (rMAPPO-style, supports both acting and sequence training)
 # =============================================================================
 
-class RNNLayer(nn.Module):
+class RNNLayer(nn.Module): # 初始化输入是
     """
     GRU + LayerNorm, supports:
     - acting mode: x [E,feat], hxs [E,H], masks [E,1] -> out [E,H], next_h [E,H]
@@ -32,6 +32,18 @@ class RNNLayer(nn.Module):
         super().__init__()
         self._recurrent_N = recurrent_N
         self.rnn = nn.GRU(inputs_dim, outputs_dim, num_layers=recurrent_N)
+        # for name, p in self.rnn.named_parameters():
+        #     if 'bias' in name:
+        #         nn.init.constant_(p, 0.0)
+        #     elif 'weight' in name:
+        #         if use_orthogonal:
+        #             nn.init.orthogonal_(p)
+        #         else:
+        #             nn.init.xavier_uniform_(p)
+        self._init_weights(use_orthogonal=use_orthogonal)
+        self.norm = nn.LayerNorm(outputs_dim)
+
+    def _init_weights(self, use_orthogonal=True):
         for name, p in self.rnn.named_parameters():
             if 'bias' in name:
                 nn.init.constant_(p, 0.0)
@@ -40,9 +52,8 @@ class RNNLayer(nn.Module):
                     nn.init.orthogonal_(p)
                 else:
                     nn.init.xavier_uniform_(p)
-        self.norm = nn.LayerNorm(outputs_dim)
 
-    def forward(self, x, hxs, masks):
+    def forward(self, x, hxs, masks): # 输入x h, 输出 
         """
         x:
           acting:   [E, feat]
@@ -52,7 +63,7 @@ class RNNLayer(nn.Module):
           training: [B, H]
         masks:
           acting:   [E, 1]
-          training: [L*B, 1]
+          training: [L*B, 1] # L是时间长度
         return:
           out:      same leading dim as x (E or L*B) x H
           hxs_out:  [E, H] or [B, H] (last layer hidden)
@@ -66,44 +77,49 @@ class RNNLayer(nn.Module):
         if masks.dtype not in (torch.float32, torch.float64):
             masks = masks.float()
 
-        # Acting single-step
+        # Inference
         if x.dim() == 2 and x.size(0) == B:
             h = hxs.unsqueeze(0).expand(layers, B, hxs.size(1)).contiguous()
-            m = masks.view(1, B, 1).expand(layers, B, 1).contiguous()
+            m = masks.view(1, B, 1).expand(layers, B, 1).contiguous() # [layers, B, 1]
             h = h * m
 
-            out, h = self.rnn(x.unsqueeze(0), h)
-            out = out.squeeze(0)
+            out, h = self.rnn(x.unsqueeze(0), h) # h.shape = [layers, E, H]
+            out = out.squeeze(0)  # out.shape: [1, E, H] -> [E, H] here 1 is time step
             out = self.norm(out)
-            return out, h[-1]
+            return out, h[-1] # 都是 [E, H]
 
         # Training: sequence L×B
         assert x.dim() == 2 and x.size(0) % B == 0, f"x {x.shape} not divisible by batch {B}"
         L = x.size(0) // B
         assert masks.size(0) == L * B, f"masks {masks.shape} vs L*B {L*B}"
 
-        x = x.view(L, B, x.size(1))
-        m = masks.view(L, B, 1)
+        x = x.view(L, B, x.size(1)) # [L, B, feat]
+        m = masks.view(L, B, 1) # [L, B, 1]
 
         h = hxs.unsqueeze(0).expand(layers, B, hxs.size(1)).contiguous()
 
         outs = []
         for t in range(L):
-            mt = m[t].view(1, B, 1).expand(layers, B, 1).contiguous()
+            mt = m[t].view(1, B, 1).expand(layers, B, 1).contiguous() # 【B，1】 -> [1, B, 1] ->【layers，B，1】
             h = h * mt
             out_t, h = self.rnn(x[t].unsqueeze(0), h)
-            outs.append(out_t)
+            outs.append(out_t) #   outs = [
+                                        # tensor shape [1, B, H],
+                                        # tensor shape [1, B, H],
+                                        # ...
+                                        # tensor shape [1, B, H],
+                                        # ]  outs 里存了 L 个 [1, B, H]
 
-        out = torch.cat(outs, dim=0).reshape(L * B, -1)
-        out = self.norm(out)
-        return out, h[-1]
+        out = torch.cat(outs, dim=0).reshape(L * B, -1) # [L, B, H] -> [L*B, H]
+        out = self.norm(out) # [L*B, H]
+        return out, h[-1]  # [L * B, H] ->【B, H] out对应多个时间步的输出
 
 
 # =============================================================================
 # TanhGaussian distribution
 # =============================================================================
 
-class TanhGaussian:
+class TanhGaussian: # 涵盖采样 求logprob 求entropy
     """
     tanh(Normal(mean, std)) distribution with log_prob Jacobian correction.
     """
@@ -122,24 +138,26 @@ class TanhGaussian:
                 self.mean.shape,
                 dtype=self.mean.dtype,
                 device="cpu",
-                generator=generator,
-            )
+                generator=generator, # pytorch随机数生成器
+            ) # cpu上生成标准正态分布的噪声
             if self.mean.device.type != "cpu":
-                eps = eps.to(self.mean.device)
+                eps = eps.to(self.mean.device) # 转移到与 mean 相同的设备上
             z = self.mean + self.std * eps
         return torch.tanh(z)
 
-    def log_prob(self, action):
-        a = torch.clamp(action, -1 + self.eps, 1 - self.eps)
-        z = 0.5 * torch.log((1 + a) / (1 - a))
-        logp_z = self.normal.log_prob(z)
+    def log_prob(self, action): # log数值更稳定，尤其是多维动作时，概率密度相乘会很小；取 log 后就变成相加，更安全。
+        a = torch.clamp(action, -1 + self.eps, 1 - self.eps) # 防止除以0
+        z = 0.5 * torch.log((1 + a) / (1 - a)) # z = atanh(a) = 0.5 * log((1+a)/(1-a))
+        logp_z = self.normal.log_prob(z) # z∼N(μ,σ) logpZ(z) 用当前的 Normal(mean, std) 分布，计算 z 这个点的 log probability density。
         log_det = torch.log(1 - a.pow(2) + self.eps)
-        logp = (logp_z - log_det).sum(dim=-1, keepdim=True)
-        return logp
+        logp = (logp_z - log_det).sum(dim=-1, keepdim=True) # 修正后的项 [B, action_dim] ->【B, 1】
+        # logπ(a∣s)=i∑​logπi​(ai​∣s) 总log probability
 
+        return logp 
     def entropy(self):
         ent = 0.5 * (1 + torch.log(2 * torch.tensor(3.141592653589793))) + self.log_std
-        return ent.sum(dim=-1, keepdim=True)
+        # 正态分布 entropy H(N(μ,σ2))=21​(1+log(2π))+logσ = 1/2​log(2πeσ2)
+        return ent.sum(dim=-1, keepdim=True) # 因为 ent 一开始是每个动作维度各自的熵，而 PPO/SAC 通常需要的是整条 action vector 的总熵。 [B, action_dim] ->【B, 1】
 
 
 # =============================================================================
@@ -179,7 +197,7 @@ class ZEncoder(nn.Module):
         )
 
     def forward(self, z):
-        z_norm = (z - self.z_mean) / (self.z_scale + 1e-8)
+        z_norm = (z - self.z_mean) / (self.z_scale + 1e-8) # 先归一化，然后过网络
         return self.fc(z_norm)
 
 
@@ -202,12 +220,12 @@ class ActorRNN(nn.Module):
 
         self.fc1 = init_linear(nn.Linear(obs_dim + nz, hidden_size), gain=1.0, use_orthogonal=use_orthogonal)
         self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=use_orthogonal)
-        self.fc_mean = init_linear(nn.Linear(hidden_size, act_dim), gain=gain, use_orthogonal=use_orthogonal)
+        self.fc_mean = init_linear(nn.Linear(hidden_size, act_dim), gain=gain, use_orthogonal=use_orthogonal) # gain代表要把正则化后的weight和bias放大缩小多少
         self.log_std = nn.Parameter(torch.zeros(1, act_dim))
 
     def _dist_from_latent(self, h):
-        mean = self.fc_mean(h)
-        log_std = torch.clamp(self.log_std.expand_as(mean), -3.0, 2.0)
+        mean = self.fc_mean(h) # mean.shape = [E, act_dim]
+        log_std = torch.clamp(self.log_std.expand_as(mean), -3.0, 2.0) # 【1, act_dim】-> []
         return TanhGaussian(mean, log_std)
 
     def act_step(self, obs, z_enc, hxs, masks, deterministic=False, generator=None):
@@ -226,11 +244,11 @@ class ActorRNN(nn.Module):
             next_h: [E, H]
             entropy: [E, 1]
         """
-        x = torch.cat([obs, z_enc], dim=-1)
-        x = F.relu(self.fc1(x))
-        rnn_out, next_h = self.rnn(x, hxs, masks)
+        x = torch.cat([obs, z_enc], dim=-1) # 【E, obs_dim + nz】
+        x = F.relu(self.fc1(x)) # 【E, hidden_size】= 【E， H】
+        rnn_out, next_h = self.rnn(x, hxs, masks) 
 
-        dist = self._dist_from_latent(rnn_out)
+        dist = self._dist_from_latent(rnn_out) #！！！
         if deterministic:
             action = torch.tanh(dist.mean)
         else:
@@ -238,7 +256,9 @@ class ActorRNN(nn.Module):
 
         logp = dist.log_prob(action)
         entropy = dist.entropy()
-        return action, logp, next_h, entropy
+        return action, logp, next_h # 输入 obs 经过Encoder后的z hxs  masks
+                                            # 输出动作（mean是从mlp得来，不同环境不一样， logstd自行优化，不同环境同一个维度共享一个logstd）， logppiold(a|s,z，h) 以及下一个隐藏状态 next_h 和 (可以有的熵)
+        # obs[t] # [E, obs_dim]      actions[t] # [E, act_dim]      log_probs[t] # [E, 1]    hxs[t] # [E, H]
 
     def evaluate_actions_seq(self, obs_seq, z_enc_seq, hxs_init, masks_seq, act_seq):
         """
@@ -263,7 +283,7 @@ class ActorRNN(nn.Module):
         dist = self._dist_from_latent(rnn_out)
         logp = dist.log_prob(act_seq)
         entropy = dist.entropy()
-        return logp, entropy, last_h
+        return logp, entropy, last_h # 训练使用 的 logppinew(a|s,z，h) 基于推理得到的action ， entropy也是基于action
 
 
 # =============================================================================
@@ -303,7 +323,7 @@ class CriticVlRNN(nn.Module):
         x = torch.cat([share_obs, z_enc], dim=-1)
         x = F.relu(self.fc1(x))
         rnn_out, next_h = self.rnn(x, hxs, masks)
-        vl = self.fc_value(rnn_out)
+        vl = self.fc_value(rnn_out) # ！！！
         return vl, next_h
 
     def value_seq(self, share_obs_seq, z_enc_seq, hxs_init, masks_seq):
