@@ -8,11 +8,10 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
-# Force import dependencies - fail fast if not installed
-from omni.physx.bindings._physx import (
-    acquire_physx_attachment_interface, acquire_physx_scene_query_interface
-)
+# Isaac Sim 5.x PhysX interfaces.
+import omni.physx
 from carb._carb import Float3
+from isaaclab.utils.math import quat_apply_inverse
 
 
 class CompleteConstraintChecker:
@@ -28,12 +27,8 @@ class CompleteConstraintChecker:
         self.device = device
         self.collision_threshold = collision_threshold
         
-        try:
-            self.physics_attachment_interface = acquire_physx_attachment_interface()
-            self.physics_scene_query_interface = acquire_physx_scene_query_interface()
-        except ImportError:
-            self.physics_attachment_interface = None
-            self.physics_scene_query_interface = None
+        self.physics_attachment_interface = omni.physx.get_physx_attachment_private_interface()
+        self.physics_scene_query_interface = omni.physx.get_physx_scene_query_interface()
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """
@@ -80,9 +75,8 @@ class CompleteConstraintChecker:
                     
                     # Transform normal_vector from world to local coordinates
                     try:
-                        from isaaclab.utils.math import quat_rotate_inverse
                         normal_world = torch.tensor(result['normal_vector'], device=self.device, dtype=torch.float32)
-                        normal_local = quat_rotate_inverse(base_quats[env_id:env_id+1], normal_world.unsqueeze(0))
+                        normal_local = quat_apply_inverse(base_quats[env_id:env_id+1], normal_world.unsqueeze(0))
                         batch_results['normal_vectors'][env_id] = normal_local.squeeze(0)
                     except Exception:
                         # Fallback to original normal vector
@@ -244,12 +238,19 @@ class StepTracer:
         if not force_print and global_step % self.print_every_steps != 0:
             return
 
-        to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
+        evaluation_env_id = getattr(env, "evaluation_active_env_id", None)
+        if evaluation_env_id is None:
+            to_show = list(range(min(self.max_envs_to_print, self.num_envs)))
+        else:
+            to_show = [int(evaluation_env_id)]
 
         print("=" * 80)
         print(f"STEP {global_step} - Four-Zone Reward System (A/B/C/D)")
         print("=" * 80)
-        print(f"Showing first {len(to_show)} of {self.num_envs} environments")
+        if evaluation_env_id is None:
+            print(f"Showing first {len(to_show)} of {self.num_envs} environments")
+        else:
+            print(f"Showing evaluation environment {evaluation_env_id} only")
 
         for env_id in to_show:
             self._print_env_snapshot(env, env_id)

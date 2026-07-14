@@ -19,6 +19,9 @@ class MADDPG:
         self.params = params
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.num_envs = num_envs
+        self.human_model_type = str(self.params.get("human_model_type", "learnable"))
+        if self.human_model_type not in {"learnable", "fixed_impedance", "residual_impedance"}:
+            raise ValueError(f"Unsupported human_model_type: {self.human_model_type}")
         
         # Eval mode control
         self._is_eval_mode = False
@@ -32,6 +35,13 @@ class MADDPG:
         # Get environment configuration
         self.agent_ids = list(self.actual_env.cfg.possible_agents)
         self.num_agents = len(self.agent_ids)
+        self.human_agent_id = next(aid for aid in self.agent_ids if "human" in aid.lower())
+        self.robot_agent_id = next(aid for aid in self.agent_ids if "robot" in aid.lower())
+        self.trainable_agent_ids = (
+            [self.robot_agent_id]
+            if self.human_model_type == "fixed_impedance"
+            else list(self.agent_ids)
+        )
         
         # Get dimensions from environment cfg
         self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
@@ -45,6 +55,8 @@ class MADDPG:
         print(f"  Obs dims: {self.obs_dims} (total: {self.total_obs_dim})")
         print(f"  Action dims: {self.action_dims} (total: {self.total_action_dim})")
         print(f"  Networks: ONE per agent type (shared across ALL environments)")
+        print(f"  Human model: {self.human_model_type}")
+        print(f"  Trainable agents: {self.trainable_agent_ids}")
 
         # Initialize shared agents with IDENTICAL weights
         self._initialize_agents_with_identical_init()
@@ -195,6 +207,17 @@ class MADDPG:
         
         for i, agent_id in enumerate(self.agent_ids):
             obs_i = observations[agent_id]
+
+            if agent_id == self.human_agent_id and self.human_model_type == "fixed_impedance":
+                zero_action = torch.zeros(
+                    (obs_i.shape[0], self.action_dims[i]),
+                    device=obs_i.device,
+                    dtype=obs_i.dtype,
+                )
+                actions[agent_id] = zero_action
+                detail["mean_actions"][agent_id] = zero_action.clone()
+                detail["noise_actions"][agent_id] = zero_action.clone()
+                continue
             
             # Actor outputs normalized actions [-1,1]
             a_norm = self.agents[agent_id].actor(obs_i)
@@ -217,12 +240,13 @@ class MADDPG:
             # Determine force limit based on agent type
             max_force = max_robot_force if 'robot' in agent_id.lower() else max_human_force
             
-            # Map to physical units for environment
-            action = (a_norm_with_noise * max_force).clamp_(-max_force, max_force)
+            # Map to physical units. The normalized action is already bounded;
+            # the environment owns the single physical-force safety clamp.
+            action = a_norm_with_noise * max_force
             actions[agent_id] = action
             
             # Store debug information
-            detail["mean_actions"][agent_id] = (a_norm * max_force).clamp_(-max_force, max_force)
+            detail["mean_actions"][agent_id] = a_norm * max_force
             detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]
 
         for agent_id in actions.keys():
@@ -238,10 +262,27 @@ class MADDPG:
         if self._is_eval_mode:
             return
             
+        actual_env = self.actual_env
+        if hasattr(actual_env, "get_applied_agent_actions"):
+            applied_actions = actual_env.get_applied_agent_actions()
+        else:
+            applied_actions = actions
+
+        if hasattr(actual_env, "get_applied_impedance_force"):
+            current_impedance = actual_env.get_applied_impedance_force()
+        else:
+            current_impedance = getattr(actual_env, "human_impedance_forces_t", None)
+            if current_impedance is None:
+                current_impedance = torch.zeros(self.num_envs, 3, device=self.device)
+        if hasattr(actual_env, "compute_next_impedance_force"):
+            next_impedance = actual_env.compute_next_impedance_force()
+        else:
+            next_impedance = torch.zeros_like(current_impedance)
+
         for env_id in range(self.num_envs):
             # Concatenate observations and actions (by agent_ids order)
             obs_all = torch.cat([obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
-            act_all = torch.cat([actions[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
+            act_all = torch.cat([applied_actions[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             rew_vec = torch.stack([rewards[aid][env_id].reshape(()).float() for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             nobs_all = torch.cat([next_obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
             
@@ -252,7 +293,34 @@ class MADDPG:
                     done_any = True
                     break
             
-            self.replay.add(obs_all, act_all, rew_vec, nobs_all, done_any)
+            self.replay.add(
+                obs_all,
+                act_all,
+                rew_vec,
+                nobs_all,
+                done_any,
+                impedance=current_impedance[env_id].detach().cpu().numpy(),
+                next_impedance=next_impedance[env_id].detach().cpu().numpy(),
+            )
+
+    def _compose_human_action_norm(
+        self, policy_action_norm: torch.Tensor, impedance_force: torch.Tensor
+    ) -> torch.Tensor:
+        """Compose a normalized human action for centralized-critic inputs."""
+        max_human_force = float(
+            self.params.get("constraints", {}).get("max_human_force", 0.04)
+        )
+        impedance_norm = impedance_force / max_human_force
+        if self.human_model_type == "fixed_impedance":
+            return impedance_norm.clamp(-1.0, 1.0)
+        if self.human_model_type == "residual_impedance":
+            return (impedance_norm + policy_action_norm).clamp(-1.0, 1.0)
+        return policy_action_norm
+
+    def human_actor_checksum(self) -> float:
+        """Return a compact checksum used to verify fixed-human immutability."""
+        actor = self.agents[self.human_agent_id].actor
+        return float(sum(p.detach().double().sum().item() for p in actor.parameters()))
 
     def _module_grad_norm(self, module) -> float:
         """Calculate L2 gradient norm for a module."""
@@ -296,7 +364,7 @@ class MADDPG:
         if batch is None:
             return {}
 
-        obs_all, act_all, rew_all, nobs_all, done_any = batch
+        obs_all, act_all, rew_all, nobs_all, done_any, impedance, next_impedance = batch
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 
         # Dynamically build per-dim action limits
@@ -322,12 +390,23 @@ class MADDPG:
         for i, agent_id in enumerate(self.agent_ids):
             slice_i = self.obs_slices[i]
             with torch.no_grad():
-                a2_norm_i = self.agents[agent_id].actor_target(nobs_all[:, slice_i])
+                if agent_id == self.human_agent_id and self.human_model_type == "fixed_impedance":
+                    policy_norm_i = torch.zeros_like(next_impedance)
+                else:
+                    policy_norm_i = self.agents[agent_id].actor_target(nobs_all[:, slice_i])
+                if agent_id == self.human_agent_id:
+                    a2_norm_i = self._compose_human_action_norm(
+                        policy_norm_i, next_impedance
+                    )
+                else:
+                    a2_norm_i = policy_norm_i
             next_action_parts.append(a2_norm_i)
         next_act_all_norm = torch.cat(next_action_parts, dim=-1)
 
         # Update each agent with async frequency
         for i, agent_id in enumerate(self.agent_ids):
+            if agent_id not in self.trainable_agent_ids:
+                continue
             agent = self.agents[agent_id]
 
             # CRITIC UPDATE (every interval steps)
@@ -359,11 +438,19 @@ class MADDPG:
                 action_parts = []
                 for j, agent_j in enumerate(self.agent_ids):
                     slice_j = self.obs_slices[j]
-                    if j == i:
-                        a_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
+                    if agent_j == self.human_agent_id and self.human_model_type == "fixed_impedance":
+                        policy_norm_j = torch.zeros_like(impedance)
+                    elif j == i:
+                        policy_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
                     else:
                         with torch.no_grad():
-                            a_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
+                            policy_norm_j = self.agents[agent_j].actor(obs_all[:, slice_j])
+                    if agent_j == self.human_agent_id:
+                        a_norm_j = self._compose_human_action_norm(
+                            policy_norm_j, impedance
+                        )
+                    else:
+                        a_norm_j = policy_norm_j
                     action_parts.append(a_norm_j)
                 
                 action_pred_all_norm = torch.cat(action_parts, dim=-1)

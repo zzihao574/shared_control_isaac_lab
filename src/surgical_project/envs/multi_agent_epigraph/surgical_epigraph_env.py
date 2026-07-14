@@ -62,7 +62,6 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
         self._setup_core_configuration()
         self._initialize_state_variables()
         self._initialize_components()
-        self._setup_gymnasium_spaces()
         
         # Initialize StepTracer based on YAML config
         enable_console_logging = bool(
@@ -292,25 +291,6 @@ class SurgicalEpigraphEnv(DirectMARLEnv):
             device=self.device, 
             collision_threshold=self.collision_threshold
         )
-    
-    def _setup_gymnasium_spaces(self) -> None:
-        """Setup Gymnasium compatibility spaces for multi-agent interface."""
-        import gymnasium as gym
-        self.action_space = gym.spaces.Dict({
-            agent: gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(self.cfg.action_spaces[agent],), 
-                dtype=np.float32
-            ) for agent in self.cfg.possible_agents
-        })
-        
-        self.observation_space = gym.spaces.Dict({
-            agent: gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(self.cfg.observation_spaces[agent],), 
-                dtype=np.float32
-            ) for agent in self.cfg.possible_agents
-        })
     
     def _setup_scene(self):
         """Setup the simulation scene with robot and constraint objects."""

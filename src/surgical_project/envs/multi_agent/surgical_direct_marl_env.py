@@ -15,10 +15,11 @@ import yaml
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectMARLEnv
-from isaaclab.utils.math import sample_uniform, quat_rotate_inverse
+from isaaclab.utils.math import quat_apply_inverse, sample_uniform
 
 from .surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
 from .utils import CompleteConstraintChecker, TrajectoryManager
+from ..human_force_controller import HumanForceController
 
 
 class SurgicalDirectMARLEnv(DirectMARLEnv):
@@ -43,15 +44,19 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         super().__init__(cfg, render_mode, **kwargs)
         
         self._setup_core_configuration()
+        self.human_force_controller = HumanForceController(self.params, self.device)
         self._initialize_state_variables()
         self._initialize_components()
-        self._setup_gymnasium_spaces()
         
         self._trainer_global_step = None
     
     def _setup_core_configuration(self) -> None:
         """Setup core configuration from trainer injection or direct YAML reading."""
-        if hasattr(self, "params") and isinstance(getattr(self, "params", None), dict):
+        cfg_params = getattr(self.cfg, "params", None)
+        if isinstance(cfg_params, dict):
+            self.params = cfg_params
+            print("[ENV] Using configuration injected via cfg.params")
+        elif hasattr(self, "params") and isinstance(getattr(self, "params", None), dict):
             print("[ENV] Using configuration injected by trainer")
         else:
             print("[ENV] Configuration not injected by trainer, loading directly from YAML")
@@ -85,6 +90,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         constraints = self.params['constraints']
         
         self.min_z_pos = constraints['min_z_position']
+        self.max_robot_force = float(constraints['max_robot_force'])
         
         joint_limits = constraints['joint_limits']
         self.joint_lower_limits = torch.tensor([
@@ -132,8 +138,28 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _initialize_physics_state(self) -> None:
         """Initialize physics interaction state variables."""
+        self._evaluation_active_env_id: int | None = None
+        self._evaluation_force_mask: torch.Tensor | None = None
         self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_policy_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_impedance_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_residual_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.combined_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_reference_position_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.human_reference_velocity_t = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # Preserve the action that produced the transition returned by env.step().
+        # Isaac Lab may reset completed environments before step() returns, so
+        # replay/logging must not read directly from resettable episode caches.
+        self._last_force_breakdown = {
+            "human_policy": torch.zeros(self.num_envs, 3, device=self.device),
+            "human_impedance": torch.zeros(self.num_envs, 3, device=self.device),
+            "human_residual": torch.zeros(self.num_envs, 3, device=self.device),
+            "human": torch.zeros(self.num_envs, 3, device=self.device),
+            "robot": torch.zeros(self.num_envs, 3, device=self.device),
+            "combined": torch.zeros(self.num_envs, 3, device=self.device),
+        }
         
         self.actor_mean_forces = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
@@ -146,6 +172,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _initialize_observation_cache(self) -> None:
         """Initialize observation caching variables for efficient updates."""
+        self._state_cache_sim_step = None
         self.stylus_pos_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.stylus_vel_t1 = torch.zeros(self.num_envs, 3, device=self.device)
         self.safety_distances_t1 = torch.ones(self.num_envs, device=self.device) * 0.01
@@ -174,25 +201,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             device=self.device, 
             collision_threshold=self.collision_threshold
         )
-    
-    def _setup_gymnasium_spaces(self) -> None:
-        """Setup Gymnasium compatibility spaces for multi-agent interface."""
-        import gymnasium as gym
-        self.action_space = gym.spaces.Dict({
-            agent: gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(self.cfg.action_spaces[agent],), 
-                dtype=np.float32
-            ) for agent in self.cfg.possible_agents
-        })
-        
-        self.observation_space = gym.spaces.Dict({
-            agent: gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(self.cfg.observation_spaces[agent],), 
-                dtype=np.float32
-            ) for agent in self.cfg.possible_agents
-        })
     
     def set_trainer_global_step(self, global_step: int) -> None:
         """Set the current global step from trainer for unified logging."""
@@ -296,8 +304,54 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             
             self.agent_actions[agent] = action
         
-        self.robot_forces_t = self.agent_actions["robot"]
-        self.human_forces_t = self.agent_actions["human"]
+        # The environment is the single owner of the physical robot-force limit.
+        self.robot_forces_t = torch.clamp(
+            self.agent_actions["robot"],
+            -self.max_robot_force,
+            self.max_robot_force,
+        )
+        human_result = self.human_force_controller.compose(
+            policy_force=self.agent_actions["human"],
+            eef_position=self._get_stylus_position(),
+            eef_velocity=self._get_stylus_velocity(),
+        )
+        self.human_policy_forces_t = human_result.policy
+        self.human_impedance_forces_t = human_result.impedance
+        self.human_residual_forces_t = human_result.residual
+        self.human_forces_t = human_result.total
+        self.human_reference_position_t = human_result.reference_position
+        self.human_reference_velocity_t = human_result.reference_velocity
+
+        # Milestone evaluation advances only one environment. Apply this mask
+        # after human-force composition so fixed/residual impedance cannot bypass
+        # the single-environment evaluation contract.
+        if self._evaluation_force_mask is not None:
+            force_mask = self._evaluation_force_mask
+            self.robot_forces_t = self.robot_forces_t * force_mask
+            self.human_policy_forces_t = self.human_policy_forces_t * force_mask
+            self.human_impedance_forces_t = self.human_impedance_forces_t * force_mask
+            self.human_residual_forces_t = self.human_residual_forces_t * force_mask
+            self.human_forces_t = self.human_forces_t * force_mask
+            for agent in self.cfg.possible_agents:
+                self.actor_mean_forces[agent] = self.actor_mean_forces[agent] * force_mask
+                self.actor_noise_forces[agent] = self.actor_noise_forces[agent] * force_mask
+
+        self.agent_actions["robot"] = self.robot_forces_t
+        self.agent_actions["human"] = self.human_forces_t
+        self.combined_forces_t = self.robot_forces_t + self.human_forces_t
+
+        self._last_force_breakdown = {
+            "human_policy": self.human_policy_forces_t.detach().clone(),
+            "human_impedance": self.human_impedance_forces_t.detach().clone(),
+            "human_residual": self.human_residual_forces_t.detach().clone(),
+            "human": self.human_forces_t.detach().clone(),
+            "robot": self.robot_forces_t.detach().clone(),
+            "combined": self.combined_forces_t.detach().clone(),
+        }
+
+        # StepTracer should display the force that reaches the environment, not
+        # the raw residual command used by the human policy.
+        self.actor_mean_forces["human"] = self.human_forces_t.clone()
         
         self._apply_external_forces()
         self._enforce_joint_constraints()
@@ -305,22 +359,66 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     def set_detail_actor_info(self, detail_info: Dict[str, Any]) -> None:
         """Set detail information from MADDPG actor outputs for console logging."""
         self._detail_actor_info = detail_info
+
+    @property
+    def evaluation_active_env_id(self) -> int | None:
+        """Environment index physically enabled during in-place evaluation."""
+        return self._evaluation_active_env_id
+
+    def set_evaluation_active_env(self, env_id: int) -> None:
+        """Enable physical forces for exactly one environment during evaluation."""
+        env_id = int(env_id)
+        if env_id < 0 or env_id >= self.num_envs:
+            raise IndexError(
+                f"Evaluation environment index {env_id} is outside [0, {self.num_envs})"
+            )
+        force_mask = torch.zeros((self.num_envs, 1), device=self.device)
+        force_mask[env_id] = 1.0
+        self._evaluation_active_env_id = env_id
+        self._evaluation_force_mask = force_mask
+
+    def clear_evaluation_active_env(self) -> None:
+        """Restore physical forces for all environments after evaluation."""
+        self._evaluation_active_env_id = None
+        self._evaluation_force_mask = None
         
     def _apply_external_forces(self) -> None:
         """Apply external forces to the robot end-effector."""
-        total_forces = self.robot_forces_t + self.human_forces_t
+        total_forces = self.combined_forces_t
         stylus_quat = self._omni_robot.data.body_link_quat_w[:, self.stylus_body_idx, :]
         
-        forces_local = quat_rotate_inverse(stylus_quat, total_forces)
+        forces_local = quat_apply_inverse(stylus_quat, total_forces)
         
         forces_with_body_dim = forces_local.unsqueeze(1)
         torques_with_body_dim = torch.zeros_like(forces_with_body_dim)
         
-        self._omni_robot.set_external_force_and_torque(
-            forces_with_body_dim, 
-            torques_with_body_dim,
-            body_ids=[self.stylus_body_idx]
+        self._omni_robot.permanent_wrench_composer.set_forces_and_torques(
+            forces=forces_with_body_dim,
+            torques=torques_with_body_dim,
+            body_ids=[self.stylus_body_idx],
         )
+
+    def compute_next_impedance_force(self) -> torch.Tensor:
+        """Compute impedance for the post-step state without mutating current-step caches."""
+        impedance, _, _ = self.human_force_controller.compute_impedance(
+            self._get_stylus_position(), self._get_stylus_velocity()
+        )
+        return impedance
+
+    def get_applied_agent_actions(self) -> Dict[str, torch.Tensor]:
+        """Return the physical actions that produced the latest transition."""
+        return {
+            "human": self._last_force_breakdown["human"].clone(),
+            "robot": self._last_force_breakdown["robot"].clone(),
+        }
+
+    def get_applied_impedance_force(self) -> torch.Tensor:
+        """Return the impedance request associated with the latest transition."""
+        return self._last_force_breakdown["human_impedance"].clone()
+
+    def get_force_breakdown(self) -> Dict[str, torch.Tensor]:
+        """Return force channels that produced the latest transition."""
+        return {name: force.clone() for name, force in self._last_force_breakdown.items()}
         
     def _enforce_joint_constraints(self) -> None:
         """Enforce joint limits and fix end joints for stable operation."""
@@ -338,8 +436,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         """Apply actions to simulation."""
         self._omni_robot.write_data_to_sim()
 
-    def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """Compute observations for all agents and update state cache."""
+    def _refresh_state_cache(self) -> None:
+        """Refresh post-physics state once per simulator control step."""
+        sim_step = int(self._sim_step_counter)
+        if self._state_cache_sim_step == sim_step:
+            return
+
         self.stylus_pos_t1 = self._get_stylus_position()
         self.stylus_vel_t1 = self._get_stylus_velocity()
 
@@ -354,6 +456,11 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self.safety_distances_t1 = self.constraint_results_t1['distances_constraint']
         self.is_violating_t1 = self.constraint_results_t1['is_overlapping']
         self.normal_t1 = self.constraint_results_t1['normal_vectors']
+        self._state_cache_sim_step = sim_step
+
+    def _get_observations(self) -> Dict[str, torch.Tensor]:
+        """Compute observations for all agents from the latest state cache."""
+        self._refresh_state_cache()
 
         constraint_distances = self.safety_distances_t1.unsqueeze(-1)     # [N,1]
 
@@ -622,6 +729,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
         """Four-zone reward system with robot/human symmetric rewards."""
+        self._refresh_state_cache()
         self.reward_components = {}
         masks = self._build_zone_masks()
 
@@ -724,6 +832,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Determine termination and truncation conditions for all agents."""
+        self._refresh_state_cache()
         z_below_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.enable_z_termination:
             z_below_zero = self.stylus_pos_t1[:, 2] < self.min_z_pos
@@ -748,6 +857,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             env_ids = torch.arange(self.num_envs, device=self.device)
 
         super()._reset_idx(env_ids)
+        # Reset changes physical state without advancing the simulator counter.
+        # Force the following observation query to refresh reset-state caches.
+        self._state_cache_sim_step = None
         
         if self.stylus_body_idx is None:
             self._initialize_body_indices()
@@ -771,6 +883,12 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         self.human_forces_t[env_ids] = 0.0
         self.robot_forces_t[env_ids] = 0.0
+        self.human_policy_forces_t[env_ids] = 0.0
+        self.human_impedance_forces_t[env_ids] = 0.0
+        self.human_residual_forces_t[env_ids] = 0.0
+        self.combined_forces_t[env_ids] = 0.0
+        self.human_reference_position_t[env_ids] = 0.0
+        self.human_reference_velocity_t[env_ids] = 0.0
         self.safety_distances_t1[env_ids] = 0.01
         self.is_violating_t1[env_ids] = False
         self.normal_t1[env_ids] = torch.zeros((num_resets, 3), device=self.device)
@@ -797,6 +915,6 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         
         vel_world = self._omni_robot.data.body_link_lin_vel_w[:, self.stylus_body_idx, :]
         base_quat = self._omni_robot.data.root_link_quat_w
-        vel_local = quat_rotate_inverse(base_quat, vel_world)
+        vel_local = quat_apply_inverse(base_quat, vel_world)
         
         return vel_local

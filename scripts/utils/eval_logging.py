@@ -276,8 +276,15 @@ class EvalRecorder:
         self._current_steps.append(record)
 
         # Force records
-        forces_dict = detail.get("applied_forces") or detail.get("mean_actions") or {}
-        for aid in self.agent_ids:
+        forces_dict = (
+            detail.get("force_breakdown")
+            or detail.get("applied_forces")
+            or detail.get("mean_actions")
+            or {}
+        )
+        force_channels = list(dict.fromkeys([*self.agent_ids, *forces_dict.keys()]))
+        for aid in force_channels:
+            self._current_forces.setdefault(aid, [])
             fx = fy = fz = f_norm = 0.0
             if aid in forces_dict:
                 tensor = forces_dict[aid]
@@ -369,8 +376,8 @@ class EvalRecorder:
         # Persist current episode data to global storage
         self.episode_summaries.append(summary)
         self.all_step_records.extend(self._current_steps)
-        for aid in self.agent_ids:
-            self.all_force_records[aid].extend(self._current_forces[aid])
+        for aid, records in self._current_forces.items():
+            self.all_force_records.setdefault(aid, []).extend(records)
         self.all_position_records.extend(self._current_positions)
 
         # Reset episode state
@@ -437,8 +444,7 @@ class EvalRecorder:
                     ]
                 )
 
-        for aid in self.agent_ids:
-            force_records = self.all_force_records[aid]
+        for aid, force_records in self.all_force_records.items():
             if not force_records:
                 continue
             force_path = os.path.join(save_dir, f"forces_{aid}.csv")

@@ -17,6 +17,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": "surgical_project.envs.multi_agent.surgical_direct_marl_env_cfg:SurgicalDirectMARLEnvCfg",
     },
+    disable_env_checker=True,
 )
 
 print(f"[INFO] Successfully registered Isaac-Surgical-MARL-Direct-v0")

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg, AssetBaseCfg
@@ -10,6 +12,9 @@ from isaaclab.envs import DirectMARLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+
+
+ASSET_USD_DIR = Path(__file__).resolve().parents[4] / "assets" / "models" / "usd"
 
 
 @configclass
@@ -32,6 +37,9 @@ class MySceneCfg(InteractiveSceneCfg):
 @configclass
 class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     """Configuration for Surgical Direct MARL Environment."""
+
+    # Resolved experiment YAML injected before environment initialization.
+    params: dict | None = None
     
     # Episode configuration
     episode_length_s = 20  # Episode length in seconds
@@ -50,7 +58,9 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
         "robot": 6, # Corrected to actual dimensions
     }
     
-    state_space = 38
+    # MADDPG constructs its centralized critic input from joint observations.
+    # No separate environment-level state is exposed.
+    state_space = 0
 
     # Physics simulation configuration
     sim: SimulationCfg = SimulationCfg(
@@ -78,7 +88,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     phantom_omni = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/shared_control_isaac_sim/assets/models/usd/omni.usd",
+            usd_path=str(ASSET_USD_DIR / "omni.usd"),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_linear_velocity=0.06,   # Limited for safety
@@ -115,42 +125,42 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
             },
         ),
         # Individual actuator configuration for each joint
-        # Note: effort_limit here is different from YAML force constraints
-        # effort_limit is joint torque limit, max_robot_force is end-effector force limit
+        # Note: effort_limit_sim here is different from YAML force constraints.
+        # It is a joint torque limit; max_robot_force is an end-effector force limit.
         actuators={
             "waist_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["waist"],
-                effort_limit=5.0,   # Joint torque limit (Nm)
+                effort_limit_sim=5.0,  # Joint torque limit (Nm)
                 stiffness=0.0,      # Zero stiffness for force control
                 damping=0.0,        # Zero damping for free motion
             ),
             "shoulder_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["shoulder"],
-                effort_limit=5.0,
+                effort_limit_sim=5.0,
                 stiffness=0.0,
                 damping=0.0,
             ),
             "elbow_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["elbow"],
-                effort_limit=5.0,
+                effort_limit_sim=5.0,
                 stiffness=0.0,
                 damping=0.0,
             ),
             "yaw_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["yaw"],
-                effort_limit=5.0,
+                effort_limit_sim=5.0,
                 stiffness=0.0,
                 damping=0.0,
             ),
             "pitch_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["pitch"],
-                effort_limit=5.0,
+                effort_limit_sim=5.0,
                 stiffness=0.0,
                 damping=0.0,
             ),
             "roll_actuator": ImplicitActuatorCfg(
                 joint_names_expr=["roll"],
-                effort_limit=5.0,
+                effort_limit_sim=5.0,
                 stiffness=0.0,
                 damping=0.0,
             ),
@@ -161,7 +171,7 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     constraint = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Constraint", 
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/zzh/workspace/shared_control_isaac_sim/assets/models/usd/sphere.usd",
+            usd_path=str(ASSET_USD_DIR / "sphere.usd"),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,   # Kinematic object (doesn't respond to forces)
                 disable_gravity=True,     # No gravity effect

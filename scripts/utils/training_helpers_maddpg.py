@@ -95,6 +95,15 @@ class TrainingRunner:
         # Environment interaction
         next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
 
+        actual_env = getattr(self.env, "unwrapped", self.env)
+        if hasattr(actual_env, "get_force_breakdown"):
+            breakdown = actual_env.get_force_breakdown()
+            detail["force_breakdown"] = breakdown
+            detail["applied_forces"] = {
+                "human": breakdown["human"],
+                "robot": breakdown["robot"],
+            }
+
         # Store joint transitions
         done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
         
@@ -166,30 +175,68 @@ class TrainingRunner:
 
     def _push_current_step_force_statistics(self, detail):
         """Push current step's force statistics to WandB."""
-        if "mean_actions" not in detail:
-            return
-        
         force_payload = {}
-        
-        # Robot forces - current step all environments average
-        if "robot" in detail["mean_actions"]:
-            robot_forces = detail["mean_actions"]["robot"]  # [num_envs, 3]
-            robot_mean = robot_forces.mean(dim=0)  # [3] - current step cross-environment mean
+
+        breakdown = detail.get("force_breakdown", {}) if isinstance(detail, dict) else {}
+        if not breakdown:
+            source = detail.get("mean_actions", {}) if isinstance(detail, dict) else {}
+            breakdown = {k: v for k, v in source.items() if k in {"human", "robot"}}
+
+        for channel in (
+            "human_impedance",
+            "human_residual",
+            "human",
+            "robot",
+            "combined",
+        ):
+            forces = breakdown.get(channel)
+            if forces is None:
+                continue
+            mean_xyz = forces.mean(dim=0)
+            norms = torch.linalg.vector_norm(forces, dim=-1)
             force_payload.update({
-                "forces/robot_fx_mean": float(robot_mean[0].item()),
-                "forces/robot_fy_mean": float(robot_mean[1].item()),
-                "forces/robot_fz_mean": float(robot_mean[2].item()),
+                f"forces/{channel}_fx_mean": float(mean_xyz[0].item()),
+                f"forces/{channel}_fy_mean": float(mean_xyz[1].item()),
+                f"forces/{channel}_fz_mean": float(mean_xyz[2].item()),
+                f"forces/{channel}_norm_mean": float(norms.mean().item()),
+                f"forces/{channel}_norm_rms": float(torch.sqrt(torch.mean(norms.square())).item()),
             })
-        
-        # Human forces - current step all environments average  
-        if "human" in detail["mean_actions"]:
-            human_forces = detail["mean_actions"]["human"]  # [num_envs, 3]
-            human_mean = human_forces.mean(dim=0)  # [3] - current step cross-environment mean
-            force_payload.update({
-                "forces/human_fx_mean": float(human_mean[0].item()),
-                "forces/human_fy_mean": float(human_mean[1].item()),
-                "forces/human_fz_mean": float(human_mean[2].item()),
-            })
+
+        residual = breakdown.get("human_residual")
+        if residual is not None:
+            residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+            force_payload["forces/human_residual_norm_p95"] = float(
+                torch.quantile(residual_norm, 0.95).item()
+            )
+
+        human = breakdown.get("human")
+        if human is not None:
+            max_human_force = float(
+                self.maddpg.params.get("constraints", {}).get("max_human_force", 0.04)
+            )
+            saturated = torch.isclose(
+                human.abs(),
+                torch.tensor(max_human_force, device=human.device, dtype=human.dtype),
+                atol=1e-6,
+                rtol=0.0,
+            )
+            force_payload["forces/human_saturation_fraction"] = float(
+                saturated.float().mean().item()
+            )
+
+        if all(name in breakdown for name in ("human", "robot", "combined")):
+            composition_error = breakdown["combined"] - (
+                breakdown["human"] + breakdown["robot"]
+            )
+            force_payload["forces/composition_error_max"] = float(
+                composition_error.abs().max().item()
+            )
+            force_payload["forces/composition_error_mean"] = float(
+                composition_error.abs().mean().item()
+            )
+
+        if self.maddpg.human_model_type == "fixed_impedance":
+            force_payload["human/fixed_actor_checksum"] = self.maddpg.human_actor_checksum()
         
         # Push to MetricsHub for WandB logging
         if force_payload:
@@ -253,13 +300,28 @@ class MilestoneEvaluator:
         return {"skip_episode_once": True}
 
     def _run_single_evaluation_episode(self):
-        """Run single environment evaluation episode with proper action masking and display."""
+        """Run env0 evaluation and always restore normal parallel physics."""
         active_env = 0
-        target_episodes = 1
-        
-        print(f"[EVAL] Starting in-place evaluation (env0 only, 1 episode)...")
-        
         env = getattr(self.env, "unwrapped", self.env)
+        if not hasattr(env, "set_evaluation_active_env"):
+            raise RuntimeError(
+                "Environment does not support single-environment physical evaluation"
+            )
+
+        env.set_evaluation_active_env(active_env)
+        try:
+            return self._run_active_evaluation_episode(env, active_env)
+        finally:
+            env.clear_evaluation_active_env()
+            env.reset()
+            print("[EVAL] Environment reset back to parallel training mode")
+
+    def _run_active_evaluation_episode(self, env, active_env: int):
+        """Evaluate and record only the selected physical environment."""
+        target_episodes = 1
+
+        print(f"[EVAL] Starting in-place evaluation (env{active_env} only, 1 episode)...")
+
         obs, _ = env.reset()
         print(f"[EVAL] Environment reset for independent evaluation")
         
@@ -286,28 +348,9 @@ class MilestoneEvaluator:
                 
                 # Select actions deterministically (no noise during evaluation)
                 actions, detail_info = self.maddpg.select_actions(current_obs, add_noise=False, noise_scale=0.0)
-                
-                # Apply complete action masking to both actions AND detail_info
-                for aid, act in actions.items():
-                    if act.ndim == 2:
-                        # Mask actions - only env0 executes real actions, others get zero
-                        masked_actions = torch.zeros_like(act)
-                        masked_actions[active_env] = act[active_env]
-                        actions[aid] = masked_actions
-                        
-                        # Also mask the detail info to reflect actual forces being applied
-                        if aid in detail_info['mean_actions']:
-                            masked_mean = torch.zeros_like(detail_info['mean_actions'][aid])
-                            masked_mean[active_env] = detail_info['mean_actions'][aid][active_env]
-                            detail_info['mean_actions'][aid] = masked_mean
-                        
-                        if aid in detail_info['noise_actions']:
-                            # In evaluation, noise should be zero anyway, but mask for consistency
-                            masked_noise = torch.zeros_like(detail_info['noise_actions'][aid])
-                            masked_noise[active_env] = detail_info['noise_actions'][aid][active_env]  # Should be 0 anyway
-                            detail_info['noise_actions'][aid] = masked_noise
-                
-                # Set detail info to environment AFTER masking for correct display
+
+                # The environment owns the physical single-env force mask. This
+                # keeps fixed/residual impedance and policy forces consistent.
                 env.set_detail_actor_info(detail_info)
                 
                 obs, rewards, terminated, truncated, infos = env.step(actions)
@@ -358,11 +401,7 @@ class MilestoneEvaluator:
         avg_return_norm = sum(final_return_norms) / max(1, len(final_return_norms))
         
         print(f"[EVAL] Completed: {len(final_return_norms)} episodes, Average return_norm: {avg_return_norm:.4f}")
-        
-        # Reset environment back to training state
-        _, _ = env.reset()
-        print(f"[EVAL] Environment reset back to training mode")
-        
+
         return avg_return_norm, len(final_return_norms)
 
 class MetricsHub:
@@ -450,8 +489,14 @@ class WandBLogger:
             project=self.project_name,
             name=run_name,
             config=config,
-            tags=["maddpg", "multi-agent", "surgical-robot", "residual-networks", "async-updates"],
-            notes="Multi-environment parallel MADDPG training with residual networks, noise scheduling, and async critic-actor updates",
+            tags=[
+                "maddpg",
+                "multi-agent",
+                "surgical-robot",
+                str(config.get("human_model_type", "learnable")),
+                "async-updates",
+            ],
+            notes="MADDPG shared-control experiment with configurable human force model",
             settings=wandb.Settings(start_method="thread")
         )
         
@@ -465,7 +510,10 @@ class WandBLogger:
             "critic_update_interval": maddpg_cfg.get("update_interval", 100),
             "actor_update_interval": maddpg_cfg.get("update_interval", 100) * 2,  # Actor updates 2x slower
             "reward_scale": 0.01,
-            "agent_mode": "robot_only",
+            "agent_mode": (
+                "robot_only" if config.get("human_model_type") == "fixed_impedance"
+                else "human_and_robot"
+            ),
             "reward_components": "trajectory+progress+potential_field",
             "termination_mode": "direct_obstacle_collision",
             "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
@@ -537,6 +585,15 @@ class WandBLogger:
             if src_key in metrics_data and metrics_data[src_key] is not None:
                 log_data[dest_key] = metrics_data[src_key]
 
+        # Human-model force channels are intentionally extensible. Passing
+        # them through avoids maintaining a brittle one-key-at-a-time map.
+        for key, value in metrics_data.items():
+            if key.startswith(("forces/", "human/")) and value is not None:
+                try:
+                    log_data.setdefault(key, float(value))
+                except (TypeError, ValueError):
+                    pass
+
         if log_data:
             wandb.log(log_data, step=step)
 
@@ -589,6 +646,11 @@ def save_milestone_checkpoint_maddpg(
         "training_steps_total": int(getattr(maddpg, "training_steps", 0)),
         "actor_update_count": int(getattr(maddpg, "actor_update_count", 0)),
         "critic_update_count": int(getattr(maddpg, "critic_update_count", 0)),
+        "human_model_type": getattr(maddpg, "human_model_type", "learnable"),
+        "human_impedance": maddpg.params.get("human_impedance", {}),
+        "force_limit_semantics": "per_axis",
+        "git_commit": maddpg.params.get("git_commit", "unknown"),
+        "human_actor_checksum": maddpg.human_actor_checksum(),
     }
 
     for agent_id in maddpg.agent_ids:
@@ -620,6 +682,47 @@ def save_milestone_checkpoint_maddpg(
         fname,
     )
     print(f"[CKPT] Saved milestone {milestone} (score={score:.4f}) -> {fpath}")
+    return fpath
+
+
+def save_final_checkpoint_maddpg(maddpg, runner, ckpt_dir: str) -> str:
+    """Save a resume-compatible checkpoint at the configured training limit."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    global_step = int(getattr(runner, "global_step", 0))
+    fpath = os.path.join(ckpt_dir, f"final_step_{global_step:09d}.pth")
+    checkpoint = {
+        "algorithm": "maddpg_shared",
+        "agent_ids": maddpg.agent_ids,
+        "params": maddpg.params,
+        "global_steps_total": global_step,
+        "episodes_done_total": int(getattr(runner, "global_episodes", 0)),
+        "training_steps_total": int(getattr(maddpg, "training_steps", 0)),
+        "actor_update_count": int(getattr(maddpg, "actor_update_count", 0)),
+        "critic_update_count": int(getattr(maddpg, "critic_update_count", 0)),
+        "human_model_type": getattr(maddpg, "human_model_type", "learnable"),
+        "human_impedance": maddpg.params.get("human_impedance", {}),
+        "force_limit_semantics": "per_axis",
+        "git_commit": maddpg.params.get("git_commit", "unknown"),
+        "human_actor_checksum": maddpg.human_actor_checksum(),
+    }
+    optim_state = {}
+    for agent_id in maddpg.agent_ids:
+        agent = maddpg.agents[agent_id]
+        checkpoint[f"{agent_id}_actor"] = agent.actor.state_dict()
+        checkpoint[f"{agent_id}_critic"] = agent.critic.state_dict()
+        checkpoint[f"{agent_id}_actor_target"] = agent.actor_target.state_dict()
+        checkpoint[f"{agent_id}_critic_target"] = agent.critic_target.state_dict()
+        optim_state[f"{agent_id}_actor"] = agent.actor_optimizer.state_dict()
+        optim_state[f"{agent_id}_critic"] = agent.critic_optimizer.state_dict()
+    checkpoint["optim_state"] = optim_state
+    checkpoint["rng_state"] = {
+        "py": random.getstate(),
+        "np": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    torch.save(checkpoint, fpath)
+    print(f"[CKPT] Saved final checkpoint -> {fpath}")
     return fpath
 
 
@@ -679,8 +782,17 @@ def resume_from_checkpoint_maddpg(path: str, maddpg, runner=None, device: Option
         print("[RESUME] Optimizer states restored.")
 
     if "params" in ckpt and isinstance(ckpt["params"], dict):
-        maddpg.params = ckpt["params"]
-        print("[RESUME] Updated maddpg.params from checkpoint.")
+        checkpoint_mode = str(ckpt["params"].get("human_model_type", "learnable"))
+        current_mode = str(maddpg.params.get("human_model_type", "learnable"))
+        if checkpoint_mode != current_mode:
+            raise ValueError(
+                "Checkpoint human_model_type does not match the resolved training "
+                f"configuration: checkpoint={checkpoint_mode}, current={current_mode}"
+            )
+        # The trainer reconstructs and resolves checkpoint params before creating
+        # MADDPG.  Keep that resolved object here so explicit runtime overrides
+        # (for example a larger max_global_steps) are not silently discarded.
+        print("[RESUME] Checkpoint human model metadata validated.")
 
     maddpg.training_steps = int(ckpt.get("training_steps_total", getattr(maddpg, "training_steps", 0)))
     maddpg.actor_update_count = int(ckpt.get("actor_update_count", getattr(maddpg, "actor_update_count", 0)))
@@ -713,9 +825,27 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=config_path)
     
     # Environment configuration
-    parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=None,
+        help="Number of parallel environments (new-run default: 512; resume: checkpoint value)",
+    )
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (default: use resolved config/checkpoint seed)")
+    parser.add_argument(
+        "--human_model_type",
+        choices=("learnable", "fixed_impedance", "residual_impedance"),
+        default=None,
+        help="Override the human force model for a new run",
+    )
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Explicit output directory for resolved config, checkpoints, and logs",
+    )
     
     # Training termination - removed default value to allow proper priority handling in trainer
     parser.add_argument(

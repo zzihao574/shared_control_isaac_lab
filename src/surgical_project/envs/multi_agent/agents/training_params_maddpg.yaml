@@ -6,6 +6,23 @@
 # ==============================================================================
 seed: 42
 
+# Human force model. Missing key remains backward-compatible with "learnable".
+human_model_type: "learnable"  # learnable | fixed_impedance | residual_impedance
+
+human_impedance:
+  kp: [0.8, 0.8, 0.8]              # Position gains (N/m)
+  kd: [0.1, 0.1, 0.1]              # Velocity gains (N*s/m)
+  lookahead_distance: 0.04          # Look-ahead equilibrium distance (m)
+  reference_speed: 0.02             # Tangential reference speed (m/s)
+
+# Residual uses the existing human actor's full per-axis force range. It can
+# therefore cancel or reverse the impedance prior before total-force clipping.
+human_residual:
+  mapping: "policy_tanh_times_max_human_force"
+  can_override_impedance: true
+
+force_limit_semantics: "per_axis"
+
 # ==============================================================================
 # Network Architecture Configuration with Residual Connections
 # ==============================================================================
@@ -42,7 +59,7 @@ exploration:
 # Logging Configuration
 # ==============================================================================
 logging:
-  enable_console_logging: true  # Enable detailed console logging for debugging
+  enable_console_logging: false  # Enable detailed console logging for debugging
 
 # ==============================================================================
 # Trajectory Parameters (Task Logic)

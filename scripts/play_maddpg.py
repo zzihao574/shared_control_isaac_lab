@@ -12,6 +12,7 @@ Features:
 """
 
 import argparse
+import copy
 import os
 import sys
 from typing import Dict, Optional
@@ -137,8 +138,13 @@ def load_maddpg_checkpoint(maddpg, checkpoint_path: str):
         )
 
     if "params" in ckpt and isinstance(ckpt["params"], dict):
-        maddpg.params = ckpt["params"]
-        print("[LOAD] MADDPG params updated from checkpoint.")
+        checkpoint_mode = str(ckpt["params"].get("human_model_type", "learnable"))
+        if checkpoint_mode != maddpg.human_model_type:
+            raise ValueError(
+                "Checkpoint human_model_type does not match the evaluation "
+                f"configuration: checkpoint={checkpoint_mode}, current={maddpg.human_model_type}"
+            )
+        print("[LOAD] Checkpoint human model metadata validated.")
 
     # Optional metadata
     for key in ("milestone", "score", "global_steps_total", "episodes_done_total"):
@@ -170,6 +176,12 @@ def evaluate(args):
     config_path = resolve_config_path(args.config, args.checkpoint)
     print(f"[SETUP] Using config: {config_path}")
     config = TrainingConfiguration.from_yaml(config_path)
+    checkpoint_meta = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=False
+    )
+    if isinstance(checkpoint_meta.get("params"), dict):
+        config.params = copy.deepcopy(checkpoint_meta["params"])
+        print("[SETUP] Restored resolved configuration embedded in checkpoint.")
 
     setup_global_reproducibility(args.seed, strict_determinism=True)
 
@@ -211,6 +223,7 @@ def evaluate(args):
                 project="maddpg_evaluation",
                 run_name=run_name,
                 config={
+                    **config.params,
                     "checkpoint": args.checkpoint,
                     "config_path": config_path,
                     "task": args.task,
@@ -239,6 +252,13 @@ def evaluate(args):
             )
             actual_env.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, info = env.step(actions)
+            if hasattr(actual_env, "get_force_breakdown"):
+                breakdown = actual_env.get_force_breakdown()
+                detail["force_breakdown"] = breakdown
+                detail["applied_forces"] = {
+                    "human": breakdown["human"],
+                    "robot": breakdown["robot"],
+                }
             recorder.record_step(step, env, rewards, info, detail)
 
             done_mask = None

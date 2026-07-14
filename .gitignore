@@ -23,6 +23,9 @@
 !/scripts/utils/training_helpers_epigraph.py
 !/scripts/utils/eval_logging.py
 !/src/
+!/tests/
+!/tests/test_human_force_controller.py
+!/tests/test_maddpg_human_modes.py
 
 # 忽略缓存
 **/__pycache__/

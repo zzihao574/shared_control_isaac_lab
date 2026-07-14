@@ -7,9 +7,13 @@ Features configurable architectures, noise scheduling, and milestone evaluation.
 
 import sys
 import os
+import copy
+import json
+import subprocess
 import torch
 import numpy as np
 import random
+import yaml
 from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import warnings
@@ -28,6 +32,7 @@ from utils.training_helpers_maddpg import (
     TrainingRunner,
     MilestoneEvaluator,
     resume_from_checkpoint_maddpg,
+    save_final_checkpoint_maddpg,
 )
 
 
@@ -63,6 +68,7 @@ def setup_environment(args, config):
     env_cfg = SurgicalDirectMARLEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
+    env_cfg.params = config.params
     
     env = gym.make(args.task, cfg=env_cfg)
     return env, env_cfg
@@ -137,15 +143,108 @@ class MADDPGTrainer:
         """Load and setup training configuration with per-env scaling."""
         print(f"[SETUP] Loading configuration from: {self.args.config}")
         self.config = TrainingConfiguration.from_yaml(self.args.config)
+
+        # A resumed run must reconstruct the experiment from the checkpoint,
+        # not silently from whatever the current default YAML contains.
+        if self.args.checkpoint:
+            checkpoint = torch.load(
+                self.args.checkpoint, map_location="cpu", weights_only=False
+            )
+            checkpoint_params = checkpoint.get("params")
+            if isinstance(checkpoint_params, dict):
+                self.config.params = copy.deepcopy(checkpoint_params)
+                print("[SETUP] Restored resolved configuration from checkpoint")
+
+        configured_seed = int(self.config.params.get("seed", 42))
+        if self.args.checkpoint and self.args.seed is not None and int(self.args.seed) != configured_seed:
+            raise ValueError(
+                "Cannot resume with a different seed than the checkpoint: "
+                f"checkpoint={configured_seed}, CLI={self.args.seed}"
+            )
+        self.args.seed = configured_seed if self.args.seed is None else int(self.args.seed)
+
+        runtime = self.config.params.get("runtime", {})
+        checkpoint_num_envs = int(runtime.get("num_envs", 512))
+        if self.args.checkpoint:
+            if self.args.num_envs is not None and int(self.args.num_envs) != checkpoint_num_envs:
+                raise ValueError(
+                    "Cannot resume with a different num_envs than the checkpoint: "
+                    f"checkpoint={checkpoint_num_envs}, CLI={self.args.num_envs}"
+                )
+            self.args.num_envs = checkpoint_num_envs
+        elif self.args.num_envs is None:
+            self.args.num_envs = 512
+        checkpoint_model_type = str(
+            self.config.params.get("human_model_type", "learnable")
+        )
+        if self.args.human_model_type is not None:
+            if self.args.checkpoint and self.args.human_model_type != checkpoint_model_type:
+                raise ValueError(
+                    "Cannot resume a checkpoint with a different human_model_type: "
+                    f"checkpoint={checkpoint_model_type}, CLI={self.args.human_model_type}"
+                )
+            self.config.params["human_model_type"] = self.args.human_model_type
+        else:
+            self.config.params.setdefault("human_model_type", "learnable")
+
+        maddpg_cfg = self.config.params.setdefault("maddpg_config", {})
+        if self.args.max_global_steps > 0:
+            maddpg_cfg["max_global_steps"] = int(self.args.max_global_steps)
+
+        self.config.params["seed"] = self.args.seed
+        self.config.params["runtime"] = {
+            "algorithm": "maddpg",
+            "num_envs": int(self.args.num_envs),
+            "max_global_steps": int(maddpg_cfg.get("max_global_steps", 200000)),
+        }
         
         # Setup global reproducibility
         setup_global_reproducibility(self.args.seed, strict_determinism=True)
-        self.config.params['seed'] = self.args.seed
         
         print(f"[SETUP] Configuration loaded, global reproducibility set: {self.args.seed}")
         
-        # Apply per-env scaling
-        self._apply_per_env_scaling()
+        # Checkpoints already contain the runtime-scaled replay/milestone values.
+        if self.args.checkpoint:
+            print("[SETUP] Keeping checkpoint runtime scaling unchanged")
+        else:
+            self._apply_per_env_scaling()
+
+        self._validate_resolved_configuration()
+
+    def _validate_resolved_configuration(self):
+        """Fail before environment construction when the experiment is inconsistent."""
+        params = self.config.params
+        model_type = str(params.get("human_model_type", "learnable"))
+        supported = {"learnable", "fixed_impedance", "residual_impedance"}
+        if model_type not in supported:
+            raise ValueError(
+                f"Unsupported human_model_type={model_type!r}; expected {sorted(supported)}"
+            )
+
+        impedance = params.get("human_impedance", {})
+        for gain_name in ("kp", "kd"):
+            gains = impedance.get(gain_name, [0.8, 0.8, 0.8] if gain_name == "kp" else [0.1, 0.1, 0.1])
+            if not isinstance(gains, (list, tuple)) or len(gains) != 3:
+                raise ValueError(f"human_impedance.{gain_name} must contain three values")
+        if float(impedance.get("lookahead_distance", 0.04)) <= 0.0:
+            raise ValueError("human_impedance.lookahead_distance must be positive")
+        if float(impedance.get("reference_speed", 0.02)) < 0.0:
+            raise ValueError("human_impedance.reference_speed must be non-negative")
+
+        constraints = params.get("constraints", {})
+        for limit_name in ("max_human_force", "max_robot_force"):
+            if float(constraints.get(limit_name, 0.04)) <= 0.0:
+                raise ValueError(f"constraints.{limit_name} must be positive")
+
+        trajectory = params.get("trajectory", {})
+        start = np.asarray(trajectory.get("start_point"), dtype=np.float64)
+        end = np.asarray(trajectory.get("end_point"), dtype=np.float64)
+        if start.shape != (3,) or end.shape != (3,) or np.allclose(start, end):
+            raise ValueError("trajectory start_point/end_point must be distinct 3D points")
+        if self.args.num_envs <= 0:
+            raise ValueError("num_envs must be positive")
+
+        print(f"[SETUP] Resolved configuration validated ({model_type})")
 
     def _apply_per_env_scaling(self):
         """
@@ -197,18 +296,71 @@ class MADDPGTrainer:
     def _setup_logging_and_wandb(self):
         """Setup logging directory and WandB integration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = f"logs/maddpg_dual/{timestamp}"
+        human_model_type = self.config.params.get("human_model_type", "learnable")
+        self.log_dir = self.args.run_dir or f"logs/maddpg_dual/{human_model_type}/{timestamp}"
         os.makedirs(self.log_dir, exist_ok=True)
         self.checkpoint_dir = os.path.join(self.log_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         print(f"[SETUP] Log directory created: {self.log_dir}")
         print(f"[SETUP] Checkpoints will be stored in: {self.checkpoint_dir}")
 
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+                text=True,
+            ).strip()
+        except Exception:
+            git_commit = "unknown"
+
+        self.config.params["git_commit"] = git_commit
+        resolved_config_path = os.path.join(self.log_dir, "resolved_config.yaml")
+        with open(resolved_config_path, "w", encoding="utf-8") as config_file:
+            yaml.safe_dump(
+                self.config.params,
+                config_file,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+        manifest = {
+            "algorithm": "maddpg",
+            "human_model_type": human_model_type,
+            "seed": self.args.seed,
+            "num_envs": self.args.num_envs,
+            "max_global_steps": self.config.params["maddpg_config"]["max_global_steps"],
+            "git_commit": git_commit,
+            "resolved_config": resolved_config_path,
+        }
+        with open(os.path.join(self.log_dir, "run_manifest.json"), "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2)
+
         # Initialize WandB
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
-            run_config = {**vars(self.args), **self.config.params}
-            run_name = f"maddpg_dual_{self.args.num_envs}envs_{timestamp}"
+            impedance = self.config.params.get("human_impedance", {})
+            constraints = self.config.params.get("constraints", {})
+            kp = impedance.get("kp", [0.8, 0.8, 0.8])
+            kd = impedance.get("kd", [0.1, 0.1, 0.1])
+            run_config = {
+                **self.config.params,
+                "algorithm": "maddpg",
+                "num_envs": self.args.num_envs,
+                "max_global_steps": self.config.params["maddpg_config"]["max_global_steps"],
+                "experiment/algorithm": "maddpg",
+                "experiment/human_model_type": human_model_type,
+                "experiment/seed": self.args.seed,
+                "human/kp_x": kp[0], "human/kp_y": kp[1], "human/kp_z": kp[2],
+                "human/kd_x": kd[0], "human/kd_y": kd[1], "human/kd_z": kd[2],
+                "human/lookahead_distance": impedance.get("lookahead_distance", 0.04),
+                "human/reference_speed": impedance.get("reference_speed", 0.02),
+                "human/max_force_per_axis": constraints.get("max_human_force", 0.04),
+                "human/residual_limit_per_axis": constraints.get("max_human_force", 0.04),
+                "human/residual_can_override_impedance": True,
+                "robot/max_force_per_axis": constraints.get("max_robot_force", 0.04),
+                "git_commit": git_commit,
+            }
+            self.wandb_run_config = run_config
+            run_name = f"maddpg_{human_model_type}_seed{self.args.seed}_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
             print(f"[SETUP] WandB initialized with run name: {run_name}")
         else:
@@ -289,6 +441,12 @@ class MADDPGTrainer:
             runner=self.runner,
             device=self.config.get_compute_device(),
         )
+        if self.wandb_logger.enabled and self.wandb_logger.run is not None:
+            self.wandb_logger.run.config.update(
+                self.wandb_run_config,
+                allow_val_change=True,
+            )
+            print("[SETUP] WandB config synchronized with resumed resolved config")
         print(f"[SETUP] Resumed from checkpoint: {self.args.checkpoint}")
 
     def _setup_milestone_management(self):
@@ -422,6 +580,9 @@ class MADDPGTrainer:
             print(f"  Total episodes: {self.runner.global_episodes}")
             print(f"  Max milestone triggered: {self.max_milestone_triggered}")
             print(f"  Final noise scale: {self.runner._calculate_noise_scale():.4f}")
+            save_final_checkpoint_maddpg(
+                self.maddpg, self.runner, self.checkpoint_dir
+            )
             
             print("\n" + "=" * 70, "\nTraining Complete!\n" + "=" * 70)
             print(f"\nResults saved in: {self.log_dir}")
@@ -463,7 +624,7 @@ def main():
     
     print(f"[MAIN] Arguments parsed:")
     print(f"  Task: {args_cli.task}")
-    print(f"  Environments: {args_cli.num_envs}")
+    print(f"  Environments: {args_cli.num_envs if args_cli.num_envs is not None else 'checkpoint/default'}")
     print(f"  Max steps: {args_cli.max_global_steps if args_cli.max_global_steps > 0 else 'from YAML'}")
     print(f"  WandB: {args_cli.wandb}")
     print(f"  Config: {args_cli.config}")

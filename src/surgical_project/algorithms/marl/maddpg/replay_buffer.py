@@ -24,6 +24,7 @@ class JointReplayBuffer:
     - rewards_all: [capacity, num_agents] - per-agent rewards
     - next_obs_all: [capacity, total_obs_dim] - concatenated next observations
     - done_any: [capacity, 1] - logical OR of agent done signals
+    - impedance / next_impedance: [capacity, 3] - analytic human prior
     """
     
     def __init__(self, capacity: int, total_obs_dim: int, total_action_dim: int, num_agents: int, device: torch.device):
@@ -43,11 +44,15 @@ class JointReplayBuffer:
         self.rew = np.zeros((capacity, num_agents), dtype=np.float32)
         self.nobs = np.zeros((capacity, total_obs_dim), dtype=np.float32)
         self.done_any = np.zeros((capacity, 1), dtype=np.float32)
+        self.impedance = np.zeros((capacity, 3), dtype=np.float32)
+        self.next_impedance = np.zeros((capacity, 3), dtype=np.float32)
         
         print(f"[JOINT BUFFER] Initialized: capacity={capacity}, obs_dim={total_obs_dim}, act_dim={total_action_dim}")
 
     def add(self, obs_all: np.ndarray, act_all: np.ndarray, rewards_vec: np.ndarray, 
-            next_obs_all: np.ndarray, done_any: bool) -> None:
+            next_obs_all: np.ndarray, done_any: bool,
+            impedance: Optional[np.ndarray] = None,
+            next_impedance: Optional[np.ndarray] = None) -> None:
         """Add joint experience to buffer."""
         i = self.ptr
         self.obs[i] = obs_all
@@ -55,11 +60,15 @@ class JointReplayBuffer:
         self.rew[i] = rewards_vec
         self.nobs[i] = next_obs_all
         self.done_any[i] = float(done_any)
+        if impedance is not None:
+            self.impedance[i] = impedance
+        if next_impedance is not None:
+            self.next_impedance[i] = next_impedance
         
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, generator: Optional[torch.Generator] = None) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def sample(self, batch_size: int, generator: Optional[torch.Generator] = None) -> Optional[Tuple[torch.Tensor, ...]]:
         """
         Sample random batch from joint buffer using dedicated generator.
         
@@ -68,7 +77,8 @@ class JointReplayBuffer:
             generator: Optional torch.Generator for reproducible sampling
             
         Returns:
-            Tuple of (obs, actions, rewards, next_obs, dones) tensors or None if insufficient data
+            Tuple of (obs, actions, rewards, next_obs, dones,
+            impedance, next_impedance) tensors or None if insufficient data
         """
         if self.size < batch_size:
             return None
@@ -85,8 +95,10 @@ class JointReplayBuffer:
         rew = torch.from_numpy(self.rew[idx]).to(self.device)      # [B, num_agents]
         nobs = torch.from_numpy(self.nobs[idx]).to(self.device)    # [B, total_obs_dim]
         done = torch.from_numpy(self.done_any[idx]).to(self.device) # [B, 1]
+        impedance = torch.from_numpy(self.impedance[idx]).to(self.device)
+        next_impedance = torch.from_numpy(self.next_impedance[idx]).to(self.device)
         
-        return obs, act, rew, nobs, done
+        return obs, act, rew, nobs, done, impedance, next_impedance
 
     def __len__(self) -> int:
         """Return current buffer size."""

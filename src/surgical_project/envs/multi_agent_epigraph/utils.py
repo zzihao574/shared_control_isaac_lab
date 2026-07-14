@@ -20,9 +20,7 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
-from omni.physx.bindings._physx import (
-    acquire_physx_attachment_interface, acquire_physx_scene_query_interface
-)
+import omni.physx
 from carb._carb import Float3
 
 
@@ -33,12 +31,8 @@ class CompleteConstraintChecker:
         self.device = device
         self.collision_threshold = collision_threshold
         
-        try:
-            self.physics_attachment_interface = acquire_physx_attachment_interface()
-            self.physics_scene_query_interface = acquire_physx_scene_query_interface()
-        except ImportError:
-            self.physics_attachment_interface = None
-            self.physics_scene_query_interface = None
+        self.physics_attachment_interface = omni.physx.get_physx_attachment_private_interface()
+        self.physics_scene_query_interface = omni.physx.get_physx_scene_query_interface()
     
     def analyze_constraint_state_batch(self, stylus_positions: torch.Tensor, env_base_positions: torch.Tensor):
         """Analyze constraint states for batch of environments."""
