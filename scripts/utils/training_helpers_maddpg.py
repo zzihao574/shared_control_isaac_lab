@@ -6,15 +6,149 @@ Features unified training execution, milestone evaluation, and optimized WandB l
 """
 
 import argparse
+import copy
 import os
 import yaml
 import torch
 import numpy as np
 import math
 import random
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Union, Any, Callable, DefaultDict, Deque
+from typing import Dict, List, Optional, Any, Callable, DefaultDict, Deque
 from collections import defaultdict, deque
+
+
+@dataclass(frozen=True)
+class SeedPlan:
+    """Single source of truth for MADDPG random-stream derivation."""
+
+    base_seed: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "base_seed", int(self.base_seed))
+
+    def network_seed(self) -> int:
+        return self.base_seed % (2**32)
+
+    def replay_seed(self) -> int:
+        return (self.base_seed + 424242) % (2**32)
+
+    def exploration_seed(self, agent_index: int, env_id: int) -> int:
+        return (
+            self.base_seed
+            + 1234567
+            + int(agent_index) * 10007
+            + int(env_id) * 97
+        ) % (2**32)
+
+    def apply_network_seed(self) -> None:
+        """Seed PyTorch immediately before deterministic network construction."""
+        torch.manual_seed(self.network_seed())
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.network_seed())
+
+    def make_replay_generator(self) -> torch.Generator:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.replay_seed())
+        return generator
+
+    def make_exploration_generator(
+        self,
+        device: torch.device | str,
+        agent_index: int,
+        env_id: int,
+    ) -> torch.Generator:
+        generator = torch.Generator(device=torch.device(device))
+        generator.manual_seed(self.exploration_seed(agent_index, env_id))
+        return generator
+
+
+def setup_global_reproducibility(
+    seed: int, strict_determinism: bool = True
+) -> None:
+    """Seed process-level RNGs before Isaac Sim is launched."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if strict_determinism:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("[SEED] Strict determinism enabled (may slow down training)")
+
+    print(f"[SEED] Global reproducibility set: seed={seed}")
+
+
+def resolve_startup_seed(args) -> int:
+    """Resolve the seed before AppLauncher from checkpoint, CLI, or YAML."""
+    cli_seed = getattr(args, "seed", None)
+    checkpoint_path = getattr(args, "checkpoint", None)
+
+    if checkpoint_path:
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        checkpoint_params = checkpoint.get("params", {})
+        checkpoint_seed = int(checkpoint_params.get("seed", 42))
+        if cli_seed is not None and int(cli_seed) != checkpoint_seed:
+            raise ValueError(
+                "Cannot resume with a different seed than the checkpoint: "
+                f"checkpoint={checkpoint_seed}, CLI={cli_seed}"
+            )
+        return checkpoint_seed
+
+    if cli_seed is not None:
+        return int(cli_seed)
+
+    with open(args.config, "r", encoding="utf-8") as config_file:
+        params = yaml.safe_load(config_file) or {}
+    return int(params.get("seed", 42))
+
+
+def build_maddpg_wandb_config(
+    resolved_config: Dict[str, Any],
+    runtime: Dict[str, Any],
+    human_metadata: Dict[str, Any],
+    git_commit: str,
+) -> Dict[str, Any]:
+    """Build nested and query-friendly WandB metadata from resolved values."""
+    run_config = copy.deepcopy(resolved_config)
+    termination = resolved_config.get("termination_conditions", {})
+    constraints = resolved_config.get("constraints", {})
+    human_model_type = str(resolved_config.get("human_model_type", "learnable"))
+
+    run_config.update(
+        {
+            "algorithm": "maddpg",
+            "num_envs": int(runtime["num_envs"]),
+            "max_global_steps": int(runtime["max_global_steps"]),
+            "experiment/algorithm": "maddpg",
+            "experiment/human_model_type": human_model_type,
+            "experiment/seed": int(runtime["seed"]),
+            "robot/max_force_per_axis": float(
+                constraints.get("max_robot_force", 0.04)
+            ),
+            "termination/z_below_zero": bool(
+                termination.get("z_below_zero", False)
+            ),
+            "termination/edge_collision": bool(
+                termination.get("edge_collision", True)
+            ),
+            "termination/safety_distance_threshold": float(
+                termination.get("safety_distance_threshold", 0.0)
+            ),
+            "git_commit": git_commit,
+        }
+    )
+    run_config.update(copy.deepcopy(human_metadata))
+    return run_config
 
 # WandB support
 try:
@@ -32,12 +166,10 @@ class TrainingRunner:
     Features exponential noise decay and unified global step tracking.
     """
     
-    def __init__(self, env, maddpg, replay, metrics_hub, reward_logger, agent_ids, max_global_steps=None):
+    def __init__(self, env, maddpg, metrics_hub, agent_ids, max_global_steps=None):
         self.env = env
         self.maddpg = maddpg
-        self.replay = replay
         self.metrics = metrics_hub
-        self.reward_logger = reward_logger  # Can be None now
         self.agent_ids = agent_ids
         self.global_step = 0  # Current training step
         self.global_episodes = 0  # Total episodes completed
@@ -93,16 +225,7 @@ class TrainingRunner:
         self.env.unwrapped.set_detail_actor_info(detail)
 
         # Environment interaction
-        next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
-
-        actual_env = getattr(self.env, "unwrapped", self.env)
-        if hasattr(actual_env, "get_force_breakdown"):
-            breakdown = actual_env.get_force_breakdown()
-            detail["force_breakdown"] = breakdown
-            detail["applied_forces"] = {
-                "human": breakdown["human"],
-                "robot": breakdown["robot"],
-            }
+        next_obs, rewards, terminated, truncated, _ = self.env.step(actions)
 
         # Store joint transitions
         done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
@@ -156,6 +279,9 @@ class TrainingRunner:
 
         # Push force statistics every 10 steps
         if self.global_step % 10 == 0:
+            actual_env = getattr(self.env, "unwrapped", self.env)
+            if hasattr(actual_env, "get_force_breakdown"):
+                detail["force_breakdown"] = actual_env.get_force_breakdown()
             self._push_current_step_force_statistics(detail)
 
         # Step counting and environment synchronization
@@ -242,14 +368,6 @@ class TrainingRunner:
         if force_payload:
             self.metrics.push_update(self.global_step, force_payload)
 
-    def run_until(self, max_global_steps: int):
-        """Run training until reaching maximum steps."""
-        obs, _ = self.env.reset()
-        self._current_obs = obs
-        while self.global_step < max_global_steps:
-            self.execute_training_step()
-
-
 class MilestoneEvaluator:
     """
     Milestone evaluator with single environment evaluation.
@@ -308,10 +426,14 @@ class MilestoneEvaluator:
                 "Environment does not support single-environment physical evaluation"
             )
 
+        had_trainer_step = hasattr(env, "_trainer_global_step")
+        training_global_step = getattr(env, "_trainer_global_step", None)
         env.set_evaluation_active_env(active_env)
         try:
             return self._run_active_evaluation_episode(env, active_env)
         finally:
+            if had_trainer_step:
+                env.set_trainer_global_step(training_global_step)
             env.clear_evaluation_active_env()
             env.reset()
             print("[EVAL] Environment reset back to parallel training mode")
@@ -330,14 +452,10 @@ class MilestoneEvaluator:
         ep_steps = torch.zeros(num_envs, dtype=torch.int64, device='cuda' if torch.cuda.is_available() else 'cpu')
         completed_return_norms = []
         
-        # Get current global step for StepTracer (use training step, don't increment)
-        training_global_step = getattr(env, '_trainer_global_step', 0)
-        eval_step_counter = 0  # Local step counter for evaluation
+        eval_step_counter = 0
         
         with torch.no_grad():
             while len(completed_return_norms) < target_episodes:
-                eval_step_counter += 1
-                
                 # Get current observations
                 if hasattr(env, '_get_observations'):
                     current_obs = env._get_observations()
@@ -352,20 +470,12 @@ class MilestoneEvaluator:
                 # The environment owns the physical single-env force mask. This
                 # keeps fixed/residual impedance and policy forces consistent.
                 env.set_detail_actor_info(detail_info)
-                
-                obs, rewards, terminated, truncated, infos = env.step(actions)
-                
-                # Call StepTracer every 10 eval steps with force_print=True to bypass step frequency check
-                if (hasattr(env, 'step_tracer') and env.step_tracer is not None and 
-                    eval_step_counter % 10 == 0):
-                    # Temporarily enable console logging
-                    original_logging = env.step_tracer.enable_console_logging
-                    env.step_tracer.enable_console_logging = True
-                    
-                    # Use force_print=True to bypass step frequency check during evaluation
-                    env.step_tracer.maybe_print_step(env, rewards, training_global_step, force_print=True)
-                    
-                    env.step_tracer.enable_console_logging = original_logging
+
+                # Reuse the environment's normal StepTracer path. Starting from
+                # zero matches the training cadence (0, 10, 20, ... by default).
+                env.set_trainer_global_step(eval_step_counter)
+                obs, rewards, terminated, truncated, _ = env.step(actions)
+                eval_step_counter += 1
                 
                 # Accumulate env0 rewards and steps
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
@@ -509,13 +619,11 @@ class WandBLogger:
             "update_interval": maddpg_cfg.get("update_interval", 100),
             "critic_update_interval": maddpg_cfg.get("update_interval", 100),
             "actor_update_interval": maddpg_cfg.get("update_interval", 100) * 2,  # Actor updates 2x slower
-            "reward_scale": 0.01,
             "agent_mode": (
                 "robot_only" if config.get("human_model_type") == "fixed_impedance"
                 else "human_and_robot"
             ),
             "reward_components": "trajectory+progress+potential_field",
-            "termination_mode": "direct_obstacle_collision",
             "completion_threshold": config.get("reward_parameters", {}).get("completion_threshold", 0.01),
             # Network configuration
             "actor_layers": networks_cfg.get("actor", {}).get("hidden_layers", []),
@@ -611,7 +719,6 @@ class TrainingConfiguration:
         self.config_path = config_path
         with open(self.config_path, 'r') as f:
             self.params = yaml.safe_load(f)
-        self.maddpg_cfg = self.params.get('maddpg_config', {})
     
     @classmethod
     def from_yaml(cls, config_path: str):
@@ -635,44 +742,12 @@ def save_milestone_checkpoint_maddpg(
     fname = f"ckpt_milestone_{milestone:06d}_score_{score:.6f}.pth"
     fpath = os.path.join(ckpt_dir, fname)
 
-    checkpoint = {
-        "algorithm": "maddpg_shared",
-        "agent_ids": maddpg.agent_ids,
-        "score": float(score),
-        "milestone": int(milestone),
-        "params": maddpg.params,
-        "global_steps_total": int(getattr(runner, "global_step", 0)),
-        "episodes_done_total": int(getattr(runner, "global_episodes", 0)),
-        "training_steps_total": int(getattr(maddpg, "training_steps", 0)),
-        "actor_update_count": int(getattr(maddpg, "actor_update_count", 0)),
-        "critic_update_count": int(getattr(maddpg, "critic_update_count", 0)),
-        "human_model_type": getattr(maddpg, "human_model_type", "learnable"),
-        "human_impedance": maddpg.params.get("human_impedance", {}),
-        "force_limit_semantics": "per_axis",
-        "git_commit": maddpg.params.get("git_commit", "unknown"),
-        "human_actor_checksum": maddpg.human_actor_checksum(),
-    }
-
-    for agent_id in maddpg.agent_ids:
-        agent = maddpg.agents[agent_id]
-        checkpoint[f"{agent_id}_actor"] = agent.actor.state_dict()
-        checkpoint[f"{agent_id}_critic"] = agent.critic.state_dict()
-        checkpoint[f"{agent_id}_actor_target"] = agent.actor_target.state_dict()
-        checkpoint[f"{agent_id}_critic_target"] = agent.critic_target.state_dict()
-
-    optim_state = {}
-    for agent_id in maddpg.agent_ids:
-        agent = maddpg.agents[agent_id]
-        optim_state[f"{agent_id}_actor"] = agent.actor_optimizer.state_dict()
-        optim_state[f"{agent_id}_critic"] = agent.critic_optimizer.state_dict()
-    checkpoint["optim_state"] = optim_state
-
-    checkpoint["rng_state"] = {
-        "py": random.getstate(),
-        "np": np.random.get_state(),
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-    }
+    checkpoint = _build_maddpg_checkpoint(
+        maddpg,
+        runner,
+        score=float(score),
+        milestone=int(milestone),
+    )
 
     torch.save(checkpoint, fpath)
     _append_milestone_index_maddpg(
@@ -690,11 +765,19 @@ def save_final_checkpoint_maddpg(maddpg, runner, ckpt_dir: str) -> str:
     os.makedirs(ckpt_dir, exist_ok=True)
     global_step = int(getattr(runner, "global_step", 0))
     fpath = os.path.join(ckpt_dir, f"final_step_{global_step:09d}.pth")
+    checkpoint = _build_maddpg_checkpoint(maddpg, runner)
+    torch.save(checkpoint, fpath)
+    print(f"[CKPT] Saved final checkpoint -> {fpath}")
+    return fpath
+
+
+def _build_maddpg_checkpoint(maddpg, runner, **extra_fields) -> Dict[str, Any]:
+    """Build the common resume-compatible MADDPG checkpoint payload."""
     checkpoint = {
         "algorithm": "maddpg_shared",
         "agent_ids": maddpg.agent_ids,
         "params": maddpg.params,
-        "global_steps_total": global_step,
+        "global_steps_total": int(getattr(runner, "global_step", 0)),
         "episodes_done_total": int(getattr(runner, "global_episodes", 0)),
         "training_steps_total": int(getattr(maddpg, "training_steps", 0)),
         "actor_update_count": int(getattr(maddpg, "actor_update_count", 0)),
@@ -705,6 +788,8 @@ def save_final_checkpoint_maddpg(maddpg, runner, ckpt_dir: str) -> str:
         "git_commit": maddpg.params.get("git_commit", "unknown"),
         "human_actor_checksum": maddpg.human_actor_checksum(),
     }
+    checkpoint.update(extra_fields)
+
     optim_state = {}
     for agent_id in maddpg.agent_ids:
         agent = maddpg.agents[agent_id]
@@ -721,9 +806,7 @@ def save_final_checkpoint_maddpg(maddpg, runner, ckpt_dir: str) -> str:
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
-    torch.save(checkpoint, fpath)
-    print(f"[CKPT] Saved final checkpoint -> {fpath}")
-    return fpath
+    return checkpoint
 
 
 def _append_milestone_index_maddpg(index_path: str, milestone: int, score: float, fname: str):

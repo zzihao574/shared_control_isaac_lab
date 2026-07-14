@@ -12,10 +12,8 @@ import json
 import subprocess
 import torch
 import numpy as np
-import random
 import yaml
 from datetime import datetime
-from typing import Dict, Any, Tuple, List
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -33,30 +31,11 @@ from utils.training_helpers_maddpg import (
     MilestoneEvaluator,
     resume_from_checkpoint_maddpg,
     save_final_checkpoint_maddpg,
+    SeedPlan,
+    build_maddpg_wandb_config,
+    resolve_startup_seed,
+    setup_global_reproducibility,
 )
-
-
-def setup_global_reproducibility(seed: int, strict_determinism: bool = True):
-    """Setup global reproducibility for consistent training results."""
-    import os
-    import random
-
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    
-    if strict_determinism:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        print(f"[SEED] Strict determinism enabled (may slow down training)")
-    
-    print(f"[SEED] Global reproducibility set: seed={seed}")
 
 
 def setup_environment(args, config):
@@ -91,6 +70,7 @@ def initialize_maddpg_algorithm(env, config, args):
         num_envs=num_envs,
         env=env,
         params=config.params,
+        seed_plan=SeedPlan(config.params.get("seed", args.seed)),
         device=device
     )
     
@@ -198,10 +178,7 @@ class MADDPGTrainer:
             "max_global_steps": int(maddpg_cfg.get("max_global_steps", 200000)),
         }
         
-        # Setup global reproducibility
-        setup_global_reproducibility(self.args.seed, strict_determinism=True)
-        
-        print(f"[SETUP] Configuration loaded, global reproducibility set: {self.args.seed}")
+        print(f"[SETUP] Configuration loaded with startup seed: {self.args.seed}")
         
         # Checkpoints already contain the runtime-scaled replay/milestone values.
         if self.args.checkpoint:
@@ -281,15 +258,7 @@ class MADDPGTrainer:
         """Create and configure the environment."""
         print(f"[SETUP] Creating environment: {self.args.task}")
         self.env, self.env_cfg = setup_environment(self.args, self.config)
-        
-        # Inject configuration to environment
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        if hasattr(actual_env, "params"):
-            actual_env.params = self.config.params
-            print(f"[SETUP] Injected configuration parameters to environment")
-        else:
-            print("[WARNING] Environment does not support config injection")
-        
+
         # Inject StepTracer for console logging
         inject_step_tracer(self.env, self.config, self.args.num_envs)
 
@@ -337,28 +306,18 @@ class MADDPGTrainer:
         # Initialize WandB
         self.wandb_logger = WandBLogger(enabled=self.args.wandb)
         if self.wandb_logger.enabled:
-            impedance = self.config.params.get("human_impedance", {})
-            constraints = self.config.params.get("constraints", {})
-            kp = impedance.get("kp", [0.8, 0.8, 0.8])
-            kd = impedance.get("kd", [0.1, 0.1, 0.1])
-            run_config = {
-                **self.config.params,
-                "algorithm": "maddpg",
-                "num_envs": self.args.num_envs,
-                "max_global_steps": self.config.params["maddpg_config"]["max_global_steps"],
-                "experiment/algorithm": "maddpg",
-                "experiment/human_model_type": human_model_type,
-                "experiment/seed": self.args.seed,
-                "human/kp_x": kp[0], "human/kp_y": kp[1], "human/kp_z": kp[2],
-                "human/kd_x": kd[0], "human/kd_y": kd[1], "human/kd_z": kd[2],
-                "human/lookahead_distance": impedance.get("lookahead_distance", 0.04),
-                "human/reference_speed": impedance.get("reference_speed", 0.02),
-                "human/max_force_per_axis": constraints.get("max_human_force", 0.04),
-                "human/residual_limit_per_axis": constraints.get("max_human_force", 0.04),
-                "human/residual_can_override_impedance": True,
-                "robot/max_force_per_axis": constraints.get("max_robot_force", 0.04),
-                "git_commit": git_commit,
-            }
+            actual_env = getattr(self.env, "unwrapped", self.env)
+            human_metadata = actual_env.human_force_controller.wandb_metadata()
+            run_config = build_maddpg_wandb_config(
+                resolved_config=self.config.params,
+                runtime={
+                    "seed": self.args.seed,
+                    "num_envs": self.args.num_envs,
+                    "max_global_steps": self.config.params["maddpg_config"]["max_global_steps"],
+                },
+                human_metadata=human_metadata,
+                git_commit=git_commit,
+            )
             self.wandb_run_config = run_config
             run_name = f"maddpg_{human_model_type}_seed{self.args.seed}_{timestamp}"
             self.wandb_logger.initialize_run(run_config, run_name)
@@ -412,9 +371,7 @@ class MADDPGTrainer:
         self.runner = TrainingRunner(
             env=self.env,
             maddpg=self.maddpg,
-            replay=self.maddpg.replay,
             metrics_hub=self.metrics_hub,
-            reward_logger=None,  # No reward_logger dependency
             agent_ids=self.maddpg.agent_ids,
             max_global_steps=self.max_global_steps  # Pass the resolved value
         )
@@ -621,6 +578,10 @@ def main():
     parser = create_argument_parser()
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
+
+    # Resolve and apply the experiment seed before Isaac Sim is launched.
+    args_cli.seed = resolve_startup_seed(args_cli)
+    setup_global_reproducibility(args_cli.seed, strict_determinism=True)
     
     print(f"[MAIN] Arguments parsed:")
     print(f"  Task: {args_cli.task}")

@@ -4,10 +4,7 @@ Features deterministic actor, centralized critic, and configurable network archi
 """
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
 from typing import Dict, Any
 from .networks import Actor, Critic
 

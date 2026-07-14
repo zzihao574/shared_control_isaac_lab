@@ -18,7 +18,7 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import quat_apply_inverse, sample_uniform
 
 from .surgical_direct_marl_env_cfg import SurgicalDirectMARLEnvCfg
-from .utils import CompleteConstraintChecker, TrajectoryManager
+from .utils import CompleteConstraintChecker, ForceChannelState, TrajectoryManager
 from ..human_force_controller import HumanForceController
 
 
@@ -138,28 +138,9 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     
     def _initialize_physics_state(self) -> None:
         """Initialize physics interaction state variables."""
-        self._evaluation_active_env_id: int | None = None
-        self._evaluation_force_mask: torch.Tensor | None = None
-        self.human_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.robot_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.human_policy_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.human_impedance_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.human_residual_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
-        self.combined_forces_t = torch.zeros(self.num_envs, 3, device=self.device)
+        self.force_channels = ForceChannelState(self.num_envs, self.device)
         self.human_reference_position_t = torch.zeros(self.num_envs, 3, device=self.device)
         self.human_reference_velocity_t = torch.zeros(self.num_envs, 3, device=self.device)
-
-        # Preserve the action that produced the transition returned by env.step().
-        # Isaac Lab may reset completed environments before step() returns, so
-        # replay/logging must not read directly from resettable episode caches.
-        self._last_force_breakdown = {
-            "human_policy": torch.zeros(self.num_envs, 3, device=self.device),
-            "human_impedance": torch.zeros(self.num_envs, 3, device=self.device),
-            "human_residual": torch.zeros(self.num_envs, 3, device=self.device),
-            "human": torch.zeros(self.num_envs, 3, device=self.device),
-            "robot": torch.zeros(self.num_envs, 3, device=self.device),
-            "combined": torch.zeros(self.num_envs, 3, device=self.device),
-        }
         
         self.actor_mean_forces = {
             agent: torch.zeros(self.num_envs, 3, device=self.device)
@@ -305,7 +286,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             self.agent_actions[agent] = action
         
         # The environment is the single owner of the physical robot-force limit.
-        self.robot_forces_t = torch.clamp(
+        robot_force = torch.clamp(
             self.agent_actions["robot"],
             -self.max_robot_force,
             self.max_robot_force,
@@ -315,40 +296,28 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
             eef_position=self._get_stylus_position(),
             eef_velocity=self._get_stylus_velocity(),
         )
-        self.human_policy_forces_t = human_result.policy
-        self.human_impedance_forces_t = human_result.impedance
-        self.human_residual_forces_t = human_result.residual
-        self.human_forces_t = human_result.total
         self.human_reference_position_t = human_result.reference_position
         self.human_reference_velocity_t = human_result.reference_velocity
 
-        # Milestone evaluation advances only one environment. Apply this mask
-        # after human-force composition so fixed/residual impedance cannot bypass
-        # the single-environment evaluation contract.
-        if self._evaluation_force_mask is not None:
-            force_mask = self._evaluation_force_mask
-            self.robot_forces_t = self.robot_forces_t * force_mask
-            self.human_policy_forces_t = self.human_policy_forces_t * force_mask
-            self.human_impedance_forces_t = self.human_impedance_forces_t * force_mask
-            self.human_residual_forces_t = self.human_residual_forces_t * force_mask
-            self.human_forces_t = self.human_forces_t * force_mask
+        # ForceChannelState applies the single-env evaluation mask only after
+        # the human model has composed fixed/residual forces.
+        self.force_channels.update(human_result, robot_force)
+
+        if self.force_channels.evaluation_mask is not None:
             for agent in self.cfg.possible_agents:
-                self.actor_mean_forces[agent] = self.actor_mean_forces[agent] * force_mask
-                self.actor_noise_forces[agent] = self.actor_noise_forces[agent] * force_mask
+                self.actor_mean_forces[agent] = (
+                    self.force_channels.apply_evaluation_mask(
+                        self.actor_mean_forces[agent]
+                    )
+                )
+                self.actor_noise_forces[agent] = (
+                    self.force_channels.apply_evaluation_mask(
+                        self.actor_noise_forces[agent]
+                    )
+                )
 
         self.agent_actions["robot"] = self.robot_forces_t
         self.agent_actions["human"] = self.human_forces_t
-        self.combined_forces_t = self.robot_forces_t + self.human_forces_t
-
-        self._last_force_breakdown = {
-            "human_policy": self.human_policy_forces_t.detach().clone(),
-            "human_impedance": self.human_impedance_forces_t.detach().clone(),
-            "human_residual": self.human_residual_forces_t.detach().clone(),
-            "human": self.human_forces_t.detach().clone(),
-            "robot": self.robot_forces_t.detach().clone(),
-            "combined": self.combined_forces_t.detach().clone(),
-        }
-
         # StepTracer should display the force that reaches the environment, not
         # the raw residual command used by the human policy.
         self.actor_mean_forces["human"] = self.human_forces_t.clone()
@@ -363,24 +332,39 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
     @property
     def evaluation_active_env_id(self) -> int | None:
         """Environment index physically enabled during in-place evaluation."""
-        return self._evaluation_active_env_id
+        return self.force_channels.evaluation_active_env_id
+
+    @property
+    def human_policy_forces_t(self) -> torch.Tensor:
+        return self.force_channels.human_policy
+
+    @property
+    def human_impedance_forces_t(self) -> torch.Tensor:
+        return self.force_channels.human_impedance
+
+    @property
+    def human_residual_forces_t(self) -> torch.Tensor:
+        return self.force_channels.human_residual
+
+    @property
+    def human_forces_t(self) -> torch.Tensor:
+        return self.force_channels.human
+
+    @property
+    def robot_forces_t(self) -> torch.Tensor:
+        return self.force_channels.robot
+
+    @property
+    def combined_forces_t(self) -> torch.Tensor:
+        return self.force_channels.combined
 
     def set_evaluation_active_env(self, env_id: int) -> None:
         """Enable physical forces for exactly one environment during evaluation."""
-        env_id = int(env_id)
-        if env_id < 0 or env_id >= self.num_envs:
-            raise IndexError(
-                f"Evaluation environment index {env_id} is outside [0, {self.num_envs})"
-            )
-        force_mask = torch.zeros((self.num_envs, 1), device=self.device)
-        force_mask[env_id] = 1.0
-        self._evaluation_active_env_id = env_id
-        self._evaluation_force_mask = force_mask
+        self.force_channels.set_evaluation_active_env(env_id)
 
     def clear_evaluation_active_env(self) -> None:
         """Restore physical forces for all environments after evaluation."""
-        self._evaluation_active_env_id = None
-        self._evaluation_force_mask = None
+        self.force_channels.clear_evaluation_active_env()
         
     def _apply_external_forces(self) -> None:
         """Apply external forces to the robot end-effector."""
@@ -407,18 +391,15 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
 
     def get_applied_agent_actions(self) -> Dict[str, torch.Tensor]:
         """Return the physical actions that produced the latest transition."""
-        return {
-            "human": self._last_force_breakdown["human"].clone(),
-            "robot": self._last_force_breakdown["robot"].clone(),
-        }
+        return self.force_channels.get_applied_actions()
 
     def get_applied_impedance_force(self) -> torch.Tensor:
         """Return the impedance request associated with the latest transition."""
-        return self._last_force_breakdown["human_impedance"].clone()
+        return self.force_channels.get_applied_impedance()
 
     def get_force_breakdown(self) -> Dict[str, torch.Tensor]:
         """Return force channels that produced the latest transition."""
-        return {name: force.clone() for name, force in self._last_force_breakdown.items()}
+        return self.force_channels.get_breakdown()
         
     def _enforce_joint_constraints(self) -> None:
         """Enforce joint limits and fix end joints for stable operation."""
@@ -881,12 +862,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         for agent in self.cfg.possible_agents:
             self.agent_actions[agent][env_ids] = 0.0
         
-        self.human_forces_t[env_ids] = 0.0
-        self.robot_forces_t[env_ids] = 0.0
-        self.human_policy_forces_t[env_ids] = 0.0
-        self.human_impedance_forces_t[env_ids] = 0.0
-        self.human_residual_forces_t[env_ids] = 0.0
-        self.combined_forces_t[env_ids] = 0.0
+        self.force_channels.reset_live(env_ids)
         self.human_reference_position_t[env_ids] = 0.0
         self.human_reference_velocity_t[env_ids] = 0.0
         self.safety_distances_t1[env_ids] = 0.01

@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from surgical_project.algorithms.marl.maddpg import MADDPG
+from scripts.utils.training_helpers_maddpg import SeedPlan
 
 
 class MockEnvironment:
@@ -64,7 +65,10 @@ def fill_replay(maddpg: MADDPG) -> None:
 
 class MaddpgHumanModeTest(unittest.TestCase):
     def test_fixed_mode_updates_robot_but_not_human_actor(self):
-        maddpg = MADDPG(1, MockEnvironment(), make_params("fixed_impedance"), device="cpu")
+        params = make_params("fixed_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
         fill_replay(maddpg)
         human_before = maddpg.human_actor_checksum()
         robot_before = sum(
@@ -84,9 +88,18 @@ class MaddpgHumanModeTest(unittest.TestCase):
         self.assertNotEqual(robot_before, robot_after)
         self.assertNotIn("human", stats["loss/actor"])
         self.assertIn("robot", stats["loss/actor"])
+        self.assertTrue(
+            all(parameter.grad is None for parameter in maddpg.agents["robot"].critic.parameters())
+        )
+        self.assertTrue(
+            all(parameter.requires_grad for parameter in maddpg.agents["robot"].critic.parameters())
+        )
 
     def test_residual_mode_updates_human_actor(self):
-        maddpg = MADDPG(1, MockEnvironment(), make_params("residual_impedance"), device="cpu")
+        params = make_params("residual_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
         fill_replay(maddpg)
         human_before = maddpg.human_actor_checksum()
 
@@ -98,13 +111,35 @@ class MaddpgHumanModeTest(unittest.TestCase):
         self.assertIn("robot", stats["loss/actor"])
 
     def test_fixed_target_uses_normalized_impedance(self):
-        maddpg = MADDPG(1, MockEnvironment(), make_params("fixed_impedance"), device="cpu")
+        params = make_params("fixed_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
         output = maddpg._compose_human_action_norm(
             policy_action_norm=np_to_tensor([[0.9, -0.9, 0.9]]),
             impedance_force=np_to_tensor([[0.0, 0.02, -0.04]]),
         )
         expected = np_to_tensor([[0.0, 0.5, -1.0]])
         self.assertTrue(output.equal(expected))
+
+    def test_environment_action_selection_does_not_build_gradients(self):
+        params = make_params("residual_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
+        observations = {
+            "human": np_to_tensor([[0.0] * 6]).requires_grad_(True),
+            "robot": np_to_tensor([[0.0] * 6]).requires_grad_(True),
+        }
+
+        actions, detail = maddpg.select_actions(
+            observations, add_noise=True, noise_scale=0.2
+        )
+
+        for agent_id in maddpg.agent_ids:
+            self.assertFalse(actions[agent_id].requires_grad)
+            self.assertFalse(detail["mean_actions"][agent_id].requires_grad)
+            self.assertFalse(detail["noise_actions"][agent_id].requires_grad)
 
 
 def np_to_tensor(values):

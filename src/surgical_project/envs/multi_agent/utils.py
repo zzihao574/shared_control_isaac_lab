@@ -14,6 +14,120 @@ from carb._carb import Float3
 from isaaclab.utils.math import quat_apply_inverse
 
 
+class ForceChannelState:
+    """Own live, masked, and transition-snapshot force channels."""
+
+    CHANNEL_NAMES = (
+        "human_policy",
+        "human_impedance",
+        "human_residual",
+        "human",
+        "robot",
+        "combined",
+    )
+
+    def __init__(self, num_envs: int, device: torch.device | str):
+        self.num_envs = int(num_envs)
+        self.device = torch.device(device)
+        shape = (self.num_envs, 3)
+
+        self.human_policy = torch.zeros(shape, device=self.device)
+        self.human_impedance = torch.zeros(shape, device=self.device)
+        self.human_residual = torch.zeros(shape, device=self.device)
+        self.human = torch.zeros(shape, device=self.device)
+        self.robot = torch.zeros(shape, device=self.device)
+        self.combined = torch.zeros(shape, device=self.device)
+
+        self._last_applied = {
+            name: torch.zeros(shape, device=self.device)
+            for name in self.CHANNEL_NAMES
+        }
+        self._evaluation_active_env_id: int | None = None
+        self._evaluation_mask: torch.Tensor | None = None
+
+    @property
+    def evaluation_active_env_id(self) -> int | None:
+        return self._evaluation_active_env_id
+
+    @property
+    def evaluation_mask(self) -> torch.Tensor | None:
+        return self._evaluation_mask
+
+    def set_evaluation_active_env(self, env_id: int) -> None:
+        env_id = int(env_id)
+        if env_id < 0 or env_id >= self.num_envs:
+            raise IndexError(
+                f"Evaluation environment index {env_id} is outside "
+                f"[0, {self.num_envs})"
+            )
+        mask = torch.zeros((self.num_envs, 1), device=self.device)
+        mask[env_id] = 1.0
+        self._evaluation_active_env_id = env_id
+        self._evaluation_mask = mask
+
+    def clear_evaluation_active_env(self) -> None:
+        self._evaluation_active_env_id = None
+        self._evaluation_mask = None
+
+    def apply_evaluation_mask(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._evaluation_mask is None:
+            return tensor
+        return tensor * self._evaluation_mask
+
+    def update(self, human_result: Any, robot_force: torch.Tensor) -> None:
+        """Store one pre-physics force composition and snapshot its applied form."""
+        expected_shape = (self.num_envs, 3)
+        inputs = {
+            "human_policy": human_result.policy,
+            "human_impedance": human_result.impedance,
+            "human_residual": human_result.residual,
+            "human": human_result.total,
+            "robot": robot_force,
+        }
+        for name, value in inputs.items():
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"{name} force shape {tuple(value.shape)} does not match "
+                    f"{expected_shape}"
+                )
+
+        with torch.no_grad():
+            self.human_policy.copy_(
+                self.apply_evaluation_mask(human_result.policy)
+            )
+            self.human_impedance.copy_(
+                self.apply_evaluation_mask(human_result.impedance)
+            )
+            self.human_residual.copy_(
+                self.apply_evaluation_mask(human_result.residual)
+            )
+            self.human.copy_(self.apply_evaluation_mask(human_result.total))
+            self.robot.copy_(self.apply_evaluation_mask(robot_force))
+            self.combined.copy_(self.human + self.robot)
+
+            for name in self.CHANNEL_NAMES:
+                self._last_applied[name] = getattr(self, name).clone()
+
+    def reset_live(self, env_ids: torch.Tensor) -> None:
+        """Clear resettable live state without destroying the last transition."""
+        for name in self.CHANNEL_NAMES:
+            getattr(self, name)[env_ids] = 0.0
+
+    def get_applied_actions(self) -> Dict[str, torch.Tensor]:
+        return {
+            "human": self._last_applied["human"].clone(),
+            "robot": self._last_applied["robot"].clone(),
+        }
+
+    def get_applied_impedance(self) -> torch.Tensor:
+        return self._last_applied["human_impedance"].clone()
+
+    def get_breakdown(self) -> Dict[str, torch.Tensor]:
+        return {
+            name: force.clone() for name, force in self._last_applied.items()
+        }
+
+
 class CompleteConstraintChecker:
     """
     Physics-based constraint analysis for surgical robot environment.

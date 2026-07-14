@@ -11,7 +11,7 @@ Features:
 """
 import numpy as np
 import torch
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Tuple, Optional
 
 
 class JointReplayBuffer:
@@ -53,20 +53,119 @@ class JointReplayBuffer:
             next_obs_all: np.ndarray, done_any: bool,
             impedance: Optional[np.ndarray] = None,
             next_impedance: Optional[np.ndarray] = None) -> None:
-        """Add joint experience to buffer."""
-        i = self.ptr
-        self.obs[i] = obs_all
-        self.act[i] = act_all
-        self.rew[i] = rewards_vec
-        self.nobs[i] = next_obs_all
-        self.done_any[i] = float(done_any)
+        """Add one joint experience through the shared batch writer."""
+        self.add_batch(
+            obs_all=np.asarray(obs_all, dtype=np.float32)[None, ...],
+            act_all=np.asarray(act_all, dtype=np.float32)[None, ...],
+            rewards_all=np.asarray(rewards_vec, dtype=np.float32)[None, ...],
+            next_obs_all=np.asarray(next_obs_all, dtype=np.float32)[None, ...],
+            done_all=np.asarray([done_any], dtype=np.float32),
+            impedance=(
+                None
+                if impedance is None
+                else np.asarray(impedance, dtype=np.float32)[None, ...]
+            ),
+            next_impedance=(
+                None
+                if next_impedance is None
+                else np.asarray(next_impedance, dtype=np.float32)[None, ...]
+            ),
+        )
+
+    def add_batch(
+        self,
+        obs_all: np.ndarray,
+        act_all: np.ndarray,
+        rewards_all: np.ndarray,
+        next_obs_all: np.ndarray,
+        done_all: np.ndarray,
+        impedance: Optional[np.ndarray] = None,
+        next_impedance: Optional[np.ndarray] = None,
+    ) -> None:
+        """Write a vectorized environment batch into the circular buffer."""
+        obs_all = np.asarray(obs_all, dtype=np.float32)
+        act_all = np.asarray(act_all, dtype=np.float32)
+        rewards_all = np.asarray(rewards_all, dtype=np.float32)
+        next_obs_all = np.asarray(next_obs_all, dtype=np.float32)
+        done_all = np.asarray(done_all, dtype=np.float32).reshape(-1, 1)
+
+        batch_size = int(obs_all.shape[0])
+        if batch_size == 0:
+            return
+
+        expected_shapes = {
+            "obs_all": (batch_size, self.total_obs_dim),
+            "act_all": (batch_size, self.total_action_dim),
+            "rewards_all": (batch_size, self.num_agents),
+            "next_obs_all": (batch_size, self.total_obs_dim),
+            "done_all": (batch_size, 1),
+        }
+        arrays = {
+            "obs_all": obs_all,
+            "act_all": act_all,
+            "rewards_all": rewards_all,
+            "next_obs_all": next_obs_all,
+            "done_all": done_all,
+        }
+        for name, expected in expected_shapes.items():
+            if arrays[name].shape != expected:
+                raise ValueError(
+                    f"{name} shape {arrays[name].shape} does not match {expected}"
+                )
+
         if impedance is not None:
-            self.impedance[i] = impedance
+            impedance = np.asarray(impedance, dtype=np.float32)
+            if impedance.shape != (batch_size, 3):
+                raise ValueError(
+                    f"impedance shape {impedance.shape} does not match {(batch_size, 3)}"
+                )
         if next_impedance is not None:
-            self.next_impedance[i] = next_impedance
-        
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+            next_impedance = np.asarray(next_impedance, dtype=np.float32)
+            if next_impedance.shape != (batch_size, 3):
+                raise ValueError(
+                    "next_impedance shape "
+                    f"{next_impedance.shape} does not match {(batch_size, 3)}"
+                )
+
+        # If one environment batch exceeds the full capacity, only its newest
+        # transitions can survive the equivalent sequence of scalar writes.
+        if batch_size >= self.capacity:
+            keep = slice(batch_size - self.capacity, batch_size)
+            retained = self.capacity
+            start = (self.ptr + batch_size - self.capacity) % self.capacity
+            obs_all = obs_all[keep]
+            act_all = act_all[keep]
+            rewards_all = rewards_all[keep]
+            next_obs_all = next_obs_all[keep]
+            done_all = done_all[keep]
+            if impedance is not None:
+                impedance = impedance[keep]
+            if next_impedance is not None:
+                next_impedance = next_impedance[keep]
+        else:
+            retained = batch_size
+            start = self.ptr
+
+        first = min(retained, self.capacity - start)
+        second = retained - first
+
+        def write(storage: np.ndarray, values: np.ndarray) -> None:
+            storage[start : start + first] = values[:first]
+            if second:
+                storage[:second] = values[first:]
+
+        write(self.obs, obs_all)
+        write(self.act, act_all)
+        write(self.rew, rewards_all)
+        write(self.nobs, next_obs_all)
+        write(self.done_any, done_all)
+        if impedance is not None:
+            write(self.impedance, impedance)
+        if next_impedance is not None:
+            write(self.next_impedance, next_impedance)
+
+        self.ptr = (self.ptr + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
 
     def sample(self, batch_size: int, generator: Optional[torch.Generator] = None) -> Optional[Tuple[torch.Tensor, ...]]:
         """

@@ -251,6 +251,7 @@ def evaluate(args):
                 noise_scale=eval_noise_scale,
             )
             actual_env.set_detail_actor_info(detail)
+            actual_env.set_trainer_global_step(step)
             next_obs, rewards, terminated, truncated, info = env.step(actions)
             if hasattr(actual_env, "get_force_breakdown"):
                 breakdown = actual_env.get_force_breakdown()

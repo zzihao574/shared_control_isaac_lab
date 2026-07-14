@@ -4,16 +4,36 @@ Features normalized action training, external noise scheduling, and reproducible
 """
 
 import torch
-import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Any
+from contextlib import contextmanager
+from typing import Dict, Any
 from .ddpg_agent import DDPGAgent
 from .replay_buffer import JointReplayBuffer
+
+
+@contextmanager
+def freeze_module_parameters(module: torch.nn.Module):
+    """Disable parameter gradients while retaining gradients through inputs."""
+    parameters = list(module.parameters())
+    original_flags = [parameter.requires_grad for parameter in parameters]
+    try:
+        module.requires_grad_(False)
+        yield
+    finally:
+        for parameter, requires_grad in zip(parameters, original_flags):
+            parameter.requires_grad_(requires_grad)
 
 class MADDPG:
     """Multi-Agent Deep Deterministic Policy Gradient with shared network architecture."""
     
-    def __init__(self, num_envs: int, env, params: Dict[str, Any], device: str = 'cuda'):
+    def __init__(
+        self,
+        num_envs: int,
+        env,
+        params: Dict[str, Any],
+        seed_plan,
+        device: str = 'cuda',
+    ):
         self.env = env
         self.actual_env = self._unwrap_environment(env)
         self.params = params
@@ -28,9 +48,15 @@ class MADDPG:
         
         # Get base seed for reproducible generator initialization
         self.base_seed = int(self.params.get("seed", 42))
+        self.seed_plan = seed_plan
+        if int(self.seed_plan.base_seed) != self.base_seed:
+            raise ValueError(
+                "SeedPlan does not match resolved MADDPG configuration: "
+                f"plan={self.seed_plan.base_seed}, params={self.base_seed}"
+            )
         
         # Phase 1: Set deterministic seeds for network initialization
-        self._set_network_seeds()
+        self.seed_plan.apply_network_seed()
         
         # Get environment configuration
         self.agent_ids = list(self.actual_env.cfg.possible_agents)
@@ -69,7 +95,6 @@ class MADDPG:
         # Load training hyperparameters
         maddpg_cfg = self.params.get('maddpg_config', {})
         self.batch_size = int(maddpg_cfg.get('batch_size', 512))
-        self.gamma = float(maddpg_cfg.get('gamma', 0.95))
         self.update_interval = int(maddpg_cfg.get('update_interval', 100))
         self.min_buffer_size = int(maddpg_cfg.get('min_buffer_size', 4096))
         
@@ -91,33 +116,22 @@ class MADDPG:
         self._is_eval_mode = bool(is_eval)
         print(f"[MADDPG] Eval mode: {'ENABLED' if self._is_eval_mode else 'DISABLED'}")
     
-    def _set_network_seeds(self) -> None:
-        """Set deterministic seeds for network initialization."""
-        import random
-        random.seed(self.base_seed)
-        np.random.seed(self.base_seed)  
-        torch.manual_seed(self.base_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.base_seed)
-    
     def _init_noise_generators(self) -> None:
         """Initialize persistent noise generators for each (agent, env) pair."""
         self.noise_generators = {}  # {agent_id: [gen_env0, gen_env1, ...]}
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
         for i, agent_id in enumerate(self.agent_ids):
             gens = []
             for env_id in range(self.num_envs):
-                gen = torch.Generator(device=device)
-                # Reproducible but unique seed for each (agent, env) pair
-                seed_ae = (self.base_seed + 1234567 + i * 10007 + env_id * 97) % (2**32)
-                gen.manual_seed(seed_ae)
+                gen = self.seed_plan.make_exploration_generator(
+                    device=self.device,
+                    agent_index=i,
+                    env_id=env_id,
+                )
                 gens.append(gen)
             self.noise_generators[agent_id] = gens
         
         # Dedicated generator for replay buffer sampling
-        self.replay_generator = torch.Generator(device='cpu')
-        self.replay_generator.manual_seed((self.base_seed + 424242) % (2**32))
+        self.replay_generator = self.seed_plan.make_replay_generator()
         
         print(f"[GENERATORS] Initialized {self.num_agents * self.num_envs} noise generators + 1 replay generator")
     
@@ -176,22 +190,17 @@ class MADDPG:
         print(f"[BUFFER] Joint replay buffer initialized: capacity={self.buffer_size}")
     
     def _build_slices(self) -> None:
-        """Build slicing indices for concatenated observations and actions."""
+        """Build slicing indices for concatenated observations."""
         self.obs_slices = []
-        self.act_slices = []
-        
         obs_offset = 0
-        act_offset = 0
-        
-        for obs_dim, act_dim in zip(self.obs_dims, self.action_dims):
-            self.obs_slices.append(slice(obs_offset, obs_offset + obs_dim))
-            self.act_slices.append(slice(act_offset, act_offset + act_dim))
-            obs_offset += obs_dim
-            act_offset += act_dim
-            
-        print(f"[SLICES] Observation slices: {self.obs_slices}")
-        print(f"[SLICES] Action slices: {self.act_slices}")
 
+        for obs_dim in self.obs_dims:
+            self.obs_slices.append(slice(obs_offset, obs_offset + obs_dim))
+            obs_offset += obs_dim
+
+        print(f"[SLICES] Observation slices: {self.obs_slices}")
+
+    @torch.no_grad()
     def select_actions(self, observations: Dict[str, torch.Tensor], add_noise: bool, noise_scale: float = 1.0) -> tuple[Dict[str, torch.Tensor], Dict]:
         """Generate diverse noise using persistent per-(agent,env) generators."""
         actions = {}
@@ -279,29 +288,25 @@ class MADDPG:
         else:
             next_impedance = torch.zeros_like(current_impedance)
 
-        for env_id in range(self.num_envs):
-            # Concatenate observations and actions (by agent_ids order)
-            obs_all = torch.cat([obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
-            act_all = torch.cat([applied_actions[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
-            rew_vec = torch.stack([rewards[aid][env_id].reshape(()).float() for aid in self.agent_ids], dim=0).detach().cpu().numpy()
-            nobs_all = torch.cat([next_obs[aid][env_id].reshape(-1) for aid in self.agent_ids], dim=0).detach().cpu().numpy()
-            
-            # Calculate done_any (logical OR across agents)
-            done_any = False
-            for aid in self.agent_ids:
-                if bool(dones[aid][env_id]):
-                    done_any = True
-                    break
-            
-            self.replay.add(
-                obs_all,
-                act_all,
-                rew_vec,
-                nobs_all,
-                done_any,
-                impedance=current_impedance[env_id].detach().cpu().numpy(),
-                next_impedance=next_impedance[env_id].detach().cpu().numpy(),
-            )
+        obs_all = torch.cat([obs[aid] for aid in self.agent_ids], dim=-1)
+        act_all = torch.cat(
+            [applied_actions[aid] for aid in self.agent_ids], dim=-1
+        )
+        rew_all = torch.stack([rewards[aid].float() for aid in self.agent_ids], dim=-1)
+        nobs_all = torch.cat([next_obs[aid] for aid in self.agent_ids], dim=-1)
+        done_all = torch.stack(
+            [dones[aid].to(torch.bool) for aid in self.agent_ids], dim=-1
+        ).any(dim=-1)
+
+        self.replay.add_batch(
+            obs_all=obs_all.detach().cpu().numpy(),
+            act_all=act_all.detach().cpu().numpy(),
+            rewards_all=rew_all.detach().cpu().numpy(),
+            next_obs_all=nobs_all.detach().cpu().numpy(),
+            done_all=done_all.detach().cpu().numpy(),
+            impedance=current_impedance.detach().cpu().numpy(),
+            next_impedance=next_impedance.detach().cpu().numpy(),
+        )
 
     def _compose_human_action_norm(
         self, policy_action_norm: torch.Tensor, impedance_force: torch.Tensor
@@ -420,7 +425,7 @@ class MADDPG:
                 q = agent.critic(obs_all, act_all_norm).squeeze(-1)
                 critic_loss = torch.nn.functional.smooth_l1_loss(q, y)
 
-                agent.critic_optimizer.zero_grad()
+                agent.critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 c_grad_norm = self._module_grad_norm(agent.critic)
                 agent.critic_optimizer.step()
@@ -454,10 +459,16 @@ class MADDPG:
                     action_parts.append(a_norm_j)
                 
                 action_pred_all_norm = torch.cat(action_parts, dim=-1)
-                actor_loss = -agent.critic(obs_all, action_pred_all_norm).mean()
-
-                agent.actor_optimizer.zero_grad()
-                actor_loss.backward()
+                # Critic supplies dQ/da, but its parameters are not optimized by
+                # the actor objective. Clear stale critic gradients and freeze
+                # only its parameters while preserving gradients through inputs.
+                agent.critic_optimizer.zero_grad(set_to_none=True)
+                agent.actor_optimizer.zero_grad(set_to_none=True)
+                with freeze_module_parameters(agent.critic):
+                    actor_loss = -agent.critic(
+                        obs_all, action_pred_all_norm
+                    ).mean()
+                    actor_loss.backward()
                 a_grad_norm = self._module_grad_norm(agent.actor)
                 agent.actor_optimizer.step()
 
