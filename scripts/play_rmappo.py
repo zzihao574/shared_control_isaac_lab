@@ -11,6 +11,7 @@ Key features:
 """
 
 import argparse
+import copy
 import os
 import sys
 from typing import Optional
@@ -88,6 +89,25 @@ def get_hidden_size(config: TrainingConfiguration, default: int = 256) -> int:
         return default
 
 
+def resolve_evaluation_config(args):
+    """Restore the checkpoint experiment conditions before Isaac Sim starts."""
+    config_path = resolve_config_path(args.config, args.checkpoint)
+    config = TrainingConfiguration.from_yaml(config_path)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint.get("params"), dict):
+        config.params = copy.deepcopy(checkpoint["params"])
+        print("[SETUP] Restored resolved configuration embedded in checkpoint.")
+
+    checkpoint_seed = int(
+        config.params.get("seed", config.params.get("training", {}).get("seed", 42))
+    )
+    args.seed = checkpoint_seed if args.seed is None else int(args.seed)
+    config.params["seed"] = args.seed
+    config.params.setdefault("training", {})["seed"] = args.seed
+    config.params.setdefault("human_model_type", "learnable")
+    return config_path, config
+
+
 def load_checkpoint(rmappo_wrapper, checkpoint_path: str):
     """Load flat dual-network checkpoint into wrapper."""
     print(f"[LOAD] Loading checkpoint: {checkpoint_path}")
@@ -117,7 +137,9 @@ def inject_step_tracer(env, config, num_envs):
         num_envs=num_envs,
         device=getattr(actual_env, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
         enable_console_logging=enable_logging,
-        print_every_steps=1,
+        print_every_steps=int(
+            config.params.get("logging", {}).get("print_every_steps", 10)
+        ),
     )
     status = "Enabled" if enable_logging else "Disabled"
     print(f"[STEPTRACER] {status} (controlled by logging.enable_console_logging)")
@@ -128,7 +150,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pth).")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0", help="Environment task name.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: checkpoint seed).")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments (default: 1).")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of evaluation episodes.")
     parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps per episode (0 = unlimited).")
@@ -141,12 +163,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def evaluate(args, simulation_app):
-    config_path = resolve_config_path(args.config, args.checkpoint)
+def evaluate(args, simulation_app, config_path, config):
     print(f"[SETUP] Using config: {config_path}")
-    config = TrainingConfiguration.from_yaml(config_path)
-
-    setup_global_reproducibility(args.seed, strict_determinism=True)
 
     eval_num_envs = max(1, args.num_envs)
 
@@ -163,9 +181,6 @@ def evaluate(args, simulation_app):
     print(f"[SETUP] Creating environment with num_envs={eval_num_envs} ...")
     env, _ = setup_environment(env_args, config)
     actual_env = getattr(env, "unwrapped", env)
-    if hasattr(actual_env, "params"):
-        actual_env.params = config.params
-        print("[SETUP] Injected params into environment.")
 
     inject_step_tracer(env, config, eval_num_envs)
 
@@ -187,6 +202,7 @@ def evaluate(args, simulation_app):
                 project="rmappo_evaluation",
                 run_name=run_name,
                 config={
+                    **config.params,
                     "checkpoint": args.checkpoint,
                     "config_path": config_path,
                     "task": args.task,
@@ -200,68 +216,76 @@ def evaluate(args, simulation_app):
 
     max_steps = args.max_steps if args.max_steps > 0 else float("inf")
 
-    for ep in range(args.num_episodes):
-        print(f"\n=== Episode {ep + 1}/{args.num_episodes} ===")
-        recorder.start_episode(ep)
-        obs, _ = env.reset()
+    if not hasattr(actual_env, "set_evaluation_active_env"):
+        raise RuntimeError("Environment does not support single-environment evaluation")
 
-        # Initialize RNN states
-        for aid in rmappo.agent_ids:
-            rmappo.rnn_states[aid]["actor"] = torch.zeros(1, hidden_size, device=rmappo.device)
-            rmappo.rnn_states[aid]["critic"] = torch.zeros(1, hidden_size, device=rmappo.device)
+    actual_env.set_evaluation_active_env(0)
+    try:
+        for ep in range(args.num_episodes):
+            print(f"\n=== Episode {ep + 1}/{args.num_episodes} ===")
+            recorder.start_episode(ep)
+            obs, _ = env.reset()
 
-        step = 0
-        done_any = False
-        while simulation_app.is_running() and step < max_steps and not done_any:
-            actions, detail = rmappo.select_actions(obs, deterministic=args.deterministic)
-            if hasattr(actual_env, "set_detail_actor_info"):
-                actual_env.set_detail_actor_info(detail)
-
-            obs, rewards, terminated, truncated, info = env.step(actions)
-
-            if hasattr(actual_env, "step_tracer") and actual_env.step_tracer is not None:
-                actual_env.step_tracer.maybe_print_step(
-                    actual_env,
-                    rewards,
-                    global_step=step,
-                    force_print=True,
+            for aid in rmappo.agent_ids:
+                rmappo.rnn_states[aid]["actor"] = torch.zeros(
+                    eval_num_envs, hidden_size, device=rmappo.device
+                )
+                rmappo.rnn_states[aid]["critic"] = torch.zeros(
+                    eval_num_envs, hidden_size, device=rmappo.device
                 )
 
-            recorder.record_step(step, env, rewards, info, detail)
+            step = 0
+            done_any = False
+            while simulation_app.is_running() and step < max_steps and not done_any:
+                actions, detail = rmappo.select_actions(obs, deterministic=args.deterministic)
+                actual_env.set_detail_actor_info(detail)
 
-            done_mask = None
-            for aid in rmappo.agent_ids:
-                term = (terminated[aid] | truncated[aid]).to(torch.bool)
-                done_mask = term if done_mask is None else (done_mask | term)
-            done_any = bool(done_mask is not None and done_mask.any().item())
-            step += 1
+                actual_env.set_trainer_global_step(step)
+                obs, rewards, terminated, truncated, info = env.step(actions)
+                if hasattr(actual_env, "get_force_breakdown"):
+                    breakdown = actual_env.get_force_breakdown()
+                    detail["force_breakdown"] = breakdown
+                    detail["applied_forces"] = {
+                        "human": breakdown["human"],
+                        "robot": breakdown["robot"],
+                    }
+                recorder.record_step(step, env, rewards, info, detail)
 
-        summary = recorder.end_episode()
-        fmt = lambda v: f"{v:.3f}" if v is not None else "n/a"
-        print(
-            f"[EPISODE] steps={summary.episode_length} "
-            f"score={fmt(summary.score)} "
-            f"progress={fmt(summary.progress_final)} "
-            f"on_track={fmt(summary.on_track_ratio)} "
-            f"c_zone={fmt(summary.c_zone_ratio)} "
-            f"collision={fmt(summary.collision_ratio)}"
-        )
+                done_mask = None
+                for aid in rmappo.agent_ids:
+                    term = (terminated[aid] | truncated[aid]).to(torch.bool)
+                    done_mask = term if done_mask is None else (done_mask | term)
+                done_any = bool(done_mask is not None and done_mask[0].item())
+                step += 1
 
-        if wandb_logger:
-            wandb_payload = {
-                "eval/score": summary.score,
-                "eval/episode_length": summary.episode_length,
-                "eval/progress_final": summary.progress_final,
-                "eval/on_track_ratio": summary.on_track_ratio,
-                "eval/c_zone_ratio": summary.c_zone_ratio,
-                "eval/collision_ratio": summary.collision_ratio,
-                "eval/time_to_completion_steps": summary.time_to_completion_steps,
-            }
-            wandb_logger.log_episode(ep, {k: v for k, v in wandb_payload.items() if v is not None})
+            summary = recorder.end_episode()
+            fmt = lambda v: f"{v:.3f}" if v is not None else "n/a"
+            print(
+                f"[EPISODE] steps={summary.episode_length} "
+                f"score={fmt(summary.score)} "
+                f"progress={fmt(summary.progress_final)} "
+                f"on_track={fmt(summary.on_track_ratio)} "
+                f"c_zone={fmt(summary.c_zone_ratio)} "
+                f"collision={fmt(summary.collision_ratio)}"
+            )
 
-        if not simulation_app.is_running():
-            print("[WARN] Simulation app stopped running; terminating evaluation early.")
-            break
+            if wandb_logger:
+                wandb_payload = {
+                    "eval/score": summary.score,
+                    "eval/episode_length": summary.episode_length,
+                    "eval/progress_final": summary.progress_final,
+                    "eval/on_track_ratio": summary.on_track_ratio,
+                    "eval/c_zone_ratio": summary.c_zone_ratio,
+                    "eval/collision_ratio": summary.collision_ratio,
+                    "eval/time_to_completion_steps": summary.time_to_completion_steps,
+                }
+                wandb_logger.log_episode(ep, {k: v for k, v in wandb_payload.items() if v is not None})
+
+            if not simulation_app.is_running():
+                print("[WARN] Simulation app stopped running; terminating evaluation early.")
+                break
+    finally:
+        actual_env.clear_evaluation_active_env()
 
     save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
     recorder.save(save_dir)
@@ -317,11 +341,14 @@ def main():
     parser = build_argument_parser()
     args = parser.parse_args()
 
+    config_path, config = resolve_evaluation_config(args)
+    setup_global_reproducibility(args.seed, strict_determinism=True)
+
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
     try:
-        evaluate(args, simulation_app)
+        evaluate(args, simulation_app, config_path, config)
     finally:
         print("[CLEANUP] Closing simulation app...")
         simulation_app.close()

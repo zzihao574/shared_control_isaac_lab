@@ -9,17 +9,168 @@ FIXED: Evaluation returns with env.reset(), simplified action selection interfac
 """
 
 import argparse
+import copy
 import os
 import yaml
 import torch
 import numpy as np
 import random
-import pickle
 import math
-import traceback
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+from typing import Dict, Optional, Any
 from collections import defaultdict, deque
+
+
+SUPPORTED_HUMAN_MODEL_TYPES = {
+    "learnable",
+    "fixed_impedance",
+    "residual_impedance",
+}
+
+
+@dataclass(frozen=True)
+class RMAPPOSeedPlan:
+    """Single source of truth for rMAPPO random-stream derivation."""
+
+    base_seed: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "base_seed", int(self.base_seed))
+
+    def network_seed(self) -> int:
+        return self.base_seed % (2**32)
+
+    def minibatch_seed(self) -> int:
+        return (self.base_seed + 424242) % (2**32)
+
+    def apply_network_seed(self) -> None:
+        torch.manual_seed(self.network_seed())
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.network_seed())
+
+    def make_minibatch_generator(self) -> torch.Generator:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.minibatch_seed())
+        return generator
+
+
+def setup_global_reproducibility(
+    seed: int, strict_determinism: bool = True
+) -> None:
+    """Seed process-level RNGs before Isaac Sim is launched."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if strict_determinism:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"[SEED] Reproducibility set. seed={seed}, strict={strict_determinism}")
+
+
+def validate_rmappo_config(params: Dict[str, Any]) -> None:
+    """Validate resolved human-model and rMAPPO configuration."""
+    model_type = str(params.get("human_model_type", "learnable"))
+    if model_type not in SUPPORTED_HUMAN_MODEL_TYPES:
+        choices = ", ".join(sorted(SUPPORTED_HUMAN_MODEL_TYPES))
+        raise ValueError(f"Unsupported human_model_type={model_type!r}; expected {choices}")
+
+    rmappo_cfg = params.get("algorithms", {}).get("rmappo")
+    if not isinstance(rmappo_cfg, dict):
+        raise ValueError("Missing algorithms.rmappo configuration")
+
+    if model_type != "learnable":
+        impedance = params.get("human_impedance", {})
+        for name in ("kp", "kd"):
+            values = impedance.get(name)
+            if not isinstance(values, (list, tuple)) or len(values) != 3:
+                raise ValueError(f"human_impedance.{name} must contain three values")
+
+    constraints = params.get("constraints", {})
+    for name in ("max_human_force", "max_robot_force"):
+        if float(constraints.get(name, 0.0)) <= 0.0:
+            raise ValueError(f"constraints.{name} must be positive")
+
+
+def resolve_rmappo_config(args) -> "TrainingConfiguration":
+    """Resolve YAML/checkpoint configuration and CLI overrides before launch."""
+    checkpoint = None
+    if getattr(args, "checkpoint", None):
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+    if checkpoint is not None and isinstance(checkpoint.get("params"), dict):
+        params = copy.deepcopy(checkpoint["params"])
+    else:
+        with open(args.config, "r", encoding="utf-8") as config_file:
+            params = yaml.safe_load(config_file) or {}
+
+    training_cfg = params.setdefault("training", {})
+    stored_seed = int(params.get("seed", training_cfg.get("seed", 42)))
+    if checkpoint is not None and args.seed is not None and int(args.seed) != stored_seed:
+        raise ValueError(
+            f"Cannot resume with seed={args.seed}; checkpoint seed is {stored_seed}"
+        )
+    seed = stored_seed if args.seed is None else int(args.seed)
+    params["seed"] = seed
+    training_cfg["seed"] = seed
+
+    if checkpoint is not None:
+        checkpoint_model = str(params.get("human_model_type", "learnable"))
+        if args.human_model_type is not None and args.human_model_type != checkpoint_model:
+            raise ValueError(
+                "Cannot resume with a different human model: "
+                f"checkpoint={checkpoint_model}, CLI={args.human_model_type}"
+            )
+    elif args.human_model_type is not None:
+        params["human_model_type"] = args.human_model_type
+    params.setdefault("human_model_type", "learnable")
+
+    stored_num_envs = int(params.get("num_envs", 512))
+    num_envs = stored_num_envs if args.num_envs is None else int(args.num_envs)
+    params["num_envs"] = num_envs
+
+    rmappo_cfg = params.setdefault("algorithms", {}).setdefault("rmappo", {})
+    if int(getattr(args, "max_global_steps", 0)) > 0:
+        rmappo_cfg["max_global_steps"] = int(args.max_global_steps)
+
+    validate_rmappo_config(params)
+    args.seed = seed
+    args.num_envs = num_envs
+    return TrainingConfiguration(args.config, params=params)
+
+
+def build_rmappo_wandb_config(
+    resolved_config: Dict[str, Any],
+    runtime: Dict[str, Any],
+    human_metadata: Dict[str, Any],
+    git_commit: str,
+) -> Dict[str, Any]:
+    """Build complete and query-friendly WandB metadata."""
+    config = copy.deepcopy(resolved_config)
+    constraints = resolved_config.get("constraints", {})
+    config.update(
+        {
+            "algorithm": "rmappo",
+            "num_envs": int(runtime["num_envs"]),
+            "max_global_steps": int(runtime["max_global_steps"]),
+            "experiment/algorithm": "rmappo",
+            "experiment/human_model_type": str(
+                resolved_config.get("human_model_type", "learnable")
+            ),
+            "experiment/seed": int(runtime["seed"]),
+            "robot/max_force_per_axis": float(
+                constraints.get("max_robot_force", 0.04)
+            ),
+            "git_commit": git_commit,
+        }
+    )
+    config.update(copy.deepcopy(human_metadata))
+    return config
 
 # WandB support
 try:
@@ -92,11 +243,12 @@ class RMAPPOTrainingRunner:
         self.num_mini_batch = rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}).get('num_mini_batch', 4)
         self.data_chunk_length = rmappo_wrapper.params.get('algorithms', {}).get('rmappo', {}).get('data_chunk_length', 16)
         
-        # Global RNG for training (CPU-based for reproducibility)
-        seed = int(rmappo_wrapper.params.get('training', {}).get('seed', 42))
-        self._train_generator = torch.Generator(device="cpu")
-        self._train_generator.manual_seed(seed + 424242)
-        print(f"[RUNNER] Global training RNG initialized with seed: {seed + 424242}")
+        seed_plan = RMAPPOSeedPlan(rmappo_wrapper.params["seed"])
+        self._train_generator = seed_plan.make_minibatch_generator()
+        print(
+            "[RUNNER] Global training RNG initialized with seed: "
+            f"{seed_plan.minibatch_seed()}"
+        )
         
         # Inject RNG into Wrapper
         self.rmappo.train_generator = self._train_generator
@@ -150,7 +302,7 @@ class RMAPPOTrainingRunner:
         
         print(f"\n[MID-ROLLOUT EVAL] Handling evaluation trigger at t={t}, milestone={milestone}")
         
-        for aid in self.agent_ids:
+        for aid in self.rmappo.trainable_agent_ids:
             buf = self.rmappo.buffers[aid]
             
             # ============ KEY POINT 1: Strict ongoing identification ============
@@ -248,7 +400,7 @@ class RMAPPOTrainingRunner:
                 self.global_step += 1
                 self.env.unwrapped.set_trainer_global_step(self.global_step)
                 
-                for aid in self.agent_ids:
+                for aid in self.rmappo.trainable_agent_ids:
                     self.rmappo.trainers[aid].global_step = self.global_step
             
             # ============ FIXED: Simplified action selection interface ============
@@ -260,6 +412,12 @@ class RMAPPOTrainingRunner:
 
             self.env.unwrapped.set_detail_actor_info(detail)
             next_obs, rewards, terminated, truncated, infos = self.env.step(actions)
+
+            if not self.is_eval_mode and self.global_step % 10 == 0:
+                actual_env = getattr(self.env, "unwrapped", self.env)
+                if hasattr(actual_env, "get_force_breakdown"):
+                    detail["force_breakdown"] = actual_env.get_force_breakdown()
+                self._push_current_step_force_statistics(detail)
 
             # Calculate done status
             done_any_dict = {aid: (terminated[aid] | truncated[aid]) for aid in terminated.keys()}
@@ -370,12 +528,12 @@ class RMAPPOTrainingRunner:
 
             if stats:
                 payload = {
-                    "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.agent_ids},
-                    "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.agent_ids},
-                    "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
-                    "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.agent_ids},
-                    "policy/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.agent_ids]),
-                    "ppo/ratio_mean": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.agent_ids]),
+                    "loss/actor": {aid: stats.get(f"policy_loss/{aid}", 0.0) for aid in self.rmappo.trainable_agent_ids},
+                    "loss/critic": {aid: stats.get(f"value_loss/{aid}", 0.0) for aid in self.rmappo.trainable_agent_ids},
+                    "grad_norm/actor": {aid: stats.get(f"actor_grad_norm/{aid}", 0.0) for aid in self.rmappo.trainable_agent_ids},
+                    "grad_norm/critic": {aid: stats.get(f"critic_grad_norm/{aid}", 0.0) for aid in self.rmappo.trainable_agent_ids},
+                    "policy/entropy": np.mean([stats.get(f"dist_entropy/{aid}", 0.0) for aid in self.rmappo.trainable_agent_ids]),
+                    "ppo/ratio_mean": np.mean([stats.get(f"ratio/{aid}", 1.0) for aid in self.rmappo.trainable_agent_ids]),
                     "train/collection_steps": self.global_step,
                     "train/training_rounds": self.train_updates,
                     "train/global_episodes": self.global_episodes,
@@ -383,8 +541,6 @@ class RMAPPOTrainingRunner:
                 payload = {k: v for k, v in payload.items() if v is not None}
                 self.metrics.push_update(self.global_step, payload)
 
-            self._push_current_rollout_force_statistics(detail)
-            
             if self.train_updates % 50 == 0:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -400,31 +556,75 @@ class RMAPPOTrainingRunner:
         """Mark to skip episode counting once for milestone evaluation."""
         self._skip_episode_once = True
 
-    def _push_current_rollout_force_statistics(self, detail):
-        """Push current rollout's force statistics to WandB with source check."""
-        # Robust source extraction with one-time warning
-        src = {}
-        if isinstance(detail, dict):
-            src = detail.get("applied_forces") or detail.get("mean_actions") or {}
-        
-        if not src:
-            if not hasattr(self, "_warned_no_forces"):
-                print(f"[FORCES] missing 'applied_forces/mean_actions' at step={self.global_step}")
-                self._warned_no_forces = True
-            return
-        
+    def _push_current_step_force_statistics(self, detail):
+        """Push actual environment force channels to WandB."""
         force_payload = {}
-        
-        for aid in self.agent_ids:
-            if aid in src:
-                forces = src[aid]
-                mean_forces = forces.mean(dim=0)
-                force_payload.update({
-                    f"forces/{aid}_fx_mean": float(mean_forces[0].item()),
-                    f"forces/{aid}_fy_mean": float(mean_forces[1].item()),
-                    f"forces/{aid}_fz_mean": float(mean_forces[2].item()),
-                })
-        
+
+        breakdown = detail.get("force_breakdown", {}) if isinstance(detail, dict) else {}
+        if not breakdown:
+            source = detail.get("mean_actions", {}) if isinstance(detail, dict) else {}
+            breakdown = {k: v for k, v in source.items() if k in {"human", "robot"}}
+
+        for channel in (
+            "human_impedance",
+            "human_residual",
+            "human",
+            "robot",
+            "combined",
+        ):
+            forces = breakdown.get(channel)
+            if forces is None:
+                continue
+            mean_xyz = forces.mean(dim=0)
+            norms = torch.linalg.vector_norm(forces, dim=-1)
+            force_payload.update({
+                f"forces/{channel}_fx_mean": float(mean_xyz[0].item()),
+                f"forces/{channel}_fy_mean": float(mean_xyz[1].item()),
+                f"forces/{channel}_fz_mean": float(mean_xyz[2].item()),
+                f"forces/{channel}_norm_mean": float(norms.mean().item()),
+                f"forces/{channel}_norm_rms": float(
+                    torch.sqrt(torch.mean(norms.square())).item()
+                ),
+            })
+
+        residual = breakdown.get("human_residual")
+        if residual is not None:
+            residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+            force_payload["forces/human_residual_norm_p95"] = float(
+                torch.quantile(residual_norm, 0.95).item()
+            )
+
+        human = breakdown.get("human")
+        if human is not None:
+            max_human_force = float(
+                self.rmappo.params.get("constraints", {}).get("max_human_force", 0.04)
+            )
+            saturated = torch.isclose(
+                human.abs(),
+                torch.tensor(max_human_force, device=human.device, dtype=human.dtype),
+                atol=1e-6,
+                rtol=0.0,
+            )
+            force_payload["forces/human_saturation_fraction"] = float(
+                saturated.float().mean().item()
+            )
+
+        if all(name in breakdown for name in ("human", "robot", "combined")):
+            composition_error = breakdown["combined"] - (
+                breakdown["human"] + breakdown["robot"]
+            )
+            force_payload["forces/composition_error_max"] = float(
+                composition_error.abs().max().item()
+            )
+            force_payload["forces/composition_error_mean"] = float(
+                composition_error.abs().mean().item()
+            )
+
+        if self.rmappo.human_model_type == "fixed_impedance":
+            force_payload["human/fixed_actor_checksum"] = (
+                self.rmappo.human_actor_checksum()
+            )
+
         if force_payload:
             self.metrics.push_update(self.global_step, force_payload)
 
@@ -474,21 +674,17 @@ class RMAPPOMilestoneEvaluator:
         
         OPTIMIZED: Removed TopK redundancy, score tracked via WandB milestone metrics.
         """
-        # ============ EVALUATION MODE: Strict isolation ============
-        # Set networks to eval mode
         for aid in self.agent_ids:
             self.rmappo.policies[aid].actor.eval()
             self.rmappo.policies[aid].critic.eval()
-        
-        # Run evaluation with torch.no_grad()
-        with torch.no_grad():
-            return_norm, num_eps = self._run_single_evaluation_episode()
-        
-        # Restore training mode
-        for aid in self.agent_ids:
-            self.rmappo.policies[aid].actor.train()
-            self.rmappo.policies[aid].critic.train()
-        # ===========================================================
+
+        try:
+            with torch.no_grad():
+                return_norm, num_eps = self._run_single_evaluation_episode()
+        finally:
+            for aid in self.agent_ids:
+                self.rmappo.policies[aid].actor.train()
+                self.rmappo.policies[aid].critic.train()
         
         milestone_return = return_norm * 1000
         
@@ -533,15 +729,34 @@ class RMAPPOMilestoneEvaluator:
         return {"skip_episode_once": True}
 
     def _run_single_evaluation_episode(self):
-        """Run single environment evaluation episode."""
+        """Run env0 evaluation and always restore normal parallel physics."""
         active_env = 0
-        target_episodes = 1
-        
-        print(f"[EVAL] Starting in-place dual rMAPPO evaluation (env0 only, 1 episode)...")
-        
         env = getattr(self.env, "unwrapped", self.env)
+        if not hasattr(env, "set_evaluation_active_env"):
+            raise RuntimeError(
+                "Environment does not support single-environment physical evaluation"
+            )
+
+        had_trainer_step = hasattr(env, "_trainer_global_step")
+        training_global_step = getattr(env, "_trainer_global_step", None)
+        env.set_evaluation_active_env(active_env)
+        try:
+            return self._run_active_evaluation_episode(env, active_env)
+        finally:
+            if had_trainer_step:
+                env.set_trainer_global_step(training_global_step)
+            env.clear_evaluation_active_env()
+            env.reset()
+            print("[EVAL] Environment reset back to parallel training mode")
+
+    def _run_active_evaluation_episode(self, env, active_env: int):
+        """Evaluate and record only the selected physical environment."""
+        target_episodes = 1
+
+        print(f"[EVAL] Starting in-place dual rMAPPO evaluation (env{active_env} only, 1 episode)...")
+
         obs, _ = env.reset()
-        
+
         num_envs = len(obs[self.agent_ids[0]])
         ep_returns = torch.zeros(num_envs, device=self.rmappo.device)
         ep_steps = torch.zeros(num_envs, dtype=torch.int64, device=self.rmappo.device)
@@ -553,13 +768,10 @@ class RMAPPOMilestoneEvaluator:
             self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
             self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
         
-        training_global_step = getattr(env, '_trainer_global_step', 0)
         eval_step_counter = 0
-        
+
         with torch.no_grad():
             while len(completed_return_norms) < target_episodes:
-                eval_step_counter += 1
-                
                 if hasattr(env, '_get_observations'):
                     current_obs = env._get_observations()
                 elif hasattr(env, 'observation_manager'):
@@ -567,36 +779,15 @@ class RMAPPOMilestoneEvaluator:
                 else:
                     current_obs = obs
                 
-                # ============ FIXED: Simplified action selection ============
                 actions_dict, detail_info = self.rmappo.select_actions(
                     current_obs, deterministic=True
                 )
-                # ============================================================
-                
-                for aid, act in actions_dict.items():
-                    if act.ndim == 2:
-                        masked_actions = torch.zeros_like(act)
-                        masked_actions[active_env] = act[active_env]
-                        actions_dict[aid] = masked_actions
-                
-                # Build detail info for environment (with noise_actions for compatibility)
-                detail_info = {
-                    "applied_forces": {aid: actions_dict[aid].clone() for aid in self.agent_ids},
-                    "mean_actions": {aid: actions_dict[aid].clone() for aid in self.agent_ids},
-                    "noise_actions": {aid: torch.zeros_like(actions_dict[aid]) for aid in self.agent_ids},
-                    "deterministic": True
-                }
                 env.set_detail_actor_info(detail_info)
-                
+
+                env.set_trainer_global_step(eval_step_counter)
                 obs, rewards, terminated, truncated, infos = env.step(actions_dict)
-                
-                if (eval_step_counter % 10 == 0 and hasattr(env, 'step_tracer') and 
-                    env.step_tracer is not None):
-                    original_logging = env.step_tracer.enable_console_logging
-                    env.step_tracer.enable_console_logging = True
-                    env.step_tracer.maybe_print_step(env, rewards, training_global_step, force_print=True)
-                    env.step_tracer.enable_console_logging = original_logging
-                
+                eval_step_counter += 1
+
                 step_rewards = torch.stack([rewards[aid] for aid in self.agent_ids])
                 avg_step_rewards = step_rewards.mean(dim=0)
                 ep_returns[active_env] += avg_step_rewards[active_env]
@@ -630,7 +821,6 @@ class RMAPPOMilestoneEvaluator:
         
         print(f"[EVAL] Completed: {len(final_return_norms)} episodes, Average return_norm: {avg_return_norm:.4f}")
         
-        _, _ = env.reset()
         return avg_return_norm, len(final_return_norms)
 
     def _extract_dual_model_state(self):
@@ -752,7 +942,6 @@ class WandBLogger:
             name=run_name,
             config=config,
             tags=["rmappo", "multi-agent", "surgical-robot", "rnn", "dual-network", "reproducible"],
-            settings=wandb.Settings(start_method="thread")
         )
         
         rmappo_cfg = config.get("algorithms", {}).get("rmappo", {})
@@ -862,7 +1051,7 @@ class WandBLogger:
         passthrough_prefixes = (
             "train/", "forces/", "lr/", "eval/",
             "ppo/", "value/", "policy/", "rnn/", "grad/", "milestone/",
-            "lifecycle/"
+            "lifecycle/", "human/"
         )
         for k, v in metrics_data.items():
             if any(k.startswith(p) for p in passthrough_prefixes):
@@ -883,10 +1072,12 @@ class WandBLogger:
 class TrainingConfiguration:
     """Training configuration loader."""
     
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, params: Optional[Dict[str, Any]] = None):
         self.config_path = config_path
-        with open(self.config_path, 'r') as f:
-            self.params = yaml.safe_load(f)
+        if params is None:
+            with open(self.config_path, 'r') as f:
+                params = yaml.safe_load(f)
+        self.params = params or {}
     
     @classmethod
     def from_yaml(cls, config_path: str):
@@ -898,7 +1089,12 @@ class TrainingConfiguration:
         return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def build_flat_dual_checkpoint(rmappo, runner, score: float, milestone: int) -> Dict[str, Any]:
+def build_flat_dual_checkpoint(
+    rmappo,
+    runner,
+    score: Optional[float] = None,
+    milestone: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Build flat checkpoint with dual networks for milestone saving and resume.
     
@@ -911,13 +1107,18 @@ def build_flat_dual_checkpoint(rmappo, runner, score: float, milestone: int) -> 
     checkpoint = {
         "algorithm": "rmappo_dual",
         "agent_ids": rmappo.agent_ids,
-        "score": float(score),
-        "milestone": int(milestone),
+        "params": rmappo.params,
+        "human_model_type": getattr(rmappo, "human_model_type", "learnable"),
+        "human_impedance": rmappo.params.get("human_impedance", {}),
+        "force_limit_semantics": "per_axis",
+        "human_actor_checksum": rmappo.human_actor_checksum(),
+        "git_commit": rmappo.params.get("git_commit", "unknown"),
         
         # Counters: ensure LR schedule and evaluation continuity
         "global_steps_total": int(runner.global_step),
         "training_rounds_total": int(rmappo.train_updates),
         "episodes_done_total": int(runner.global_episodes),
+        "max_milestone_triggered": int(runner.max_milestone_triggered),
         
         # Four networks (flat keys)
         "human_actor": rmappo.policies["human"].actor.state_dict(),
@@ -925,6 +1126,10 @@ def build_flat_dual_checkpoint(rmappo, runner, score: float, milestone: int) -> 
         "robot_actor": rmappo.policies["robot"].actor.state_dict(),
         "robot_critic": rmappo.policies["robot"].critic.state_dict(),
     }
+    if score is not None:
+        checkpoint["score"] = float(score)
+    if milestone is not None:
+        checkpoint["milestone"] = int(milestone)
     
     # ============ OPTIMIZED: Multi-path optimizer state extraction ============
     # Support different optimizer storage patterns:
@@ -1002,6 +1207,16 @@ def save_milestone_checkpoint(ckpt_dir: str, rmappo, runner, score: float, miles
     
     print(f"[CKPT] Saved milestone {milestone} (score={score:.4f}) -> {fname}")
     
+    return fpath
+
+
+def save_final_checkpoint_rmappo(ckpt_dir: str, rmappo, runner) -> str:
+    """Save a resume-compatible checkpoint at the configured training limit."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    global_step = int(getattr(runner, "global_step", 0))
+    fpath = os.path.join(ckpt_dir, f"final_step_{global_step:09d}.pth")
+    torch.save(build_flat_dual_checkpoint(rmappo, runner), fpath)
+    print(f"[CKPT] Saved final checkpoint -> {fpath}")
     return fpath
 
 
@@ -1084,8 +1299,11 @@ def resume_from_checkpoint(path: str, rmappo, runner, device=None) -> None:
         print(f"[RESUME] Restored RNG states")
     
     # 6) Optional: restore milestone tracking
-    if "milestone" in ckpt:
-        runner.max_milestone_triggered = int(ckpt["milestone"])
+    restored_milestone = ckpt.get(
+        "max_milestone_triggered", ckpt.get("milestone")
+    )
+    if restored_milestone is not None:
+        runner.max_milestone_triggered = int(restored_milestone)
         print(f"[RESUME] Last milestone: {runner.max_milestone_triggered}")
     
     print(f"[RESUME] Checkpoint restoration complete\n")
@@ -1102,12 +1320,20 @@ def create_argument_parser(config_path: str = None) -> argparse.ArgumentParser:
                        help="Path to training configuration YAML")
     parser.add_argument("--checkpoint", type=str, default=None,
                        help="Path to checkpoint (.pth) for resume training or play")
-    parser.add_argument("--num_envs", type=int, default=512,
-                       help="Number of parallel environments")
+    parser.add_argument("--num_envs", type=int, default=None,
+                       help="Number of parallel environments (default: resolved config or 512)")
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0",
                        help="Environment task name")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Random seed (default: resolved config/checkpoint)")
+    parser.add_argument(
+        "--human_model_type",
+        choices=tuple(sorted(SUPPORTED_HUMAN_MODEL_TYPES)),
+        default=None,
+        help="Override the human force model for a new run",
+    )
+    parser.add_argument("--run_dir", type=str, default=None,
+                       help="Explicit run directory")
     parser.add_argument("--max_global_steps", type=int, default=0,
                        help="Maximum global steps (0=use config value)")
     parser.add_argument("--top_k_models", type=int, default=10,

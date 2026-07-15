@@ -16,7 +16,7 @@ human_impedance:
   reference_speed: 0.02             # Tangential reference speed (m/s)
 
 # Residual uses the existing human actor's full per-axis force range. It can
-# therefore cancel or reverse the impedance prior before total-force clipping.
+# therefore cancel or reverse the bounded impedance prior before final clipping.
 human_residual:
   mapping: "policy_tanh_times_max_human_force"
   can_override_impedance: true
@@ -193,7 +193,4 @@ maddpg_config:
 # Training Monitoring
 # ==============================================================================
 training_monitor:
-  # Milestone episodes for policy evaluation and TopK model selection
-  # Episodes are counted as sum of all environment completions
-  # These are per-env baselines and will be auto-scaled by --num_envs
-  milestone_episodes: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 115, 130, 145, 160, 175, 190, 200, 300, 400, 500]
+  milestone_episodes: [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270, 285, 300, 315, 330, 345, 360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525, 540, 555, 570, 585, 600]

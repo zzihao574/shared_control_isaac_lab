@@ -140,7 +140,7 @@ class CompleteConstraintChecker:
         """Initialize constraint checker with physics interfaces."""
         self.device = device
         self.collision_threshold = collision_threshold
-        
+
         self.physics_attachment_interface = omni.physx.get_physx_attachment_private_interface()
         self.physics_scene_query_interface = omni.physx.get_physx_scene_query_interface()
     

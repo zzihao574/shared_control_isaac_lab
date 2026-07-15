@@ -106,11 +106,16 @@ class HumanForceController:
     def compute_impedance(
         self, eef_position: torch.Tensor, eef_velocity: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute the raw impedance request before final human-force saturation."""
+        """Compute the per-axis bounded impedance prior."""
         reference_position, reference_velocity = self.compute_reference(eef_position)
         position_error = reference_position - eef_position
         velocity_error = reference_velocity - eef_velocity
         impedance = self.kp.unsqueeze(0) * position_error + self.kd.unsqueeze(0) * velocity_error
+        impedance = torch.clamp(
+            impedance,
+            -self.max_human_force,
+            self.max_human_force,
+        )
         return impedance, reference_position, reference_velocity
 
     def compose(
@@ -135,7 +140,8 @@ class HumanForceController:
             residual = policy
             requested_total = impedance + residual
 
-        # All three modes share exactly one physical human-force limit.
+        # The bounded impedance prior is composed first; this final clamp is the
+        # physical human-force safety limit after an optional residual is added.
         total = torch.clamp(
             requested_total,
             -self.max_human_force,

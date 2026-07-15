@@ -90,7 +90,7 @@ class HumanForceControllerTest(unittest.TestCase):
         self.assertTrue(torch.equal(result.total, policy))
         self.assertTrue(torch.count_nonzero(result.residual) == 0)
 
-    def test_all_modes_share_one_final_human_force_limit(self):
+    def test_impedance_prior_and_final_human_force_are_bounded(self):
         excessive_policy = torch.tensor([[0.08, -0.09, 0.10]])
         far_off_path = torch.tensor([[0.50, -0.20, 0.03]])
 
@@ -103,7 +103,7 @@ class HumanForceControllerTest(unittest.TestCase):
         fixed = HumanForceController(make_params("fixed_impedance"), "cpu").compose(
             torch.zeros_like(excessive_policy), far_off_path, self.zero_velocity
         )
-        self.assertLess(float(fixed.impedance[0, 0]), -0.04)
+        self.assertAlmostEqual(float(fixed.impedance[0, 0]), -0.04, places=6)
         self.assertAlmostEqual(float(fixed.total[0, 0]), -0.04, places=6)
 
         residual = HumanForceController(make_params("residual_impedance"), "cpu").compose(
@@ -112,6 +112,12 @@ class HumanForceControllerTest(unittest.TestCase):
         self.assertTrue(torch.equal(residual.residual, excessive_policy))
         expected = (residual.impedance + excessive_policy).clamp(-0.04, 0.04)
         self.assertTrue(torch.equal(residual.total, expected))
+
+        cancelling = HumanForceController(make_params("residual_impedance"), "cpu").compose(
+            torch.tensor([[0.04, 0.0, 0.0]]), far_off_path, self.zero_velocity
+        )
+        self.assertAlmostEqual(float(cancelling.impedance[0, 0]), -0.04, places=6)
+        self.assertAlmostEqual(float(cancelling.total[0, 0]), 0.0, places=6)
 
     def test_residual_adds_per_axis_and_clamps_total(self):
         controller = HumanForceController(make_params("residual_impedance"), "cpu")

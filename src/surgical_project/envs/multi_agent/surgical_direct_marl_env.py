@@ -383,7 +383,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         )
 
     def compute_next_impedance_force(self) -> torch.Tensor:
-        """Compute impedance for the post-step state without mutating current-step caches."""
+        """Compute the bounded post-step impedance prior without mutating caches."""
         impedance, _, _ = self.human_force_controller.compute_impedance(
             self._get_stylus_position(), self._get_stylus_velocity()
         )
@@ -394,7 +394,7 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         return self.force_channels.get_applied_actions()
 
     def get_applied_impedance_force(self) -> torch.Tensor:
-        """Return the impedance request associated with the latest transition."""
+        """Return the bounded impedance prior associated with the latest transition."""
         return self.force_channels.get_applied_impedance()
 
     def get_force_breakdown(self) -> Dict[str, torch.Tensor]:

@@ -122,6 +122,17 @@ class MaddpgHumanModeTest(unittest.TestCase):
         expected = np_to_tensor([[0.0, 0.5, -1.0]])
         self.assertTrue(output.equal(expected))
 
+    def test_residual_composition_bounds_impedance_before_addition(self):
+        params = make_params("residual_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
+        output = maddpg._compose_human_action_norm(
+            policy_action_norm=np_to_tensor([[-1.0, 0.0, 0.0]]),
+            impedance_force=np_to_tensor([[0.08, 0.0, 0.0]]),
+        )
+        self.assertTrue(output.equal(np_to_tensor([[0.0, 0.0, 0.0]])))
+
     def test_environment_action_selection_does_not_build_gradients(self):
         params = make_params("residual_impedance")
         maddpg = MADDPG(

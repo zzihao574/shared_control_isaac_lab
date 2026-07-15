@@ -9,15 +9,12 @@ FIXED: Simplified action selection interface, removed TopKManager, optimized con
 
 import sys
 import os
+import json
+import subprocess
 import torch
-import numpy as np
-import random
-import copy
 import yaml
-import traceback
-import time
 from datetime import datetime
-from typing import Dict, Any, Tuple, List
+from typing import Dict
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -27,30 +24,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from isaaclab.app import AppLauncher
 from utils.training_helpers_rmappo import (
-    WandBLogger, TrainingConfiguration, create_argument_parser, 
+    WandBLogger, create_argument_parser,
     MetricsHub, RMAPPOTrainingRunner, RMAPPOMilestoneEvaluator, 
-    save_milestone_checkpoint, resume_from_checkpoint
+    resume_from_checkpoint, save_final_checkpoint_rmappo,
+    RMAPPOSeedPlan, build_rmappo_wandb_config, resolve_rmappo_config,
+    setup_global_reproducibility,
 )
-
-
-def setup_global_reproducibility(seed: int, strict_determinism: bool = True):
-    """Setup global reproducibility."""
-    import os
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-    
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    
-    if strict_determinism:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    print(f"[SEED] Reproducibility set. seed={seed}, strict={strict_determinism}")
 
 
 def setup_environment(args, config):
@@ -62,6 +41,7 @@ def setup_environment(args, config):
     env_cfg = SurgicalDirectMARLEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
+    env_cfg.params = config.params
     
     env = gym.make(args.task, cfg=env_cfg)
     return env, env_cfg
@@ -106,6 +86,9 @@ def build_dual_network_config_from_params(params: dict):
     import copy
     human_config = copy.deepcopy(common)
     robot_config = copy.deepcopy(common)
+    lr_decay = copy.deepcopy(params.get("training", {}).get("lr_decay", {}))
+    human_config["lr_decay"] = lr_decay
+    robot_config["lr_decay"] = copy.deepcopy(lr_decay)
     
     print(f"[CONFIG] Successfully built dual network configuration from params")
     
@@ -119,36 +102,29 @@ def build_dual_network_config_from_params(params: dict):
 def initialize_rmappo_algorithm(env, config, args, metrics_hub):
     """Create and initialize dual rMAPPO algorithm wrapper."""
     device = config.get_compute_device()
-    
-    num_envs = args.num_envs
-    if hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'num_envs'):
-        num_envs = env.unwrapped.num_envs
-    elif hasattr(env, 'num_envs'):
-        num_envs = env.num_envs
-
-    obs_dict, _ = env.reset()
-    obs_dim = int(obs_dict["human"].shape[1])
-    share_obs_dim = obs_dim * 2
-    
+    actual_env = getattr(env, "unwrapped", env)
     try:
-        act_dim = int(env.unwrapped.action_space['human'].shape[0])
-    except Exception:
-        raise RuntimeError("[ERROR] Cannot infer action dimension from environment")
+        num_envs = int(actual_env.num_envs)
+        obs_dim = int(actual_env.cfg.observation_spaces["human"])
+        act_dim = int(actual_env.cfg.action_spaces["human"])
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "[ERROR] Cannot infer rMAPPO dimensions from environment cfg"
+        ) from exc
+    share_obs_dim = obs_dim * 2
 
     print(f"[RMAPPO] Dual Network Architecture:")
     print(f"  Environments: {num_envs}")
     print(f"  Obs dim: {obs_dim}, Share obs dim: {share_obs_dim}, Action dim: {act_dim}")
 
-    # ============ FIXED: Use params-based config builder ============
     dual_config = build_dual_network_config_from_params(config.params)
-    config.params['mappo_args'] = dual_config['common']
-    # ================================================================
     
-    rollout_horizon = config.params.get('rollout_horizon', 256)
+    rollout_horizon = dual_config['common'].get('rollout_horizon', 256)
     data_chunk_length = dual_config['common'].get('data_chunk_length', 16)
     if rollout_horizon % data_chunk_length != 0:
         raise ValueError(f"[CONFIG ERROR] rollout_horizon must be divisible by data_chunk_length")
     
+    RMAPPOSeedPlan(config.params["seed"]).apply_network_seed()
     return DualRMAPPOWrapper(
         dual_config, device, num_envs, obs_dim, share_obs_dim, act_dim, config.params, metrics_hub, args
     )
@@ -163,7 +139,10 @@ def inject_step_tracer(env, config, num_envs):
     actual_env.step_tracer = StepTracer(
         num_envs=num_envs,
         device=getattr(actual_env, "device", torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
-        enable_console_logging=config.params.get("logging", {}).get("enable_console_logging", False)
+        enable_console_logging=config.params.get("logging", {}).get("enable_console_logging", False),
+        print_every_steps=int(
+            config.params.get("logging", {}).get("print_every_steps", 10)
+        ),
     )
 
 
@@ -178,10 +157,17 @@ class DualRMAPPOWrapper:
         self.num_envs = num_envs
         self.params = params
         self.agent_ids = ["human", "robot"]
+        self.human_model_type = str(params.get("human_model_type", "learnable"))
+        self.trainable_agent_ids = (
+            ["robot"]
+            if self.human_model_type == "fixed_impedance"
+            else list(self.agent_ids)
+        )
         self.metrics_hub = metrics_hub
         self.args = args
-        
-        self.T = int(params.get('rollout_horizon', 256))
+
+        self.rmappo_cfg = params["algorithms"]["rmappo"]
+        self.T = int(self.rmappo_cfg.get('rollout_horizon', 256))
         self.rollout_step = 0
         self.train_updates = 0
         self._is_eval_mode = False
@@ -260,6 +246,8 @@ class DualRMAPPOWrapper:
         print(f"  Rollout horizon: {self.T}")
         print(f"  Networks: independent human & robot")
         print(f"  Initial weights: robot copied from human")
+        print(f"  Human model: {self.human_model_type}")
+        print(f"  Trainable agents: {self.trainable_agent_ids}")
         
         self.train_generator = None
 
@@ -337,13 +325,20 @@ class DualRMAPPOWrapper:
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
             masks = torch.ones(obs.shape[0], 1, device=self.device)
-            
-            with torch.no_grad():
-                v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
-                    share_obs, obs, 
-                    self.rnn_states[aid]["actor"], self.rnn_states[aid]["critic"],
-                    masks, deterministic=deterministic
-                )
+
+            if aid == "human" and self.human_model_type == "fixed_impedance":
+                a = torch.zeros(obs.shape[0], self.policies[aid].act_dim, device=self.device)
+                lp = torch.zeros(obs.shape[0], 1, device=self.device)
+                v = torch.zeros(obs.shape[0], 1, device=self.device)
+                rnn_a_new = self.rnn_states[aid]["actor"]
+                rnn_c_new = self.rnn_states[aid]["critic"]
+            else:
+                with torch.no_grad():
+                    v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
+                        share_obs, obs,
+                        self.rnn_states[aid]["actor"], self.rnn_states[aid]["critic"],
+                        masks, deterministic=deterministic
+                    )
             
             actions_norm[aid] = a
             action_log_probs[aid] = lp
@@ -433,6 +428,10 @@ class DualRMAPPOWrapper:
         stats = {}
         
         for aid in self.agent_ids:
+            if aid not in self.trainable_agent_ids:
+                self.buffers[aid].after_update()
+                continue
+
             next_obs_dict = getattr(self, '_next_obs', None)
             if next_obs_dict is not None:
                 next_obs_scaled = self.build_obs_scaled(next_obs_dict)
@@ -446,8 +445,8 @@ class DualRMAPPOWrapper:
             else:
                 last_values = torch.zeros(self.num_envs, 1, device=self.device)
             
-            gamma = self.params.get('mappo_args', {}).get('gamma', 0.99)
-            gae_lambda = self.params.get('mappo_args', {}).get('gae_lambda', 0.95)
+            gamma = self.rmappo_cfg.get('gamma', 0.99)
+            gae_lambda = self.rmappo_cfg.get('gae_lambda', 0.95)
             
             self.buffers[aid].compute_returns_and_adv(last_values, gamma, gae_lambda)
             
@@ -466,6 +465,11 @@ class DualRMAPPOWrapper:
         
         return stats
 
+    def human_actor_checksum(self) -> float:
+        """Return a compact checksum for fixed-human immutability checks."""
+        actor = self.policies["human"].actor
+        return float(sum(p.detach().double().sum().item() for p in actor.parameters()))
+
     def store_next_obs(self, next_obs):
         """Store next observations for bootstrapping."""
         self._next_obs = next_obs
@@ -474,8 +478,10 @@ class DualRMAPPOWrapper:
 class TrainingOrchestrator:
     """Main rMAPPO trainer with dual network infrastructure and mid-rollout evaluation support."""
     
-    def __init__(self, args):
+    def __init__(self, args, config):
         self.args = args
+        self.config = config
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"[ORCHESTRATOR] Initializing Dual rMAPPO Training Orchestrator...")
         
         self._setup_configuration()
@@ -486,11 +492,9 @@ class TrainingOrchestrator:
         print(f"[ORCHESTRATOR] Initialization complete")
 
     def _setup_configuration(self):
-        """Load and setup training configuration."""
-        self.config = TrainingConfiguration.from_yaml(self.args.config)
-        setup_global_reproducibility(self.args.seed, strict_determinism=True)
-        self.config.params['seed'] = self.args.seed
-        self._apply_per_env_scaling()
+        """Finalize bookkeeping derived from the already-resolved config."""
+        if not self.args.checkpoint:
+            self._apply_per_env_scaling()
 
     def _apply_per_env_scaling(self):
         """Scale parameters by number of environments."""
@@ -504,62 +508,97 @@ class TrainingOrchestrator:
     def _setup_environment(self):
         """Create and configure the environment."""
         self.env, self.env_cfg = setup_environment(self.args, self.config)
-        actual_env = getattr(self.env, 'unwrapped', self.env)
-        actual_env.params = self.config.params
         inject_step_tracer(self.env, self.config, self.args.num_envs)
 
     def _setup_training_components(self):
         """Initialize training components."""
         self.metrics_hub = MetricsHub()
-        self.wandb_logger = WandBLogger(enabled=self.args.wandb)
-        run_config = {**vars(self.args), **self.config.params}
-        run_name = f"rmappo_dual_{self.args.num_envs}envs_{time.strftime('%Y%m%d_%H%M%S')}"
-        self.wandb_logger.initialize_run(run_config, run_name)
-        self.wandb_logger.attach_metrics_hub(self.metrics_hub)
-        
         self.rmappo = initialize_rmappo_algorithm(self.env, self.config, self.args, self.metrics_hub)
-        
-        mappo_max_steps = int(self.config.params.get('mappo_args', {}).get('max_global_steps', 200000))
-        if self.args.max_global_steps > 0:
-            self.max_global_steps = self.args.max_global_steps
-        else:
-            self.max_global_steps = mappo_max_steps
+
+        rmappo_cfg = self.config.params["algorithms"]["rmappo"]
+        self.max_global_steps = int(rmappo_cfg["max_global_steps"])
+        human_model_type = self.config.params.get("human_model_type", "learnable")
+        self.log_dir = self.args.run_dir or os.path.join(
+            "logs", "rmappo_dual", human_model_type, self.timestamp
+        )
+        self.ckpt_dir = os.path.join(self.log_dir, "checkpoints")
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+                text=True,
+            ).strip()
+        except Exception:
+            git_commit = "unknown"
+        self.config.params["git_commit"] = git_commit
+
+        resolved_config_path = os.path.join(self.log_dir, "resolved_config.yaml")
+        with open(resolved_config_path, "w", encoding="utf-8") as config_file:
+            yaml.safe_dump(
+                self.config.params,
+                config_file,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+        manifest = {
+            "algorithm": "rmappo",
+            "human_model_type": human_model_type,
+            "seed": self.args.seed,
+            "num_envs": self.args.num_envs,
+            "max_global_steps": self.max_global_steps,
+            "git_commit": git_commit,
+            "resolved_config": resolved_config_path,
+        }
+        with open(
+            os.path.join(self.log_dir, "run_manifest.json"), "w", encoding="utf-8"
+        ) as manifest_file:
+            json.dump(manifest, manifest_file, indent=2)
+
+        self.wandb_logger = WandBLogger(enabled=self.args.wandb)
+        if self.wandb_logger.enabled:
+            actual_env = getattr(self.env, "unwrapped", self.env)
+            human_metadata = actual_env.human_force_controller.wandb_metadata()
+            run_config = build_rmappo_wandb_config(
+                resolved_config=self.config.params,
+                runtime={
+                    "seed": self.args.seed,
+                    "num_envs": self.args.num_envs,
+                    "max_global_steps": self.max_global_steps,
+                },
+                human_metadata=human_metadata,
+                git_commit=git_commit,
+            )
+            run_name = (
+                f"rmappo_{human_model_type}_seed{self.args.seed}_{self.timestamp}"
+            )
+            self.wandb_logger.initialize_run(run_config, run_name)
+            print(f"[SETUP] WandB initialized with run name: {run_name}")
+        self.wandb_logger.attach_metrics_hub(self.metrics_hub)
 
     def _setup_runners_and_evaluators(self):
         """Initialize training runner and evaluator with cross-references."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = f"logs/rmappo_dual/{timestamp}"
-        os.makedirs(self.log_dir, exist_ok=True)
-        
-        # Create checkpoints directory
-        self.ckpt_dir = os.path.join(self.log_dir, "checkpoints")
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        
-        # ============ MODIFIED: Create runner first ============
         self.runner = RMAPPOTrainingRunner(
             env=self.env,
             rmappo_wrapper=self.rmappo,
             metrics_hub=self.metrics_hub,
             agent_ids=self.rmappo.agent_ids,
             max_global_steps=self.max_global_steps,
-            evaluator=None  # Will be set after evaluator creation
+            evaluator=None
         )
-        
-        # ============ FIXED: Remove topk_mgr parameter ============
+
         self.evaluator = RMAPPOMilestoneEvaluator(
             env=self.env,
             rmappo_wrapper=self.rmappo,
             metrics_hub=self.metrics_hub,
             log_dir=self.log_dir,
             agent_ids=self.rmappo.agent_ids,
-            runner=self.runner  # Pass runner for checkpoint saving
+            runner=self.runner
         )
-        # ==========================================================
-        
-        # Set evaluator reference in runner
+
         self.runner.evaluator = self.evaluator
-        
-        # ============ NEW: Resume from checkpoint if provided ============
+
         if self.args.checkpoint:
             resume_from_checkpoint(
                 self.args.checkpoint, 
@@ -568,7 +607,6 @@ class TrainingOrchestrator:
                 device=self.config.get_compute_device()
             )
             print(f"[SETUP] Resumed from checkpoint: {self.args.checkpoint}")
-        # ==================================================================
 
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode."""
@@ -578,7 +616,7 @@ class TrainingOrchestrator:
     def train(self):
         """Main training loop - simplified as evaluation is now handled in runner."""
         print(f"[TRAIN] Starting dual rMAPPO training with mid-rollout evaluation support")
-        
+
         obs_dict, _ = self.env.reset()
         self.runner._current_obs = obs_dict
         
@@ -598,12 +636,21 @@ class TrainingOrchestrator:
         print(f"  Final episodes: {self.runner.global_episodes}")
         print(f"  Training updates: {self.rmappo.train_updates}")
         print(f"  Last milestone: {self.runner.max_milestone_triggered}")
+        final_checkpoint = save_final_checkpoint_rmappo(
+            self.ckpt_dir, self.rmappo, self.runner
+        )
         print(f"\n[INFO] All checkpoints saved to: {self.ckpt_dir}")
+        print(f"[INFO] Final checkpoint: {final_checkpoint}")
         print(f"[INFO] Check milestones_index.txt for saved checkpoints list")
-        
-        if hasattr(self, 'env'):
+
+    def close(self):
+        """Close training resources once, including after an exception."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if hasattr(self, "env"):
             self.env.close()
-        if hasattr(self, 'wandb_logger'):
+        if hasattr(self, "wandb_logger"):
             self.wandb_logger.finalize_run()
 
 
@@ -616,14 +663,20 @@ def main():
     parser = create_argument_parser()
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
-    
+
+    resolved_config = resolve_rmappo_config(args_cli)
+    setup_global_reproducibility(args_cli.seed, strict_determinism=True)
+
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
-    
-    trainer = TrainingOrchestrator(args_cli)
-    trainer.train()
-    
-    simulation_app.close()
+    trainer = None
+    try:
+        trainer = TrainingOrchestrator(args_cli, resolved_config)
+        trainer.train()
+    finally:
+        if trainer is not None:
+            trainer.close()
+        simulation_app.close()
 
 
 if __name__ == "__main__":

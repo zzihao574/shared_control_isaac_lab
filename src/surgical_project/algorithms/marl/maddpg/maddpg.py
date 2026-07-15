@@ -315,9 +315,12 @@ class MADDPG:
         max_human_force = float(
             self.params.get("constraints", {}).get("max_human_force", 0.04)
         )
-        impedance_norm = impedance_force / max_human_force
+        # Enforce the same bounded-prior semantics used by the environment.
+        # Replay normally contains an already bounded prior, while this clamp
+        # also keeps actor/target composition safe for externally supplied data.
+        impedance_norm = (impedance_force / max_human_force).clamp(-1.0, 1.0)
         if self.human_model_type == "fixed_impedance":
-            return impedance_norm.clamp(-1.0, 1.0)
+            return impedance_norm
         if self.human_model_type == "residual_impedance":
             return (impedance_norm + policy_action_norm).clamp(-1.0, 1.0)
         return policy_action_norm

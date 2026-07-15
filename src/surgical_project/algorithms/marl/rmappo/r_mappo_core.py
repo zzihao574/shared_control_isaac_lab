@@ -285,17 +285,10 @@ class RMAPPOAlgorithm:
         self.actor_lr_init = self.policy.actor_optimizer.param_groups[0]["lr"]
         self.critic_lr_init = self.policy.critic_optimizer.param_groups[0]["lr"]
         
-        # Load LR decay config from args
-        if 'args' in args and hasattr(args['args'], 'config'):
-            import yaml
-            try:
-                with open(args['args'].config, 'r') as f:
-                    full_cfg = yaml.safe_load(f)
-                    decay_cfg = full_cfg.get('training', {}).get('lr_decay', {})
-            except Exception:
-                decay_cfg = {}
-        else:
-            decay_cfg = {}
+        # The caller injects the already-resolved training configuration here.
+        # Do not reopen the default YAML: checkpoint/CLI conditions must remain
+        # the single source of truth.
+        decay_cfg = args.get("lr_decay", {})
         
         self._lr_decay_enabled = bool(decay_cfg.get('enabled', False))
         self._lr_final_factor = float(decay_cfg.get('final_factor', 0.1))
