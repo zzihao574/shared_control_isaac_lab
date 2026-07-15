@@ -20,8 +20,9 @@ class RMAPPOWandbConfigTest(unittest.TestCase):
                 "max_human_force": 0.04,
                 "max_robot_force": 0.03,
             },
+            "force_scaling": {"human_factor": 25.0, "robot_factor": 100.0 / 3.0},
             "algorithms": {"rmappo": {"gamma": 0.99, "hidden_size": 256}},
-            "obs_scaling": {"factors": [1.0] * 6},
+            "obs_scaling": {"factors": [1.0] * 6 + [25.0] * 3},
         }
         metadata = {
             "human/kp_x": 0.8,
@@ -44,6 +45,8 @@ class RMAPPOWandbConfigTest(unittest.TestCase):
         self.assertEqual(config["robot/max_force_per_axis"], 0.03)
         self.assertEqual(config["human/kp_x"], 0.8)
         self.assertTrue(config["human/residual_can_override_impedance"])
+        self.assertEqual(config["human/force_input_factor"], 25.0)
+        self.assertEqual(config["observation/opponent_action_dim"], 3)
         self.assertEqual(config["git_commit"], "abc123")
 
 

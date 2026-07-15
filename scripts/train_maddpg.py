@@ -213,6 +213,34 @@ class MADDPGTrainer:
             if float(constraints.get(limit_name, 0.04)) <= 0.0:
                 raise ValueError(f"constraints.{limit_name} must be positive")
 
+        force_scaling = params.get("force_scaling", {})
+        for agent_name in ("human", "robot"):
+            factor_name = f"{agent_name}_factor"
+            limit_name = f"max_{agent_name}_force"
+            factor = float(force_scaling.get(factor_name, 0.0))
+            limit = float(constraints.get(limit_name, 0.04))
+            if factor <= 0.0:
+                raise ValueError(f"force_scaling.{factor_name} must be positive")
+            if not np.isclose(factor * limit, 1.0, rtol=1e-6, atol=1e-6):
+                raise ValueError(
+                    f"force_scaling.{factor_name} must equal 1/{limit_name}; "
+                    f"got {factor} * {limit}"
+                )
+
+        obs_factors = params.get("obs_scaling", {}).get("factors", [])
+        if len(obs_factors) != 9:
+            raise ValueError("obs_scaling.factors must contain 9 values")
+        human_factor = float(force_scaling["human_factor"])
+        robot_factor = float(force_scaling["robot_factor"])
+        if not np.isclose(human_factor, robot_factor, rtol=1e-6, atol=1e-6):
+            raise ValueError(
+                "The shared observation scaler requires equal human/robot force factors"
+            )
+        if not np.allclose(obs_factors[-3:], human_factor, rtol=1e-6, atol=1e-6):
+            raise ValueError(
+                "The final three obs_scaling factors must match force_scaling"
+            )
+
         trajectory = params.get("trajectory", {})
         start = np.asarray(trajectory.get("start_point"), dtype=np.float64)
         end = np.asarray(trajectory.get("end_point"), dtype=np.float64)

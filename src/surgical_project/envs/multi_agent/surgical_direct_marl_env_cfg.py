@@ -54,8 +54,8 @@ class SurgicalDirectMARLEnvCfg(DirectMARLEnvCfg):
     }
     
     observation_spaces = {
-        "human": 6, # Corrected to actual dimensions
-        "robot": 6, # Corrected to actual dimensions
+        "human": 9,  # Base state (6) + previous applied robot force (3)
+        "robot": 9,  # Base state (6) + previous applied human force (3)
     }
     
     # MADDPG constructs its centralized critic input from joint observations.

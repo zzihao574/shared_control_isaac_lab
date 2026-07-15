@@ -96,6 +96,34 @@ def validate_rmappo_config(params: Dict[str, Any]) -> None:
         if float(constraints.get(name, 0.0)) <= 0.0:
             raise ValueError(f"constraints.{name} must be positive")
 
+    force_scaling = params.get("force_scaling", {})
+    for agent_name in ("human", "robot"):
+        factor_name = f"{agent_name}_factor"
+        limit_name = f"max_{agent_name}_force"
+        factor = float(force_scaling.get(factor_name, 0.0))
+        limit = float(constraints.get(limit_name, 0.0))
+        if factor <= 0.0:
+            raise ValueError(f"force_scaling.{factor_name} must be positive")
+        if not np.isclose(factor * limit, 1.0, rtol=1e-6, atol=1e-6):
+            raise ValueError(
+                f"force_scaling.{factor_name} must equal 1/{limit_name}; "
+                f"got {factor} * {limit}"
+            )
+
+    obs_factors = params.get("obs_scaling", {}).get("factors", [])
+    if len(obs_factors) != 9:
+        raise ValueError("obs_scaling.factors must contain 9 values")
+    human_factor = float(force_scaling["human_factor"])
+    robot_factor = float(force_scaling["robot_factor"])
+    if not np.isclose(human_factor, robot_factor, rtol=1e-6, atol=1e-6):
+        raise ValueError(
+            "The shared observation scaler requires equal human/robot force factors"
+        )
+    if not np.allclose(obs_factors[-3:], human_factor, rtol=1e-6, atol=1e-6):
+        raise ValueError(
+            "The final three obs_scaling factors must match force_scaling"
+        )
+
 
 def resolve_rmappo_config(args) -> "TrainingConfiguration":
     """Resolve YAML/checkpoint configuration and CLI overrides before launch."""
@@ -153,6 +181,7 @@ def build_rmappo_wandb_config(
     """Build complete and query-friendly WandB metadata."""
     config = copy.deepcopy(resolved_config)
     constraints = resolved_config.get("constraints", {})
+    force_scaling = resolved_config.get("force_scaling", {})
     config.update(
         {
             "algorithm": "rmappo",
@@ -166,6 +195,16 @@ def build_rmappo_wandb_config(
             "robot/max_force_per_axis": float(
                 constraints.get("max_robot_force", 0.04)
             ),
+            "human/force_input_factor": float(
+                force_scaling.get("human_factor", 25.0)
+            ),
+            "robot/force_input_factor": float(
+                force_scaling.get("robot_factor", 25.0)
+            ),
+            "observation/base_dim": 6,
+            "observation/opponent_action_dim": 3,
+            "observation/total_dim": 9,
+            "observation/opponent_action_source": "previous_actual_applied_force",
             "git_commit": git_commit,
         }
     )

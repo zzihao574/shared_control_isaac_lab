@@ -68,12 +68,27 @@ class MADDPG:
             if self.human_model_type == "fixed_impedance"
             else list(self.agent_ids)
         )
+
+        force_scaling = self.params["force_scaling"]
+        self.human_force_factor = float(force_scaling["human_factor"])
+        self.robot_force_factor = float(force_scaling["robot_factor"])
         
         # Get dimensions from environment cfg
         self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
         self.action_dims = [self.actual_env.cfg.action_spaces[agent] for agent in self.agent_ids]
         self.total_obs_dim = sum(self.obs_dims)
         self.total_action_dim = sum(self.action_dims)
+        action_scale = []
+        for agent_id, action_dim in zip(self.agent_ids, self.action_dims):
+            factor = (
+                self.human_force_factor
+                if agent_id == self.human_agent_id
+                else self.robot_force_factor
+            )
+            action_scale.extend([factor] * action_dim)
+        self.action_force_scale = torch.tensor(
+            action_scale, device=self.device, dtype=torch.float32
+        ).view(1, -1)
 
         print(f"[MADDPG] Shared Network Architecture with Persistent Generator Strategy:")
         print(f"  Environments: {self.num_envs}")
@@ -312,13 +327,12 @@ class MADDPG:
         self, policy_action_norm: torch.Tensor, impedance_force: torch.Tensor
     ) -> torch.Tensor:
         """Compose a normalized human action for centralized-critic inputs."""
-        max_human_force = float(
-            self.params.get("constraints", {}).get("max_human_force", 0.04)
-        )
         # Enforce the same bounded-prior semantics used by the environment.
         # Replay normally contains an already bounded prior, while this clamp
         # also keeps actor/target composition safe for externally supplied data.
-        impedance_norm = (impedance_force / max_human_force).clamp(-1.0, 1.0)
+        impedance_norm = (impedance_force * self.human_force_factor).clamp(
+            -1.0, 1.0
+        )
         if self.human_model_type == "fixed_impedance":
             return impedance_norm
         if self.human_model_type == "residual_impedance":
@@ -375,17 +389,6 @@ class MADDPG:
         obs_all, act_all, rew_all, nobs_all, done_any, impedance, next_impedance = batch
         gamma = float(self.params.get('maddpg_config', {}).get('gamma', 0.95))
 
-        # Dynamically build per-dim action limits
-        constraints = self.params.get('constraints', {})
-        a_max_list = []
-        for agent_id in self.agent_ids:
-            if 'human' in agent_id.lower():
-                max_force = float(constraints.get('max_human_force', 0.04))
-            else:
-                max_force = float(constraints.get('max_robot_force', 0.04))
-            a_max_list.extend([max_force] * 3)  # 3D force
-        a_max = torch.tensor(a_max_list, device=self.device).view(1, -1)
-
         # Enhanced statistics structure with per-agent metrics
         stats = {
             "loss/actor": {}, "loss/critic": {}, "q_mean": {}, "q_std": {},
@@ -423,8 +426,9 @@ class MADDPG:
                     q_next = agent.critic_target(nobs_all, next_act_all_norm).squeeze(-1)
                     y = rew_all[:, i] + (1.0 - done_any.squeeze(-1)) * gamma * q_next
 
-                # Current Q: Convert Buffer's physical actions to normalized
-                act_all_norm = act_all / a_max
+                # Current Q: map Replay Buffer's physical forces to the same
+                # normalized action coordinates produced by the actors.
+                act_all_norm = act_all * self.action_force_scale
                 q = agent.critic(obs_all, act_all_norm).squeeze(-1)
                 critic_loss = torch.nn.functional.smooth_l1_loss(q, y)
 

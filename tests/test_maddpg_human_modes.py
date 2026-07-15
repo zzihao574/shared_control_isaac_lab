@@ -21,7 +21,7 @@ class MockEnvironment:
     def __init__(self):
         self.cfg = SimpleNamespace(
             possible_agents=["human", "robot"],
-            observation_spaces={"human": 6, "robot": 6},
+            observation_spaces={"human": 9, "robot": 9},
             action_spaces={"human": 3, "robot": 3},
         )
 
@@ -31,7 +31,8 @@ def make_params(model_type: str) -> dict:
         "seed": 7,
         "human_model_type": model_type,
         "constraints": {"max_human_force": 0.04, "max_robot_force": 0.04},
-        "obs_scaling": {"factors": [1.0] * 6},
+        "force_scaling": {"human_factor": 25.0, "robot_factor": 25.0},
+        "obs_scaling": {"factors": [1.0] * 6 + [25.0] * 3},
         "networks": {
             "actor": {"hidden_layers": [16], "orthogonal_init": False},
             "critic": {"hidden_layers": [16], "orthogonal_init": False},
@@ -53,10 +54,10 @@ def fill_replay(maddpg: MADDPG) -> None:
     generator = np.random.default_rng(123)
     for _ in range(6):
         maddpg.replay.add(
-            obs_all=generator.normal(size=12).astype(np.float32),
+            obs_all=generator.normal(size=18).astype(np.float32),
             act_all=generator.uniform(-0.04, 0.04, size=6).astype(np.float32),
             rewards_vec=generator.normal(size=2).astype(np.float32),
-            next_obs_all=generator.normal(size=12).astype(np.float32),
+            next_obs_all=generator.normal(size=18).astype(np.float32),
             done_any=False,
             impedance=np.array([0.0, 0.034, 0.0], dtype=np.float32),
             next_impedance=np.array([0.0, 0.03, 0.0], dtype=np.float32),
@@ -133,14 +134,24 @@ class MaddpgHumanModeTest(unittest.TestCase):
         )
         self.assertTrue(output.equal(np_to_tensor([[0.0, 0.0, 0.0]])))
 
+    def test_physical_joint_actions_use_configured_force_factors(self):
+        params = make_params("residual_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
+        physical = np_to_tensor([[0.04, -0.02, 0.0, -0.04, 0.02, 0.0]])
+        normalized = physical * maddpg.action_force_scale
+        expected = np_to_tensor([[1.0, -0.5, 0.0, -1.0, 0.5, 0.0]])
+        self.assertTrue(normalized.equal(expected))
+
     def test_environment_action_selection_does_not_build_gradients(self):
         params = make_params("residual_impedance")
         maddpg = MADDPG(
             1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
         )
         observations = {
-            "human": np_to_tensor([[0.0] * 6]).requires_grad_(True),
-            "robot": np_to_tensor([[0.0] * 6]).requires_grad_(True),
+            "human": np_to_tensor([[0.0] * 9]).requires_grad_(True),
+            "robot": np_to_tensor([[0.0] * 9]).requires_grad_(True),
         }
 
         actions, detail = maddpg.select_actions(

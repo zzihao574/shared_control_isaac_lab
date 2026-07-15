@@ -23,6 +23,12 @@ human_residual:
 
 force_limit_semantics: "per_axis"
 
+# Multipliers that map physical forces in Newtons to normalized network inputs.
+# These must remain the reciprocal of the corresponding per-axis force limits.
+force_scaling:
+  human_factor: 25.0
+  robot_factor: 25.0
+
 # ==============================================================================
 # Network Architecture Configuration with Residual Connections
 # ==============================================================================
@@ -44,8 +50,8 @@ networks:
 # State Normalization Configuration
 # ==============================================================================
 obs_scaling:
-  # Fixed scaling factors 
-  factors: [5.0, 16.7, 16.7, 16.7, 5.0, 1.0]
+  # deviation, velocity xyz, safety distance, progress, previous opponent force xyz
+  factors: [5.0, 16.7, 16.7, 16.7, 5.0, 1.0, 25.0, 25.0, 25.0]
 
 # ==============================================================================
 # Exploration Configuration

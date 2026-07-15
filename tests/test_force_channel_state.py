@@ -121,6 +121,31 @@ class ForceChannelStateTest(unittest.TestCase):
         for channel in ForceChannelState.CHANNEL_NAMES:
             self.assertTrue(torch.equal(before[channel], after[channel]))
 
+    def test_observations_include_previous_opponent_actual_force(self):
+        state = ForceChannelState(3, "cpu")
+        human_result = make_human_result(3)
+        robot = torch.tensor(
+            [[0.001, 0.002, 0.003], [0.004, 0.005, 0.006], [0.007, 0.008, 0.009]]
+        )
+        base_obs = torch.arange(18, dtype=torch.float32).reshape(3, 6)
+
+        initial = state.augment_agent_observations(base_obs)
+        self.assertTrue(torch.equal(initial["human"][:, 6:], torch.zeros(3, 3)))
+        self.assertTrue(torch.equal(initial["robot"][:, 6:], torch.zeros(3, 3)))
+
+        state.update(human_result, robot)
+        observations = state.augment_agent_observations(base_obs)
+        self.assertTrue(torch.equal(observations["human"][:, :6], base_obs))
+        self.assertTrue(torch.equal(observations["robot"][:, :6], base_obs))
+        self.assertTrue(torch.equal(observations["human"][:, 6:], state.robot))
+        self.assertTrue(torch.equal(observations["robot"][:, 6:], state.human))
+
+        state.reset_live(torch.tensor([1]))
+        reset_observations = state.augment_agent_observations(base_obs)
+        self.assertTrue(torch.equal(reset_observations["human"][1, 6:], torch.zeros(3)))
+        self.assertTrue(torch.equal(reset_observations["robot"][1, 6:], torch.zeros(3)))
+        self.assertTrue(torch.equal(reset_observations["human"][0, 6:], robot[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

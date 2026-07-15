@@ -113,6 +113,20 @@ class ForceChannelState:
         for name in self.CHANNEL_NAMES:
             getattr(self, name)[env_ids] = 0.0
 
+    def augment_agent_observations(
+        self, base_observation: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Append the previous opponent's actual applied force to each actor obs."""
+        if base_observation.ndim != 2 or base_observation.shape[0] != self.num_envs:
+            raise ValueError(
+                "base_observation must have shape "
+                f"({self.num_envs}, D), got {tuple(base_observation.shape)}"
+            )
+        return {
+            "human": torch.cat((base_observation, self.robot), dim=-1),
+            "robot": torch.cat((base_observation, self.human), dim=-1),
+        }
+
     def get_applied_actions(self) -> Dict[str, torch.Tensor]:
         return {
             "human": self._last_applied["human"].clone(),

@@ -14,6 +14,7 @@ class MaddpgWandbConfigTest(unittest.TestCase):
                 "max_human_force": 0.04,
                 "max_robot_force": 0.03,
             },
+            "force_scaling": {"human_factor": 25.0, "robot_factor": 100.0 / 3.0},
             "termination_conditions": {
                 "z_below_zero": False,
                 "edge_collision": False,
@@ -41,6 +42,9 @@ class MaddpgWandbConfigTest(unittest.TestCase):
         self.assertFalse(config["termination/edge_collision"])
         self.assertEqual(config["termination/safety_distance_threshold"], 0.002)
         self.assertEqual(config["human/kp_x"], 0.8)
+        self.assertEqual(config["human/force_input_factor"], 25.0)
+        self.assertEqual(config["robot/force_input_factor"], 100.0 / 3.0)
+        self.assertEqual(config["observation/total_dim"], 9)
         self.assertNotIn("reward_scale", config)
         self.assertNotIn("termination_mode", config)
 

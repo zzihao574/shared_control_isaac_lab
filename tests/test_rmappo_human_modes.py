@@ -45,7 +45,8 @@ def make_params(model_type: str) -> dict:
         "seed": 7,
         "human_model_type": model_type,
         "constraints": {"max_human_force": 0.04, "max_robot_force": 0.04},
-        "obs_scaling": {"factors": [1.0] * 6},
+        "force_scaling": {"human_factor": 25.0, "robot_factor": 25.0},
+        "obs_scaling": {"factors": [1.0] * 6 + [25.0] * 3},
         "training": {"seed": 7, "lr_decay": {"enabled": False}},
         "algorithms": {
             "rmappo": {
@@ -84,8 +85,8 @@ def make_wrapper(model_type: str) -> DualRMAPPOWrapper:
         {"human": dict(common), "robot": dict(common), "common": common},
         "cpu",
         2,
-        6,
-        12,
+        9,
+        18,
         3,
         params,
         None,
@@ -98,14 +99,14 @@ def make_wrapper(model_type: str) -> DualRMAPPOWrapper:
 def collect_rollout(wrapper: DualRMAPPOWrapper) -> None:
     generator = torch.Generator().manual_seed(123)
     obs = {
-        "human": torch.randn(2, 6, generator=generator),
-        "robot": torch.randn(2, 6, generator=generator),
+        "human": torch.randn(2, 9, generator=generator),
+        "robot": torch.randn(2, 9, generator=generator),
     }
     for step in range(wrapper.T):
         actions, _ = wrapper.select_actions(obs, deterministic=False)
         next_obs = {
-            "human": torch.randn(2, 6, generator=generator),
-            "robot": torch.randn(2, 6, generator=generator),
+            "human": torch.randn(2, 9, generator=generator),
+            "robot": torch.randn(2, 9, generator=generator),
         }
         rewards = {
             "human": torch.tensor([0.2 + step, -0.3 + step]),
@@ -129,7 +130,7 @@ def collect_rollout(wrapper: DualRMAPPOWrapper) -> None:
 class RMAPPOHumanModeTest(unittest.TestCase):
     def test_fixed_mode_uses_zero_policy_placeholder(self):
         wrapper = make_wrapper("fixed_impedance")
-        obs = {"human": torch.ones(2, 6), "robot": torch.ones(2, 6)}
+        obs = {"human": torch.ones(2, 9), "robot": torch.ones(2, 9)}
 
         actions, _ = wrapper.select_actions(obs, deterministic=False)
 
@@ -150,7 +151,7 @@ class RMAPPOHumanModeTest(unittest.TestCase):
 
     def test_residual_buffer_stores_policy_residual_not_composed_force(self):
         wrapper = make_wrapper("residual_impedance")
-        obs = {"human": torch.ones(2, 6), "robot": torch.ones(2, 6)}
+        obs = {"human": torch.ones(2, 9), "robot": torch.ones(2, 9)}
 
         actions, _ = wrapper.select_actions(obs, deterministic=False)
         residual_norm = wrapper._current_step_data["human"]["actions"]
@@ -161,6 +162,26 @@ class RMAPPOHumanModeTest(unittest.TestCase):
             torch.isfinite(
                 wrapper._current_step_data["human"]["action_log_probs"]
             ).all()
+        )
+
+    def test_previous_opponent_physical_force_is_scaled_in_observation(self):
+        wrapper = make_wrapper("residual_impedance")
+        obs = {
+            "human": torch.zeros(2, 9),
+            "robot": torch.zeros(2, 9),
+        }
+        obs["human"][:, 6:] = torch.tensor([0.04, -0.02, 0.0])
+        obs["robot"][:, 6:] = torch.tensor([-0.04, 0.02, 0.0])
+
+        wrapper.select_actions(obs, deterministic=False)
+
+        expected_human = torch.tensor([1.0, -0.5, 0.0]).expand(2, -1)
+        expected_robot = torch.tensor([-1.0, 0.5, 0.0]).expand(2, -1)
+        self.assertTrue(
+            torch.equal(wrapper._current_step_data["human"]["obs"][:, 6:], expected_human)
+        )
+        self.assertTrue(
+            torch.equal(wrapper._current_step_data["robot"]["obs"][:, 6:], expected_robot)
         )
 
     def test_fixed_updates_robot_only_and_residual_updates_both(self):

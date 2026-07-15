@@ -122,6 +122,7 @@ def build_maddpg_wandb_config(
     run_config = copy.deepcopy(resolved_config)
     termination = resolved_config.get("termination_conditions", {})
     constraints = resolved_config.get("constraints", {})
+    force_scaling = resolved_config.get("force_scaling", {})
     human_model_type = str(resolved_config.get("human_model_type", "learnable"))
 
     run_config.update(
@@ -135,6 +136,16 @@ def build_maddpg_wandb_config(
             "robot/max_force_per_axis": float(
                 constraints.get("max_robot_force", 0.04)
             ),
+            "human/force_input_factor": float(
+                force_scaling.get("human_factor", 25.0)
+            ),
+            "robot/force_input_factor": float(
+                force_scaling.get("robot_factor", 25.0)
+            ),
+            "observation/base_dim": 6,
+            "observation/opponent_action_dim": 3,
+            "observation/total_dim": 9,
+            "observation/opponent_action_source": "previous_actual_applied_force",
             "termination/z_below_zero": bool(
                 termination.get("z_below_zero", False)
             ),

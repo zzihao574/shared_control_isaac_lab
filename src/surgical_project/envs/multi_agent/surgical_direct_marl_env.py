@@ -452,13 +452,20 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         progress_ratio = self.trajectory_manager.get_progress(self.stylus_pos_t1)
         progress_ratio = progress_ratio.unsqueeze(-1) 
 
-        obs_6d = torch.cat([deviations,
-                            self.stylus_vel_t1,
-                            constraint_distances,
-                            progress_ratio], dim=-1)  # [N,6]
+        base_obs = torch.cat(
+            [
+                deviations,
+                self.stylus_vel_t1,
+                constraint_distances,
+                progress_ratio,
+            ],
+            dim=-1,
+        )  # [N, 6]
 
-        observations = {agent: obs_6d for agent in self.cfg.possible_agents}
-        return observations
+        # Live force channels contain the action applied on the preceding
+        # control step. Reset clears them per environment, so a new episode
+        # starts with a zero previous-action observation.
+        return self.force_channels.augment_agent_observations(base_obs)
 
     def _build_zone_masks(self):
         """Build zone masks for four-zone reward system."""
