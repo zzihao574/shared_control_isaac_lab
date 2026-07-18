@@ -31,6 +31,7 @@ def make_params(model_type: str) -> dict:
         "seed": 7,
         "human_model_type": model_type,
         "constraints": {"max_human_force": 0.04, "max_robot_force": 0.04},
+        "human_residual": {"max_force": 0.015},
         "force_scaling": {"human_factor": 25.0, "robot_factor": 25.0},
         "obs_scaling": {"factors": [1.0] * 6 + [25.0] * 3},
         "networks": {
@@ -46,6 +47,8 @@ def make_params(model_type: str) -> dict:
             "min_buffer_size": 1,
             "max_replay_buffer_len": 16,
             "tau": 0.01,
+            "max_grad_norm_actor": 1.0,
+            "max_grad_norm_critic": 30.0,
         },
     }
 
@@ -132,7 +135,23 @@ class MaddpgHumanModeTest(unittest.TestCase):
             policy_action_norm=np_to_tensor([[-1.0, 0.0, 0.0]]),
             impedance_force=np_to_tensor([[0.08, 0.0, 0.0]]),
         )
-        self.assertTrue(output.equal(np_to_tensor([[0.0, 0.0, 0.0]])))
+        self.assertTrue(output.equal(np_to_tensor([[0.625, 0.0, 0.0]])))
+
+    def test_residual_policy_uses_residual_force_limit(self):
+        params = make_params("residual_impedance")
+        maddpg = MADDPG(
+            1, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
+        observations = {
+            "human": np_to_tensor([[0.0] * 9]),
+            "robot": np_to_tensor([[0.0] * 9]),
+        }
+
+        actions, _ = maddpg.select_actions(observations, add_noise=False)
+
+        self.assertLessEqual(float(actions["human"].abs().max()), 0.015)
+        self.assertEqual(maddpg.agents["human"].max_grad_norm_actor, 1.0)
+        self.assertEqual(maddpg.agents["human"].max_grad_norm_critic, 30.0)
 
     def test_physical_joint_actions_use_configured_force_factors(self):
         params = make_params("residual_impedance")
@@ -162,6 +181,27 @@ class MaddpgHumanModeTest(unittest.TestCase):
             self.assertFalse(actions[agent_id].requires_grad)
             self.assertFalse(detail["mean_actions"][agent_id].requires_grad)
             self.assertFalse(detail["noise_actions"][agent_id].requires_grad)
+
+    def test_exploration_noise_is_independent_and_held(self):
+        params = make_params("residual_impedance")
+        params["exploration"] = {"hold_steps": 3}
+        maddpg = MADDPG(
+            2, MockEnvironment(), params, SeedPlan(params["seed"]), device="cpu"
+        )
+        observations = {
+            "human": np_to_tensor([[0.0] * 9] * 2),
+            "robot": np_to_tensor([[0.0] * 9] * 2),
+        }
+
+        samples = [
+            maddpg.select_actions(observations, True, 0.35)[1]["noise_actions"]["robot"]
+            for _ in range(4)
+        ]
+
+        self.assertFalse(samples[0][0].equal(samples[0][1]))
+        self.assertTrue(samples[0].equal(samples[1]))
+        self.assertTrue(samples[0].equal(samples[2]))
+        self.assertFalse(samples[0].equal(samples[3]))
 
 
 def np_to_tensor(values):

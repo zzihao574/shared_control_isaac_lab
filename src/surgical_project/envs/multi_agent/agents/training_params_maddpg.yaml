@@ -10,16 +10,17 @@ seed: 42
 human_model_type: "learnable"  # learnable | fixed_impedance | residual_impedance
 
 human_impedance:
-  kp: [0.8, 0.8, 0.8]              # Position gains (N/m)
-  kd: [0.1, 0.1, 0.1]              # Velocity gains (N*s/m)
+  kp: [0.6, 0.6, 0.6]              # 3/4 of the previous position gains (N/m)
+  kd: [0.075, 0.075, 0.075]        # 3/4 of the previous damping gains (N*s/m)
   lookahead_distance: 0.04          # Look-ahead equilibrium distance (m)
   reference_speed: 0.02             # Tangential reference speed (m/s)
+  max_force: 0.03                   # Per-axis impedance limit (N)
 
-# Residual uses the existing human actor's full per-axis force range. It can
-# therefore cancel or reverse the bounded impedance prior before final clipping.
+# Residual is a bounded correction added to the impedance prior.
 human_residual:
-  mapping: "policy_tanh_times_max_human_force"
-  can_override_impedance: true
+  max_force: 0.015                  # Per-axis residual limit (N)
+  mapping: "policy_tanh_times_residual_limit"
+  can_override_impedance: false
 
 force_limit_semantics: "per_axis"
 
@@ -57,9 +58,10 @@ obs_scaling:
 # Exploration Configuration
 # ==============================================================================
 exploration:
-  sigma_start: 0.8   # Initial noise = 0.6 × max_action
-  sigma_end: 0.1     # Final noise = 0.1 × max_action
+  sigma_start: 0.28  # Initial normalized exploration scale
+  sigma_end: 0.05    # Exact terminal normalized exploration scale
   decay_k: 4.0       # Decay rate for exponential schedule
+  hold_steps: 20     # Keep each independent per-env sample for about 0.33 s
 
 # ==============================================================================
 # Logging Configuration
@@ -194,6 +196,8 @@ maddpg_config:
   min_buffer_size: 6000              # Minimum buffer size to start training (per-env baseline)
   tau: 0.005                         # Target network update rate (slower for stability)
   max_replay_buffer_len: 8400       # Maximum replay buffer size (per-env baseline)
+  max_grad_norm_actor: 1.0          # Actor gradient clipping threshold
+  max_grad_norm_critic: 30.0        # Critic gradient clipping threshold
 
 # ==============================================================================
 # Training Monitoring

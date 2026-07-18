@@ -72,6 +72,17 @@ class MADDPG:
         force_scaling = self.params["force_scaling"]
         self.human_force_factor = float(force_scaling["human_factor"])
         self.robot_force_factor = float(force_scaling["robot_factor"])
+        self.max_human_force = float(
+            self.params.get("constraints", {}).get("max_human_force", 0.04)
+        )
+        self.max_human_residual_force = float(
+            self.params.get("human_residual", {}).get(
+                "max_force", self.max_human_force
+            )
+        )
+        self.human_residual_to_total_scale = (
+            self.max_human_residual_force / self.max_human_force
+        )
         
         # Get dimensions from environment cfg
         self.obs_dims = [self.actual_env.cfg.observation_spaces[agent] for agent in self.agent_ids]
@@ -133,6 +144,11 @@ class MADDPG:
     
     def _init_noise_generators(self) -> None:
         """Initialize persistent noise generators for each (agent, env) pair."""
+        self.noise_hold_steps = max(
+            1, int(self.params.get("exploration", {}).get("hold_steps", 1))
+        )
+        self._noise_step = 0
+        self._held_noise = {}
         self.noise_generators = {}  # {agent_id: [gen_env0, gen_env1, ...]}
         for i, agent_id in enumerate(self.agent_ids):
             gens = []
@@ -223,11 +239,12 @@ class MADDPG:
         
         # Force disable noise during evaluation
         effective_add_noise = add_noise and (not self._is_eval_mode)
+        refresh_noise = self._noise_step % self.noise_hold_steps == 0
         
         # Get force constraint configuration
         constraints = self.params.get('constraints', {})
         max_robot_force = float(constraints.get('max_robot_force', 0.04))
-        max_human_force = float(constraints.get('max_human_force', 0.04))
+        max_human_force = self.max_human_force
         
         for i, agent_id in enumerate(self.agent_ids):
             obs_i = observations[agent_id]
@@ -248,13 +265,14 @@ class MADDPG:
             
             # Generate noise using persistent generators (no global seed changes)
             if effective_add_noise:
-                noise_norm = torch.zeros_like(a_norm)  # [num_envs, action_dim]
-                
-                # Each environment uses its dedicated generator
-                for env_id in range(self.num_envs):
-                    gen = self.noise_generators[agent_id][env_id]
-                    noise_norm[env_id] = noise_scale * torch.randn(a_norm.shape[1], device=a_norm.device, generator=gen)
-                    
+                if refresh_noise or agent_id not in self._held_noise:
+                    noise = torch.zeros_like(a_norm)
+                    for env_id, gen in enumerate(self.noise_generators[agent_id]):
+                        noise[env_id] = torch.randn(
+                            a_norm.shape[1], device=a_norm.device, generator=gen
+                        )
+                    self._held_noise[agent_id] = noise
+                noise_norm = noise_scale * self._held_noise[agent_id]
             else:
                 noise_norm = torch.zeros_like(a_norm)
                 
@@ -263,6 +281,11 @@ class MADDPG:
             
             # Determine force limit based on agent type
             max_force = max_robot_force if 'robot' in agent_id.lower() else max_human_force
+            if (
+                agent_id == self.human_agent_id
+                and self.human_model_type == "residual_impedance"
+            ):
+                max_force = self.max_human_residual_force
             
             # Map to physical units. The normalized action is already bounded;
             # the environment owns the single physical-force safety clamp.
@@ -272,6 +295,9 @@ class MADDPG:
             # Store debug information
             detail["mean_actions"][agent_id] = a_norm * max_force
             detail["noise_actions"][agent_id] = action - detail["mean_actions"][agent_id]
+
+        if effective_add_noise:
+            self._noise_step += 1
 
         for agent_id in actions.keys():
             actions[agent_id] = actions[agent_id].detach()
@@ -336,21 +362,14 @@ class MADDPG:
         if self.human_model_type == "fixed_impedance":
             return impedance_norm
         if self.human_model_type == "residual_impedance":
-            return (impedance_norm + policy_action_norm).clamp(-1.0, 1.0)
+            residual_norm = policy_action_norm * self.human_residual_to_total_scale
+            return (impedance_norm + residual_norm).clamp(-1.0, 1.0)
         return policy_action_norm
 
     def human_actor_checksum(self) -> float:
         """Return a compact checksum used to verify fixed-human immutability."""
         actor = self.agents[self.human_agent_id].actor
         return float(sum(p.detach().double().sum().item() for p in actor.parameters()))
-
-    def _module_grad_norm(self, module) -> float:
-        """Calculate L2 gradient norm for a module."""
-        total = 0.0
-        for p in module.parameters():
-            if p.grad is not None:
-                total += p.grad.data.norm(2).item() ** 2
-        return total ** 0.5
 
     def update(self) -> Dict[str, Any]:
         """
@@ -434,7 +453,9 @@ class MADDPG:
 
                 agent.critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
-                c_grad_norm = self._module_grad_norm(agent.critic)
+                c_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    agent.critic.parameters(), agent.max_grad_norm_critic
+                )
                 agent.critic_optimizer.step()
 
                 # Store critic statistics
@@ -476,7 +497,9 @@ class MADDPG:
                         obs_all, action_pred_all_norm
                     ).mean()
                     actor_loss.backward()
-                a_grad_norm = self._module_grad_norm(agent.actor)
+                a_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    agent.actor.parameters(), agent.max_grad_norm_actor
+                )
                 agent.actor_optimizer.step()
 
                 # Store actor statistics

@@ -34,6 +34,8 @@ class DDPGAgent:
         self.lr_actor = float(maddpg_cfg.get('lr_actor', 0.001))
         self.lr_critic = float(maddpg_cfg.get('lr_critic', 0.001))
         self.tau = float(maddpg_cfg.get('tau', 0.002))
+        self.max_grad_norm_actor = float(maddpg_cfg.get('max_grad_norm_actor', 1.0))
+        self.max_grad_norm_critic = float(maddpg_cfg.get('max_grad_norm_critic', 30.0))
         
         # Load network configuration
         net_cfg = params.get('networks', {})

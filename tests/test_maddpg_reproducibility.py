@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
-from scripts.utils.training_helpers_maddpg import SeedPlan
+from scripts.utils.training_helpers_maddpg import SeedPlan, TrainingRunner
 
 
 class MaddpgReproducibilityTest(unittest.TestCase):
@@ -53,6 +54,22 @@ class MaddpgReproducibilityTest(unittest.TestCase):
         self.assertTrue(
             any(not torch.equal(first[name], different[name]) for name in first)
         )
+
+    def test_noise_schedule_holds_during_warmup_and_reaches_exact_end(self):
+        runner = TrainingRunner.__new__(TrainingRunner)
+        runner.sigma_start = 0.28
+        runner.sigma_end = 0.05
+        runner.decay_k = 4.0
+        runner.max_global_steps = 7200
+        runner.maddpg = SimpleNamespace(min_buffer_size=18000, num_envs=3)
+
+        runner.global_step = 6000
+        self.assertEqual(runner._calculate_noise_scale(), 0.28)
+        runner.global_step = 6600
+        self.assertGreater(runner._calculate_noise_scale(), 0.05)
+        self.assertLess(runner._calculate_noise_scale(), 0.28)
+        runner.global_step = 7200
+        self.assertAlmostEqual(runner._calculate_noise_scale(), 0.05)
 
 
 if __name__ == "__main__":

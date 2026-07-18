@@ -209,9 +209,21 @@ class TrainingRunner:
         """Calculate current noise scaling factor using exponential decay."""
         if self.max_global_steps <= 0:
             return self.sigma_start
-            
-        ratio = min(1.0, float(self.global_step) / float(max(1, self.max_global_steps)))
-        noise_scale = self.sigma_end + (self.sigma_start - self.sigma_end) * math.exp(-self.decay_k * ratio)
+
+        warmup_steps = math.ceil(self.maddpg.min_buffer_size / self.maddpg.num_envs)
+        if self.global_step <= warmup_steps:
+            return self.sigma_start
+        ratio = min(
+            1.0,
+            (self.global_step - warmup_steps)
+            / max(1, self.max_global_steps - warmup_steps),
+        )
+        if self.decay_k == 0.0:
+            return self.sigma_start + (self.sigma_end - self.sigma_start) * ratio
+        decay = (
+            math.exp(-self.decay_k * ratio) - math.exp(-self.decay_k)
+        ) / (1.0 - math.exp(-self.decay_k))
+        noise_scale = self.sigma_end + (self.sigma_start - self.sigma_end) * decay
         
         return noise_scale
 

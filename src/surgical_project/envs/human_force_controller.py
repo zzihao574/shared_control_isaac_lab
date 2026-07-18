@@ -51,6 +51,12 @@ class HumanForceController:
         self.max_human_force = float(
             params.get("constraints", {}).get("max_human_force", 0.04)
         )
+        self.max_impedance_force = float(
+            impedance.get("max_force", self.max_human_force)
+        )
+        self.max_residual_force = float(
+            params.get("human_residual", {}).get("max_force", self.max_human_force)
+        )
 
         if self.lookahead_distance <= 0.0:
             raise ValueError("human_impedance.lookahead_distance must be positive")
@@ -58,6 +64,10 @@ class HumanForceController:
             raise ValueError("human_impedance.reference_speed must be non-negative")
         if self.max_human_force <= 0.0:
             raise ValueError("constraints.max_human_force must be positive")
+        if not 0.0 < self.max_impedance_force <= self.max_human_force:
+            raise ValueError("human_impedance.max_force must be in (0, max_human_force]")
+        if not 0.0 < self.max_residual_force <= self.max_human_force:
+            raise ValueError("human_residual.max_force must be in (0, max_human_force]")
 
         trajectory = params.get("trajectory", {})
         self.start = self._vector3(trajectory.get("start_point"), "trajectory.start_point")
@@ -113,8 +123,8 @@ class HumanForceController:
         impedance = self.kp.unsqueeze(0) * position_error + self.kd.unsqueeze(0) * velocity_error
         impedance = torch.clamp(
             impedance,
-            -self.max_human_force,
-            self.max_human_force,
+            -self.max_impedance_force,
+            self.max_impedance_force,
         )
         return impedance, reference_position, reference_velocity
 
@@ -137,7 +147,9 @@ class HumanForceController:
             residual = torch.zeros_like(policy)
             requested_total = impedance
         else:
-            residual = policy
+            residual = policy.clamp(
+                -self.max_residual_force, self.max_residual_force
+            )
             requested_total = impedance + residual
 
         # The bounded impedance prior is composed first; this final clamp is the
@@ -170,7 +182,10 @@ class HumanForceController:
             "human/lookahead_distance": self.lookahead_distance,
             "human/reference_speed": self.reference_speed,
             "human/max_force_per_axis": self.max_human_force,
-            "human/residual_limit_per_axis": self.max_human_force,
-            "human/residual_can_override_impedance": True,
+            "human/impedance_limit_per_axis": self.max_impedance_force,
+            "human/residual_limit_per_axis": self.max_residual_force,
+            "human/residual_can_override_impedance": (
+                self.max_residual_force >= self.max_impedance_force
+            ),
             "human/force_limit_semantics": "per_axis",
         }

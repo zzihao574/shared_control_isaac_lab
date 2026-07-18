@@ -212,6 +212,19 @@ class MADDPGTrainer:
         for limit_name in ("max_human_force", "max_robot_force"):
             if float(constraints.get(limit_name, 0.04)) <= 0.0:
                 raise ValueError(f"constraints.{limit_name} must be positive")
+        max_human_force = float(constraints.get("max_human_force", 0.04))
+        impedance_limit = float(impedance.get("max_force", max_human_force))
+        residual_limit = float(
+            params.get("human_residual", {}).get("max_force", max_human_force)
+        )
+        if not 0.0 < impedance_limit <= max_human_force:
+            raise ValueError(
+                "human_impedance.max_force must be in (0, max_human_force]"
+            )
+        if not 0.0 < residual_limit <= max_human_force:
+            raise ValueError(
+                "human_residual.max_force must be in (0, max_human_force]"
+            )
 
         force_scaling = params.get("force_scaling", {})
         for agent_name in ("human", "robot"):
