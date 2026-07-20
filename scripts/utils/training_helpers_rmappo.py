@@ -96,6 +96,26 @@ def validate_rmappo_config(params: Dict[str, Any]) -> None:
         if float(constraints.get(name, 0.0)) <= 0.0:
             raise ValueError(f"constraints.{name} must be positive")
 
+    max_human_force = float(constraints.get("max_human_force", 0.0))
+    impedance_limit = float(
+        (params.get("human_impedance") or {}).get(
+            "max_force", max_human_force
+        )
+    )
+    residual_limit = float(
+        (params.get("human_residual") or {}).get(
+            "max_force", max_human_force
+        )
+    )
+    if not 0.0 < impedance_limit <= max_human_force:
+        raise ValueError(
+            "human_impedance.max_force must be in (0, max_human_force]"
+        )
+    if not 0.0 < residual_limit <= max_human_force:
+        raise ValueError(
+            "human_residual.max_force must be in (0, max_human_force]"
+        )
+
     force_scaling = params.get("force_scaling", {})
     for agent_name in ("human", "robot"):
         factor_name = f"{agent_name}_factor"
@@ -330,7 +350,7 @@ class RMAPPOTrainingRunner:
         
         Key steps:
         1. Identify ongoing environments (not naturally done)
-        2. Apply artificial truncation: masks[t]=0, term_masks[t]=1 (truncated semantics)
+        2. Apply artificial truncation: continuation_masks[t]=0, term_masks[t]=1
         3. Compute V(s_{t+1}) using CORRECT RNN state (BEFORE masking)
         4. Store override bootstrap values
         
@@ -346,9 +366,9 @@ class RMAPPOTrainingRunner:
             
             # ============ KEY POINT 1: Strict ongoing identification ============
             # ongoing = environments where:
-            #   - masks[t] > 0.5 (not done by environment)
+            #   - continuation_masks[t] > 0.5 (not done by environment)
             #   - term_masks[t] > 0.5 (not terminated, could continue)
-            ongoing = (buf.masks[t] > 0.5) & (buf.term_masks[t] > 0.5)
+            ongoing = (buf.continuation_masks[t] > 0.5) & (buf.term_masks[t] > 0.5)
             # ====================================================================
             
             if not ongoing.any():
@@ -367,8 +387,6 @@ class RMAPPOTrainingRunner:
             # ✅ FIXED: Clone but do NOT multiply by masks[t]
             # The RNN state should reflect the "pre-evaluation" trajectory
             critic_h = self.rmappo.rnn_states[aid]["critic"].clone()
-            # ❌ OLD BUGGY CODE: critic_h = critic_h * buf.masks[t].squeeze(-1).unsqueeze(-1)
-            
             # FIXED: Explicit dtype for critic mask
             masks_for_critic = torch.ones(
                 share_obs.shape[0], 1, 
@@ -386,7 +404,7 @@ class RMAPPOTrainingRunner:
             
             # ============ Apply artificial truncation AFTER computing V ============
             # Break advantage recursion but allow bootstrap
-            buf.masks[t][ongoing] = 0.0  # Break GAE recursion
+            buf.continuation_masks[t][ongoing] = 0.0  # Break GAE recursion
             
             # FIXED: Explicitly set term_masks to allow bootstrap (truncated semantics)
             buf.term_masks[t][ongoing] = 1.0  # Allow bootstrap, prevent treating as terminal
@@ -577,6 +595,27 @@ class RMAPPOTrainingRunner:
                     "train/training_rounds": self.train_updates,
                     "train/global_episodes": self.global_episodes,
                 }
+                for aid in self.rmappo.trainable_agent_ids:
+                    payload.update({
+                        f"policy/{aid}/entropy": stats.get(f"dist_entropy/{aid}", 0.0),
+                        f"policy/{aid}/logstd_raw_mean": stats.get(f"logstd_raw/{aid}", 0.0),
+                        f"policy/{aid}/logstd_effective_mean": stats.get(f"logstd_effective/{aid}", 0.0),
+                        f"policy/{aid}/saturation": stats.get(f"saturation/{aid}", 0.0),
+                        f"ppo/{aid}/ratio_mean": stats.get(f"ratio/{aid}", 1.0),
+                        f"ppo/{aid}/ratio_max": stats.get(f"ratio_max/{aid}", 1.0),
+                        f"ppo/{aid}/kl_mean": stats.get(f"approx_kl/{aid}", 0.0),
+                        f"ppo/{aid}/clip_fraction": stats.get(f"clipfrac/{aid}", 0.0),
+                        f"ppo/{aid}/adv_mean_norm": stats.get(f"adv_mean/{aid}", 0.0),
+                        f"ppo/{aid}/adv_std_norm": stats.get(f"adv_std/{aid}", 0.0),
+                        f"value/{aid}/ret_abs_mean": stats.get(f"ret_abs_mean/{aid}", 0.0),
+                        f"value/{aid}/v_abs_mean": stats.get(f"v_abs_mean/{aid}", 0.0),
+                        f"value/{aid}/ret_absmax": stats.get(f"ret_absmax/{aid}", 0.0),
+                        f"value/{aid}/v_absmax": stats.get(f"v_absmax/{aid}", 0.0),
+                        f"rnn/{aid}/actor_h_norm": stats.get(f"rnn_actor_h_norm/{aid}", 0.0),
+                        f"rnn/{aid}/critic_h_norm": stats.get(f"rnn_critic_h_norm/{aid}", 0.0),
+                        f"lr/{aid}/actor": stats.get(f"actor_lr/{aid}", 0.0),
+                        f"lr/{aid}/critic": stats.get(f"critic_lr/{aid}", 0.0),
+                    })
                 payload = {k: v for k, v in payload.items() if v is not None}
                 self.metrics.push_update(self.global_step, payload)
 
@@ -762,6 +801,7 @@ class RMAPPOMilestoneEvaluator:
         for aid in self.agent_ids:
             self.rmappo.rnn_states[aid]["actor"].zero_()
             self.rmappo.rnn_states[aid]["critic"].zero_()
+            self.rmappo.rnn_masks[aid].fill_(1.0)
         
         print(f"[EVAL] RNN states cleared after milestone {milestone}")
 
@@ -806,6 +846,7 @@ class RMAPPOMilestoneEvaluator:
             H = rmappo_args.get('hidden_size', 256)
             self.rmappo.rnn_states[aid]["actor"] = torch.zeros(num_envs, H, device=self.rmappo.device)
             self.rmappo.rnn_states[aid]["critic"] = torch.zeros(num_envs, H, device=self.rmappo.device)
+            self.rmappo.rnn_masks[aid] = torch.ones(num_envs, 1, device=self.rmappo.device)
         
         eval_step_counter = 0
 

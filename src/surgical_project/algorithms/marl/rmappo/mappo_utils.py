@@ -111,7 +111,7 @@ class TanhDiagGaussian(nn.Module):
             return m
         
         self.fc_mean = init_(nn.Linear(in_dim, out_dim))
-        self.logstd = AddBias(torch.full((out_dim,), -2.0))
+        self.logstd = AddBias(torch.full((out_dim,), -0.5))
 
     def base_dist(self, x):
         """Get base normal distribution before tanh transform."""
@@ -119,7 +119,7 @@ class TanhDiagGaussian(nn.Module):
         logstd = self.logstd(torch.zeros_like(mean))
         
         # Model constraint - allowed boundary clamping
-        logstd = torch.clamp(logstd, -3.0, -1.0)
+        logstd = torch.clamp(logstd, -1.0, -0.2)
         std = logstd.exp()
         
         return FixedNormal(mean, std)
@@ -139,6 +139,8 @@ class TanhDiagGaussian(nn.Module):
 
 class ACTLayer(nn.Module):
     """Action layer for continuous actions with configurable distribution type and gradient monitoring."""
+
+    _ACTION_EPS = 1e-6
     
     def __init__(self, action_space, inputs_dim, use_orthogonal, gain, use_tanh=True):
         super(ACTLayer, self).__init__()
@@ -155,15 +157,16 @@ class ACTLayer(nn.Module):
         else:
             self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
     
-    def logstd_mean(self):
-        """Get mean log standard deviation for gradient monitoring system."""
+    def logstd_mean(self, effective=False):
+        """Return the raw or distribution-effective mean log standard deviation."""
         if self.use_tanh:
-            # For TanhDiagGaussian, access AddBias logstd
             if hasattr(self._dist, "logstd"):
-                return float(self._dist.logstd._bias.data.mean().item())
+                logstd = self._dist.logstd._bias.detach()
+                if effective:
+                    logstd = logstd.clamp(-1.0, -0.2)
+                return float(logstd.mean().item())
             return 0.0
         else:
-            # For DiagGaussian, access AddBias logstd  
             if hasattr(self.action_out, "logstd"):
                 return float(self.action_out.logstd._bias.data.mean().item())
             return 0.0
@@ -171,17 +174,15 @@ class ACTLayer(nn.Module):
     def forward(self, x, available_actions=None, deterministic=False):
         """Compute actions and action logprobs from given input."""
         if self.use_tanh:
-            if deterministic:
-                # For deterministic actions, use mean of base distribution then tanh
-                base_mean = self._dist.base_dist(x).mean
-                actions = torch.tanh(base_mean)
-            else:
-                # For stochastic actions, sample from transformed distribution
-                d = self._dist.dist(x)
-                actions = d.sample()
-            
-            # Compute log probability for sampled/deterministic actions
             d = self._dist.dist(x)
+            if deterministic:
+                actions = torch.tanh(d.base_dist.mean)
+            else:
+                actions = d.sample()
+
+            # Tanh can round to exactly +/-1 for large pre-tanh values.  Store
+            # and evaluate the same interior action so inverse-tanh stays finite.
+            actions = actions.clamp(-1.0 + self._ACTION_EPS, 1.0 - self._ACTION_EPS)
             action_log_probs = d.log_prob(actions).sum(-1, keepdim=True)
             
         else:
@@ -205,10 +206,11 @@ class ACTLayer(nn.Module):
         """Compute log probability and entropy of given actions."""
         if self.use_tanh:
             d = self._dist.dist(x)
-            action_log_probs = d.log_prob(action).sum(-1, keepdim=True)
+            safe_action = action.clamp(-1.0 + self._ACTION_EPS, 1.0 - self._ACTION_EPS)
+            action_log_probs = d.log_prob(safe_action).sum(-1, keepdim=True)
             
             # For entropy, use base distribution entropy (more stable)
-            base_entropy = self._dist.base_dist(x).entropy().sum(-1)
+            base_entropy = d.base_dist.entropy()
             
             if active_masks is not None:
                 if len(base_entropy.shape) == len(active_masks.shape):

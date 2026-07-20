@@ -11,16 +11,14 @@ seed: 42
 human_model_type: "learnable"  # learnable | fixed_impedance | residual_impedance
 
 human_impedance:
-  kp: [0.8, 0.8, 0.8]              # Position gains (N/m)
-  kd: [0.1, 0.1, 0.1]              # Velocity gains (N*s/m)
+  kp: [0.6, 0.6, 0.6]              # Position gains (N/m)
+  kd: [0.075, 0.075, 0.075]        # Velocity gains (N*s/m)
   lookahead_distance: 0.04          # Look-ahead equilibrium distance (m)
   reference_speed: 0.02             # Tangential reference speed (m/s)
+  max_force: 0.03                   # Per-axis impedance limit (N)
 
-# The residual actor uses its full per-axis force range and can cancel the
-# bounded impedance prior before the composed human force is finally clipped.
 human_residual:
-  mapping: "policy_tanh_times_max_human_force"
-  can_override_impedance: true
+  max_force: 0.015                  # Per-axis residual limit (N)
 
 force_limit_semantics: "per_axis"
 
@@ -59,7 +57,7 @@ algorithms:
     num_mini_batch: 8                 # Number of mini-batches per epoch
     
     # Loss coefficients
-    entropy_coef: 0.01               # Entropy regularization coefficient
+    entropy_coef: 0.003              # Entropy regularization coefficient
     
     # Gradient clipping (YAML controllable)
     max_grad_norm_actor: 5.0          # Actor gradient clipping threshold

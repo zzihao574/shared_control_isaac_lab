@@ -270,8 +270,9 @@ class RMAPPOAlgorithm:
         self._use_clipped_value_loss = args.get('use_clipped_value_loss', False)
         self._use_popart = args.get('use_popart', False)
 
-        # MetricsHub for logging
+        # Metrics are returned to the runner and emitted once per rollout.
         self.metrics_hub = args.get('metrics_hub', None)
+        self.agent_id = str(args.get('agent_id', 'agent'))
         self.global_step = 0
 
         # MODIFIED: Only PopArt is supported, ValueNorm removed
@@ -318,13 +319,6 @@ class RMAPPOAlgorithm:
         for pg in self.policy.critic_optimizer.param_groups:
             pg["lr"] = critic_lr
         
-        # Log to MetricsHub
-        if self.metrics_hub is not None:
-            self.metrics_hub.push_scalars(
-                {"lr/actor": actor_lr, "lr/critic": critic_lr},
-                step=self.global_step
-            )
-
     def cal_value_loss(self, values, value_preds_batch, return_batch):
         """Calculate value function loss using Huber loss."""
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.clip_param, self.clip_param)
@@ -361,7 +355,7 @@ class RMAPPOAlgorithm:
         actions_batch = check(sample["actions"]).to(**self.tpdv)
         value_preds_batch = check(sample["value_preds"]).to(**self.tpdv)
         return_batch = check(sample["returns"]).to(**self.tpdv)
-        masks_batch = check(sample["masks"]).to(**self.tpdv)
+        rnn_masks_batch = check(sample["rnn_masks"]).to(**self.tpdv)
         old_action_log_probs_batch = check(sample["action_log_probs"]).to(**self.tpdv)
         adv_targ = check(sample["advantages"]).to(**self.tpdv)
 
@@ -370,19 +364,19 @@ class RMAPPOAlgorithm:
         
         assert actions_batch.shape[:2] == (L, B), \
             f"actions {actions_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
-        assert masks_batch.shape[:2] == (L, B), \
-            f"masks {masks_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
+        assert rnn_masks_batch.shape[:2] == (L, B), \
+            f"rnn_masks {rnn_masks_batch.shape[:2]} != obs {obs_batch.shape[:2]}"
         
         # Flatten for network processing
         share_obs_flat = share_obs_batch.view(L * B, -1)
         obs_flat = obs_batch.view(L * B, -1)
         actions_flat = actions_batch.view(L * B, -1)
-        masks_flat = masks_batch.view(L * B, -1)
+        rnn_masks_flat = rnn_masks_batch.view(L * B, -1)
 
         # Forward pass through networks
         values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
             share_obs_flat, obs_flat, rnn_states_batch, rnn_states_critic_batch,
-            actions_flat, masks_flat
+            actions_flat, rnn_masks_flat
         )
         
         # Flatten target tensors for loss computation
@@ -396,39 +390,8 @@ class RMAPPOAlgorithm:
         approx_kl = (old_action_log_probs_batch - action_log_probs)
         act_used = _flat(actions_batch)
 
-        # Calculate mean values for returns and value predictions
-        valid = (masks_batch.view(-1) > 0.5)
-        vals = values.view(-1)[valid]
-        rets = return_batch.view(-1)[valid]
-
-        # Log comprehensive monitoring metrics
-        if self.metrics_hub is not None:
-            self.metrics_hub.push_scalars({
-                # PPO metrics
-                "ppo/ratio_mean": float(ratio.mean().detach()),
-                "ppo/ratio_max":  float(ratio.max().detach()),
-                "ppo/kl_mean":    float(approx_kl.mean().detach()),
-                "ppo/clip_fraction": float(((ratio > 1+self.clip_param) | (ratio < 1-self.clip_param)).float().mean().detach()),
-                
-                # Advantage normalization check
-                "ppo/adv_mean_norm": float(adv_targ.view(-1)[valid].mean().detach()),
-                "ppo/adv_std_norm": float(adv_targ.view(-1)[valid].std(unbiased=False).detach()),
-
-                # Value metrics (with means)
-                "value/ret_abs_mean": float(rets.abs().mean().detach()),
-                "value/v_abs_mean": float(vals.abs().mean().detach()),
-                "value/ret_absmax": float(rets.abs().max().detach()),
-                "value/v_absmax": float(vals.abs().max().detach()),
-
-                # Policy metrics
-                "policy/saturation": float((act_used.abs() > 0.98).float().mean().detach()),
-                "policy/logstd_mean": float(self.policy.actor.act.logstd_mean() if hasattr(self.policy.actor.act, "logstd_mean") else 0.0),
-                "policy/entropy": float(dist_entropy.detach()),
-
-                # RNN metrics
-                "rnn/actor_h_norm": float(_h_mean_norm(rnn_states_batch).detach()),
-                "rnn/critic_h_norm": float(_h_mean_norm(rnn_states_critic_batch).detach()),
-            }, step=self.global_step)
+        vals = values.view(-1)
+        rets = return_batch.view(-1)
 
         # Actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
@@ -452,10 +415,6 @@ class RMAPPOAlgorithm:
         
         self.policy.actor_optimizer.step()
 
-        # Log actor gradient norm
-        if self.metrics_hub is not None:
-            self.metrics_hub.push_scalars({"grad/actor": gn_actor}, step=self.global_step)
-
         # Critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch)
 
@@ -470,10 +429,6 @@ class RMAPPOAlgorithm:
         ).item()
 
         self.policy.critic_optimizer.step()
-
-        # Log critic gradient norm
-        if self.metrics_hub is not None:
-            self.metrics_hub.push_scalars({"grad/critic": gn_critic}, step=self.global_step)
 
         # Calculate PPO monitoring metrics
         with torch.no_grad():
@@ -491,21 +446,33 @@ class RMAPPOAlgorithm:
             "dist_entropy": dist_entropy.item(),
             "actor_grad_norm": float(gn_actor),
             "imp_weights": imp_weights.mean().item(),
+            "ratio_max": ratio.max().item(),
             "clipfrac": clipfrac.item(),
             "approx_kl": approx_kl.item(),
+            "adv_mean": adv_targ.mean().item(),
+            "adv_std": adv_targ.std(unbiased=False).item(),
+            "ret_abs_mean": rets.abs().mean().item(),
+            "v_abs_mean": vals.abs().mean().item(),
+            "ret_absmax": rets.abs().max().item(),
+            "v_absmax": vals.abs().max().item(),
+            "saturation": (act_used.abs() > 0.98).float().mean().item(),
+            "logstd_raw": self.policy.actor.act.logstd_mean(effective=False),
+            "logstd_effective": self.policy.actor.act.logstd_mean(effective=True),
+            "rnn_actor_h_norm": _h_mean_norm(rnn_states_batch).item(),
+            "rnn_critic_h_norm": _h_mean_norm(rnn_states_critic_batch).item(),
         }
 
     def train(self, buffer, update_actor=True, generator=None):
         """Perform multi-epoch PPO training with LR decay at the end."""
-        train_info = {}
-        train_info['value_loss'] = 0
-        train_info['policy_loss'] = 0
-        train_info['dist_entropy'] = 0
-        train_info['actor_grad_norm'] = 0
-        train_info['critic_grad_norm'] = 0
-        train_info['ratio'] = 0
-        train_info['clipfrac'] = 0
-        train_info['approx_kl'] = 0
+        metric_names = (
+            'value_loss', 'policy_loss', 'dist_entropy',
+            'actor_grad_norm', 'critic_grad_norm', 'ratio', 'ratio_max',
+            'clipfrac', 'approx_kl', 'adv_mean', 'adv_std',
+            'ret_abs_mean', 'v_abs_mean', 'ret_absmax', 'v_absmax',
+            'saturation', 'logstd_raw', 'logstd_effective',
+            'rnn_actor_h_norm', 'rnn_critic_h_norm',
+        )
+        train_info = {name: 0.0 for name in metric_names}
 
         for _ in range(self.ppo_epoch):
             data_generator = buffer.recurrent_generator(
@@ -515,17 +482,9 @@ class RMAPPOAlgorithm:
             for sample in data_generator:
                 update_info = self.ppo_update(sample, update_actor)
 
-                train_info['value_loss'] += update_info["value_loss"]
-                train_info['policy_loss'] += update_info["policy_loss"]
-                train_info['dist_entropy'] += update_info["dist_entropy"]
-                train_info['actor_grad_norm'] += update_info["actor_grad_norm"]
-                train_info['critic_grad_norm'] += update_info["critic_grad_norm"]
-                train_info['ratio'] += update_info["imp_weights"]
-                train_info['clipfrac'] += update_info["clipfrac"]
-                train_info['approx_kl'] += update_info["approx_kl"]
-
-                # Increment global step after each mini-batch update
-                self.global_step += 1
+                update_info["ratio"] = update_info.pop("imp_weights")
+                for name in metric_names:
+                    train_info[name] += update_info[name]
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
@@ -535,6 +494,8 @@ class RMAPPOAlgorithm:
         # Apply LR decay after completing full PPO update
         self._maybe_decay_lr(self.global_update_step)
         self.global_update_step += 1
+        train_info['actor_lr'] = self.policy.actor_optimizer.param_groups[0]['lr']
+        train_info['critic_lr'] = self.policy.critic_optimizer.param_groups[0]['lr']
 
         return train_info
 

@@ -19,8 +19,6 @@ human_impedance:
 # Residual is a bounded correction added to the impedance prior.
 human_residual:
   max_force: 0.015                  # Per-axis residual limit (N)
-  mapping: "policy_tanh_times_residual_limit"
-  can_override_impedance: false
 
 force_limit_semantics: "per_axis"
 

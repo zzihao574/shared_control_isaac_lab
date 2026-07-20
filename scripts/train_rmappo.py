@@ -86,6 +86,8 @@ def build_dual_network_config_from_params(params: dict):
     import copy
     human_config = copy.deepcopy(common)
     robot_config = copy.deepcopy(common)
+    human_config["agent_id"] = "human"
+    robot_config["agent_id"] = "robot"
     lr_decay = copy.deepcopy(params.get("training", {}).get("lr_decay", {}))
     human_config["lr_decay"] = lr_decay
     robot_config["lr_decay"] = copy.deepcopy(lr_decay)
@@ -175,6 +177,11 @@ class DualRMAPPOWrapper:
         constraints = params.get('constraints', {})
         self.max_robot_force = float(constraints.get('max_robot_force', 0.04))
         self.max_human_force = float(constraints.get('max_human_force', 0.04))
+        self.max_human_residual_force = float(
+            (params.get("human_residual") or {}).get(
+                "max_force", self.max_human_force
+            )
+        )
         
         obs_scaling_config = params.get('obs_scaling', {})
         self.obs_scale_factors = {}
@@ -200,9 +207,11 @@ class DualRMAPPOWrapper:
         self.trainers = {}
         self.buffers = {}
         self.rnn_states = {}
+        self.rnn_masks = {}
         
         # Initialize human network
         human_config = dual_config["human"]
+        human_config['agent_id'] = 'human'
         human_config['metrics_hub'] = metrics_hub
         human_config['args'] = args
         pol_h = RMAPPOPolicy(obs_space_desc, cent_obs_space_desc, act_space_desc, device, human_config)
@@ -219,9 +228,11 @@ class DualRMAPPOWrapper:
             "actor": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, human_config.get('hidden_size', 256), device=device),
         }
+        self.rnn_masks["human"] = torch.ones(num_envs, 1, device=device)
         
         # Initialize robot network and copy weights
         robot_config = dual_config["robot"]
+        robot_config['agent_id'] = 'robot'
         robot_config['metrics_hub'] = metrics_hub
         robot_config['args'] = args
         pol_r = RMAPPOPolicy(obs_space_desc, cent_obs_space_desc, act_space_desc, device, robot_config)
@@ -241,6 +252,7 @@ class DualRMAPPOWrapper:
             "actor": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
             "critic": torch.zeros(num_envs, robot_config.get('hidden_size', 256), device=device),
         }
+        self.rnn_masks["robot"] = torch.ones(num_envs, 1, device=device)
         
         print(f"[DUAL RMAPPO] Initialized:")
         print(f"  Rollout horizon: {self.T}")
@@ -288,7 +300,12 @@ class DualRMAPPOWrapper:
     def actions_to_env_format(self, actions_dict):
         """Convert normalized actions to environment format."""
         env_actions = {}
-        force_limits = {"human": self.max_human_force, "robot": self.max_robot_force}
+        human_policy_limit = (
+            self.max_human_residual_force
+            if self.human_model_type == "residual_impedance"
+            else self.max_human_force
+        )
+        force_limits = {"human": human_policy_limit, "robot": self.max_robot_force}
         
         for aid, actions_norm in actions_dict.items():
             env_actions[aid] = actions_norm * force_limits[aid]
@@ -321,22 +338,31 @@ class DualRMAPPOWrapper:
         actions_norm = {}
         action_log_probs = {}
         values = {}
+        rnn_states_before = {}
+        rnn_masks_used = {}
         
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(obs_scaled, aid)
-            masks = torch.ones(obs.shape[0], 1, device=self.device)
+            actor_state_before = self.rnn_states[aid]["actor"].detach().clone()
+            critic_state_before = self.rnn_states[aid]["critic"].detach().clone()
+            masks = self.rnn_masks[aid].detach().clone()
+            rnn_states_before[aid] = {
+                "actor": actor_state_before,
+                "critic": critic_state_before,
+            }
+            rnn_masks_used[aid] = masks
 
             if aid == "human" and self.human_model_type == "fixed_impedance":
                 a = torch.zeros(obs.shape[0], self.policies[aid].act_dim, device=self.device)
                 lp = torch.zeros(obs.shape[0], 1, device=self.device)
                 v = torch.zeros(obs.shape[0], 1, device=self.device)
-                rnn_a_new = self.rnn_states[aid]["actor"]
-                rnn_c_new = self.rnn_states[aid]["critic"]
+                rnn_a_new = actor_state_before
+                rnn_c_new = critic_state_before
             else:
                 with torch.no_grad():
                     v, a, lp, rnn_a_new, rnn_c_new = self.policies[aid].get_actions(
                         share_obs, obs,
-                        self.rnn_states[aid]["actor"], self.rnn_states[aid]["critic"],
+                        actor_state_before, critic_state_before,
                         masks, deterministic=deterministic
                     )
             
@@ -350,7 +376,14 @@ class DualRMAPPOWrapper:
         env_actions = self.actions_to_env_format(actions_norm)
         
         if not self._is_eval_mode:
-            self._store_rollout_data(obs_scaled, actions_norm, action_log_probs, values)
+            self._store_rollout_data(
+                obs_scaled,
+                actions_norm,
+                action_log_probs,
+                values,
+                rnn_states_before,
+                rnn_masks_used,
+            )
         
         # Build detail dictionary for environment
         # Note: noise_actions kept for environment compatibility (always zero now)
@@ -363,12 +396,19 @@ class DualRMAPPOWrapper:
         
         return env_actions, detail
 
-    def _store_rollout_data(self, observations_scaled, actions_norm, action_log_probs, values):
+    def _store_rollout_data(
+        self,
+        observations_scaled,
+        actions_norm,
+        action_log_probs,
+        values,
+        rnn_states_before,
+        rnn_masks_used,
+    ):
         """Store data for current rollout step."""
         self._current_step_data = {}
         for aid in self.agent_ids:
             obs, share_obs = self.build_obs_tensors(observations_scaled, aid)
-            masks = torch.ones(obs.shape[0], 1, device=self.device)
             
             self._current_step_data[aid] = {
                 'obs': obs.detach(),
@@ -376,9 +416,9 @@ class DualRMAPPOWrapper:
                 'actions': actions_norm[aid].detach(), 
                 'action_log_probs': action_log_probs[aid].detach(),
                 'value_preds': values[aid].detach(),
-                'masks': masks,
-                'rnn_states_actor': self.rnn_states[aid]["actor"].detach().clone(),
-                'rnn_states_critic': self.rnn_states[aid]["critic"].detach().clone()
+                'rnn_masks': rnn_masks_used[aid],
+                'rnn_states_actor': rnn_states_before[aid]["actor"],
+                'rnn_states_critic': rnn_states_before[aid]["critic"],
             }
 
     def add_experience_to_buffer(self, obs, actions, rewards, next_obs, dones, terminated=None, truncated=None, infos=None):
@@ -388,13 +428,10 @@ class DualRMAPPOWrapper:
             
         for aid in self.agent_ids:
             reward_tensor = rewards[aid].unsqueeze(-1) if len(rewards[aid].shape) == 1 else rewards[aid]
-            mask_t = (1.0 - dones[aid].float()).view(-1, 1)
-            
-            if terminated is not None and truncated is not None:
-                is_terminal = terminated[aid]
-                term_mask_t = (~is_terminal).float().view(-1, 1)
-            else:
-                term_mask_t = torch.ones_like(mask_t)
+            continuation_mask_t = (1.0 - dones[aid].float()).view(-1, 1)
+            # Isaac Lab returns reset observations after natural timeouts, so
+            # both terminated and truncated transitions are non-bootstrap here.
+            term_mask_t = continuation_mask_t.clone()
             
             self.buffers[aid].insert(
                 t=self.rollout_step,
@@ -404,7 +441,8 @@ class DualRMAPPOWrapper:
                 action_log_probs=self._current_step_data[aid]['action_log_probs'],
                 value_preds=self._current_step_data[aid]['value_preds'],
                 rewards=reward_tensor,
-                masks=mask_t,
+                rnn_masks=self._current_step_data[aid]['rnn_masks'],
+                continuation_masks=continuation_mask_t,
                 rnn_states_actor=self._current_step_data[aid]['rnn_states_actor'],
                 rnn_states_critic=self._current_step_data[aid]['rnn_states_critic'],
                 term_masks=term_mask_t
@@ -412,8 +450,9 @@ class DualRMAPPOWrapper:
             
             done_indices = dones[aid].nonzero(as_tuple=False).squeeze(-1)
             if done_indices.numel() > 0:
-                self.rnn_states[aid]["actor"][done_indices].zero_()
-                self.rnn_states[aid]["critic"][done_indices].zero_()
+                self.rnn_states[aid]["actor"][done_indices] = 0.0
+                self.rnn_states[aid]["critic"][done_indices] = 0.0
+            self.rnn_masks[aid] = continuation_mask_t.detach().clone()
         
         self.rollout_step += 1
 
