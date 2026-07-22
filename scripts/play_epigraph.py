@@ -216,7 +216,6 @@ def run_eval_episode(trainer: Any, deterministic: bool, max_steps: int, recorder
                 z_i_star = trainer.root_finder.solve(
                     vh_eval_fn=vh_eval_fn,
                     obs=obs[agent],
-                    h_tgt=0.0,
                 )
                 z_candidates.append(z_i_star)
 

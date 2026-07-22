@@ -301,7 +301,7 @@ class RMAPPOHumanModeTest(unittest.TestCase):
             torch.equal(actions["robot"], actions_norm["robot"] * 0.04)
         )
 
-    def test_logstd_effective_range_is_minus_one_to_zero(self):
+    def test_logstd_effective_range_is_minus_one_to_minus_point_two(self):
         distribution = TanhDiagGaussian(4, 3, use_orthogonal=False)
         inputs = torch.zeros(2, 4)
 
@@ -319,7 +319,7 @@ class RMAPPOHumanModeTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(
                 maximum_std,
-                torch.full_like(maximum_std, torch.exp(torch.tensor(0.0))),
+                torch.full_like(maximum_std, torch.exp(torch.tensor(-0.2))),
             )
         )
 

@@ -221,11 +221,11 @@ class ActorRNN(nn.Module):
         self.fc1 = init_linear(nn.Linear(obs_dim + nz, hidden_size), gain=1.0, use_orthogonal=use_orthogonal)
         self.rnn = RNNLayer(hidden_size, hidden_size, recurrent_N, use_orthogonal=use_orthogonal)
         self.fc_mean = init_linear(nn.Linear(hidden_size, act_dim), gain=gain, use_orthogonal=use_orthogonal) # gain代表要把正则化后的weight和bias放大缩小多少
-        self.log_std = nn.Parameter(torch.zeros(1, act_dim))
+        self.log_std = nn.Parameter(torch.full((1, act_dim), -0.5))
 
     def _dist_from_latent(self, h):
         mean = self.fc_mean(h) # mean.shape = [E, act_dim]
-        log_std = torch.clamp(self.log_std.expand_as(mean), -3.0, 2.0) # 【1, act_dim】-> []
+        log_std = torch.clamp(self.log_std.expand_as(mean), -1.0, -0.2)
         return TanhGaussian(mean, log_std)
 
     def act_step(self, obs, z_enc, hxs, masks, deterministic=False, generator=None):
@@ -253,10 +253,11 @@ class ActorRNN(nn.Module):
             action = torch.tanh(dist.mean)
         else:
             action = dist.sample(generator=generator)
+        action = action.clamp(-1.0 + dist.eps, 1.0 - dist.eps)
 
         logp = dist.log_prob(action)
         entropy = dist.entropy()
-        return action, logp, next_h # 输入 obs 经过Encoder后的z hxs  masks
+        return action, logp, next_h, entropy
                                             # 输出动作（mean是从mlp得来，不同环境不一样， logstd自行优化，不同环境同一个维度共享一个logstd）， logppiold(a|s,z，h) 以及下一个隐藏状态 next_h 和 (可以有的熵)
         # obs[t] # [E, obs_dim]      actions[t] # [E, act_dim]      log_probs[t] # [E, 1]    hxs[t] # [E, H]
 
@@ -417,14 +418,15 @@ class RootFinder:
     Binary search to find safe z values.
     Used during evaluation to compute the minimum safe risk budget.
     """
-    def __init__(self, z_min=-0.6, z_max=0.6, max_iter=32, tol=1e-4):
+    def __init__(self, z_min=-0.6, z_max=0.6, h_tgt=0.0, max_iter=32, tol=1e-4):
         self.z_min = z_min
         self.z_max = z_max
+        self.h_tgt = h_tgt
         self.max_iter = max_iter
         self.tol = tol
 
     @torch.no_grad()
-    def solve(self, vh_eval_fn, obs, h_tgt=0.0):
+    def solve(self, vh_eval_fn, obs, h_tgt=None, z_min=None, z_max=None):
         """
         Find z* such that Vh(obs, z*) ≈ h_tgt using binary search.
         
@@ -432,15 +434,25 @@ class RootFinder:
             vh_eval_fn: Callable([B,1] z) -> [B,1] predicted risk Vh
             obs: [B, obs_dim] observations (for device and batch size)
             h_tgt: Safety threshold (default 0.0)
+            z_min, z_max: Search interval (defaults to the configured final range)
         
         Returns:
             z_star: [B, 1] - Minimum safe z value per environment
         """
+        h_tgt = self.h_tgt if h_tgt is None else h_tgt
+        z_min = self.z_min if z_min is None else float(z_min)
+        z_max = self.z_max if z_max is None else float(z_max)
+        if z_min > z_max:
+            raise ValueError(f"Invalid root search interval [{z_min}, {z_max}]")
         device = obs.device
         B = obs.shape[0]
 
-        low = torch.full((B, 1), self.z_min, device=device)
-        high = torch.full((B, 1), self.z_max, device=device)
+        low = torch.full((B, 1), z_min, device=device)
+        high = torch.full((B, 1), z_max, device=device)
+        vh_low = vh_eval_fn(low)
+        vh_high = vh_eval_fn(high)
+        low_safe = vh_low <= h_tgt
+        high_safe = vh_high <= h_tgt
 
         for _ in range(self.max_iter):
             mid = 0.5 * (low + high)
@@ -452,4 +464,13 @@ class RootFinder:
             if (high - low).abs().max() < self.tol:
                 break
 
-        return 0.5 * (low + high)
+        z_root = 0.5 * (low + high)
+        return torch.where(
+            low_safe & high_safe,
+            torch.full_like(z_root, z_min),
+            torch.where(
+                (~low_safe) & (~high_safe),
+                torch.full_like(z_root, z_max),
+                z_root,
+            ),
+        )

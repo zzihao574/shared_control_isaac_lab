@@ -720,6 +720,13 @@ class SurgicalDirectMARLEnv(DirectMARLEnv):
         self._refresh_state_cache()
         self.reward_components = {}
         masks = self._build_zone_masks()
+        outside, surface, danger, rejoin = masks
+        self.reward_components.update({
+            "zoneA_active_mask": outside,
+            "zoneB_active_mask": surface & (~rejoin),
+            "zoneC_active_mask": danger,
+            "zoneD_active_mask": rejoin,
+        })
 
         def _agent_zone_sum(agent: str):
             """Calculate total zone rewards for specific agent."""

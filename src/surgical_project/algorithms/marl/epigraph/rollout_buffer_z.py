@@ -20,7 +20,7 @@ class RolloutBufferZ:
     - Value predictions (Vl, Vh)
     - Z values
     - RNN states (actor, critic_vl, critic_vh)
-    - Masks, term_masks, and override_bootstrap fields
+    - Separate RNN, GAE-continuation, and bootstrap masks
     - Computed returns and advantages
     """
     
@@ -72,9 +72,10 @@ class RolloutBufferZ:
         # Z values
         self.z = torch.zeros(T + 1, N, 1, device=device)
         
-        # Masks
-        self.masks = torch.zeros(T, N, 1, device=device)
-        self.term_masks = torch.zeros(T, N, 1, device=device)
+        # State-reset, GAE-recursion, and bootstrap semantics are distinct.
+        self.rnn_masks = torch.ones(T, N, 1, device=device)
+        self.continuation_masks = torch.ones(T, N, 1, device=device)
+        self.bootstrap_masks = torch.ones(T, N, 1, device=device)
         
         # Override bootstrap values
         self.override_bootstrap_mask_vl = torch.zeros(T, N, 1, dtype=torch.bool, device=device)
@@ -107,8 +108,9 @@ class RolloutBufferZ:
         values_vl: torch.Tensor,
         values_vh: torch.Tensor,
         z: torch.Tensor,
-        masks: torch.Tensor,
-        term_masks: torch.Tensor,
+        rnn_masks: torch.Tensor,
+        continuation_masks: torch.Tensor,
+        bootstrap_masks: torch.Tensor,
         override_bootstrap_mask_vl: torch.Tensor,
         override_bootstrap_vl: torch.Tensor,
         override_bootstrap_mask_vh: torch.Tensor,
@@ -141,8 +143,9 @@ class RolloutBufferZ:
         
         self.z[t].copy_(z)
         
-        self.masks[t].copy_(masks)
-        self.term_masks[t].copy_(term_masks)
+        self.rnn_masks[t].copy_(rnn_masks)
+        self.continuation_masks[t].copy_(continuation_masks)
+        self.bootstrap_masks[t].copy_(bootstrap_masks)
         
         self.override_bootstrap_mask_vl[t].copy_(override_bootstrap_mask_vl)
         self.override_bootstrap_vl[t].copy_(override_bootstrap_vl)
@@ -199,8 +202,8 @@ class RolloutBufferZ:
         The rMAPPO Runner milestone trick:
         - Set override_bootstrap_mask = True at t_last
         - Set override_bootstrap_value = V(s_{t_last+1}, z_{t_last+1})
-        - Keep term_masks[t_last] = 1 (allow bootstrap, not true terminal)
-        - Set masks[t_last+1] = 0 to prevent GAE from propagating beyond this rollout
+        - Keep bootstrap_masks[t_last] = 1 for the supplied next value
+        - Set continuation_masks[t_last] = 0 to stop GAE recursion
         
         This allows clean evaluation without corrupting the next rollout's RNN states.
         """
@@ -225,9 +228,8 @@ class RolloutBufferZ:
         self.override_bootstrap_vl[t_last].copy_(vl_bootstrap)
         self.override_bootstrap_vh[t_last].copy_(vh_bootstrap)
         
-        # CRITICAL: Keep term_masks[t_last] = 1 (allow bootstrap)
-        # This is different from true episode termination where term_masks = 0
-        self.term_masks[t_last, :, :] = 1.0
+        self.continuation_masks[t_last, :, :] = 0.0
+        self.bootstrap_masks[t_last, :, :] = 1.0
         
         print(f"[BUFFER] Marked milestone truncation at t={t_last}")
         print(f"[BUFFER] Override Vl: mean={vl_bootstrap.mean().item():.4f}")
@@ -270,7 +272,7 @@ class RolloutBufferZ:
         rewards_task_reshaped = self.rewards_task.view(T, A, E, 1).permute(0, 2, 1, 3)  # [T,E,A,1]
         team_task_reward = rewards_task_reshaped.mean(dim=2).squeeze(-1)  # [T,E]
         
-        # Safety costs: [T, N, 1] -> [T, E, A]
+        # Signed constraints h: [T, N, 1] -> [T, E, A]
         costs_safe_reshaped = self.costs_safe.view(T, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T,E,A]
         
         # Z trajectory: [T, N, 1] -> [T, E] (take first agent's z since it's shared)
@@ -282,9 +284,8 @@ class RolloutBufferZ:
         # Vh predictions: [T+1, N, 1] -> [T+1, E, A]
         vh_preds = self.values_vh.view(T+1, A, E, 1).permute(0, 2, 1, 3).squeeze(-1)  # [T+1,E,A]
         
-        # Masks: [T, N, 1] -> [T, E]
-        masks = self.masks[:, :E, 0]  # [T, E]
-        term_masks = self.term_masks[:, :E, 0]  # [T, E]
+        continuation_masks = self.continuation_masks[:, :E, 0]
+        bootstrap_masks = self.bootstrap_masks[:, :E, 0]
         
         # Override bootstrap: [T, N, 1] -> [T, E] and [T, E, A]
         ov_mask_vl = self.override_bootstrap_mask_vl[:, :E, 0]  # [T, E]
@@ -299,8 +300,8 @@ class RolloutBufferZ:
             z_traj=z_traj,                # [T, E]
             vl_preds=vl_preds,            # [T+1, E]
             vh_preds=vh_preds,            # [T+1, E, A]
-            masks=masks,                  # [T, E]
-            term_masks=term_masks,        # [T, E]
+            continuation_masks=continuation_masks,
+            bootstrap_masks=bootstrap_masks,
             ov_mask_vl=ov_mask_vl,        # [T, E]
             ov_vl=ov_vl,                  # [T, E]
             ov_mask_vh=ov_mask_vh,        # [T, E, A]
@@ -310,10 +311,7 @@ class RolloutBufferZ:
         )
         
         # ========== Normalize Advantages ==========
-        advantages_normalized = normalize_advantages(
-            advantages=advantages,  # [T, E, A]
-            masks=masks,            # [T, E]
-        )
+        advantages_normalized = normalize_advantages(advantages)
         
         # ========== Reshape back to agent-major [T, N, 1] and store ==========
         # Q_perf: [T, E] -> [T, E, A] (broadcast to all agents) -> [T, A, E] -> [T, N, 1]
@@ -354,8 +352,9 @@ class RolloutBufferZ:
         
         self.z.zero_()
         
-        self.masks.zero_()
-        self.term_masks.zero_()
+        self.rnn_masks.fill_(1.0)
+        self.continuation_masks.fill_(1.0)
+        self.bootstrap_masks.fill_(1.0)
         
         self.override_bootstrap_mask_vl.zero_()
         self.override_bootstrap_vl.zero_()
@@ -383,8 +382,9 @@ class RolloutBufferZ:
             "values_vl": self.values_vl[:self.T],
             "values_vh": self.values_vh[:self.T],
             "z": self.z[:self.T],
-            "masks": self.masks,
-            "term_masks": self.term_masks,
+            "rnn_masks": self.rnn_masks,
+            "continuation_masks": self.continuation_masks,
+            "bootstrap_masks": self.bootstrap_masks,
             "override_bootstrap_mask_vl": self.override_bootstrap_mask_vl,
             "override_bootstrap_vl": self.override_bootstrap_vl,
             "override_bootstrap_mask_vh": self.override_bootstrap_mask_vh,

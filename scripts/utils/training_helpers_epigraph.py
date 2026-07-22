@@ -9,6 +9,30 @@ import torch
 import numpy as np
 from typing import Dict, Any, Optional, List
 from collections import defaultdict
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EpigraphSeedPlan:
+    """Deterministic, independent RNG streams derived from one experiment seed."""
+
+    base_seed: int
+
+    def policy_seed(self) -> int:
+        return int(self.base_seed) + 424242
+
+    def minibatch_seed(self) -> int:
+        return int(self.base_seed) + 424243
+
+    def z_seed(self) -> int:
+        return int(self.base_seed) + 424244
+
+    def evaluation_seed(self) -> int:
+        return int(self.base_seed) + 424245
+
+    @staticmethod
+    def make_generator(seed: int) -> torch.Generator:
+        return torch.Generator(device="cpu").manual_seed(int(seed))
 
 
 # ============================================================================
@@ -66,9 +90,8 @@ class TrainingConfiguration:
             if section not in self.params:
                 raise ValueError(f"Missing required config section: {section}")
         
-        # Validate algorithms.rmappo (NOT algorithms.epigraph)
-        if "rmappo" not in self.params["algorithms"]:
-            raise ValueError("Missing algorithms.rmappo configuration")
+        if "epigraph" not in self.params["algorithms"]:
+            raise ValueError("Missing algorithms.epigraph configuration")
         
         # Validate training_monitor.milestone_episodes (CRITICAL for Route B)
         if "training_monitor" not in self.params:
@@ -432,47 +455,24 @@ def print_training_progress(
         update_stats: Statistics from trainer update
     """
     progress_pct = global_step / max_steps * 100 if max_steps > 0 else 0
-    
-    print("\n" + "=" * 80)
-    print(f"Training Progress: {global_step}/{max_steps} ({progress_pct:.1f}%)")
-    print("=" * 80)
-    
-    # Determine per-agent ordering
-    if agent_labels is None:
-        agent_labels = []
-    sanitized_labels = [label.replace(" ", "_") for label in agent_labels]
-    if not sanitized_labels:
-        sanitized_labels = sorted(
-            [k[len("avg_z_"):] for k in rollout_stats.keys() if k.startswith("avg_z_")]
-        )
-        agent_labels = sanitized_labels
-
-    # Rollout statistics
-    print("\n[Rollout Statistics]")
-    print(f"  Task Return (avg)       : {rollout_stats.get('avg_episode_task_return', 0):.3f}")
-    print(f"  Safe Cost Sum (avg)     : {rollout_stats.get('avg_episode_safe_cost_sum', 0):.3f}")
-    print(f"  Combined Return (avg)   : {rollout_stats.get('avg_episode_combined_return', 0):.3f}")
-    print(f"  Unsafe Step Ratio       : {rollout_stats.get('unsafe_step_ratio', 0):.2%}")
-    print(f"  Progress Ratio (avg)    : {rollout_stats.get('avg_progress_ratio', 0):.2%}")
-    print(f"  Episodes Finished       : {rollout_stats.get('episodes_finished', 0)}")
-    
-    if sanitized_labels:
-        print("\n[Per-Agent Averages]")
-        for label, sanitized in zip(agent_labels, sanitized_labels):
-            task_mean = rollout_stats.get(f"r_task_mean_{sanitized}", 0.0)
-            safe_mean = rollout_stats.get(f"r_safe_cost_mean_{sanitized}", 0.0)
-            z_mean = rollout_stats.get(f"avg_z_{sanitized}", 0.0)
-            print(f"  {label} -> task {task_mean:+.3f}, safe {safe_mean:+.3f}, z {z_mean:+.4f}")
-    
-    # Z statistics
-    print("\n[Risk Budget (Z) Statistics]")
-    print(f"  Z Range                 : [{rollout_stats.get('z_min', 0):.4f}, {rollout_stats.get('z_max', 0):.4f}]")
-    
-    # Update statistics
-    print("\n[Update Statistics]")
-    print(f"  Policy Loss             : {update_stats.get('loss_policy', 0):.4f}")
-    print(f"  Value Loss (Vl)         : {update_stats.get('loss_value_vl', 0):.4f}")
-    print(f"  Value Loss (Vh)         : {update_stats.get('loss_value_vh', 0):.4f}")
-    print(f"  Entropy                 : {update_stats.get('entropy', 0):.4f}")
-    
-    print("=" * 80 + "\n")
+    print(
+        f"[STEP {global_step}] {progress_pct:.1f}% | "
+        f"Episodes={rollout_stats.get('episodes_finished', 0)} | "
+        f"Task={rollout_stats.get('avg_episode_task_return', 0.0):+.2f} | "
+        f"Progress={rollout_stats.get('avg_progress_ratio', 0.0):.2f} | "
+        f"Violation={rollout_stats.get('constraint_violation_ratio', rollout_stats.get('unsafe_step_ratio', 0.0)):.2%}"
+    )
+    print(
+        f"  z mean/std={rollout_stats.get('z_mean', 0.0):+.2f}/"
+        f"{rollout_stats.get('z_std', 0.0):.2f} | "
+        f"bounds=({rollout_stats.get('z_lower_bound_ratio', 0.0):.2%},"
+        f"{rollout_stats.get('z_upper_bound_ratio', 0.0):.2%}) | "
+        f"branch={rollout_stats.get('performance_branch_ratio', 0.0):.2%} | "
+        f"gap={rollout_stats.get('branch_gap_mean', 0.0):+.2f}"
+    )
+    print(
+        f"  VlLoss={update_stats.get('loss_value_vl', 0.0):.3f} | "
+        f"VhLoss={update_stats.get('loss_value_vh', 0.0):.3f} | "
+        f"KL={update_stats.get('approx_kl', 0.0):.4f} | "
+        f"Entropy={update_stats.get('entropy', 0.0):.3f}"
+    )
