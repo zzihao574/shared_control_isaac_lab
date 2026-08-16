@@ -2279,8 +2279,8 @@ class EpigraphTrainer:
         torch.save(checkpoint, path)
         print(f"[CHECKPOINT] Saved to {path}")
     
-    def load_checkpoint(self, path: str):
-        """Load checkpoint with all networks, optimizers, and training state."""
+    def load_checkpoint(self, path: str, restore_training_state: bool = True):
+        """Load a checkpoint, optionally excluding resume-only runtime state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         saved_version = int(checkpoint.get("epigraph_semantics_version", 1))
         if saved_version != EPIGRAPH_SEMANTICS_VERSION:
@@ -2319,10 +2319,11 @@ class EpigraphTrainer:
         self.z_encoder_vl.load_state_dict(checkpoint["z_encoder_vl"])
         self.z_encoder_vh.load_state_dict(checkpoint["z_encoder_vh"])
 
-        # Load optimizers
-        self.optimizer_actor.load_state_dict(checkpoint["optimizer_actor"])
-        self.optimizer_vl.load_state_dict(checkpoint["optimizer_vl"])
-        self.optimizer_vh.load_state_dict(checkpoint["optimizer_vh"])
+        # Optimizers are only needed when resuming training.
+        if restore_training_state:
+            self.optimizer_actor.load_state_dict(checkpoint["optimizer_actor"])
+            self.optimizer_vl.load_state_dict(checkpoint["optimizer_vl"])
+            self.optimizer_vh.load_state_dict(checkpoint["optimizer_vh"])
         
         # Load training state
         self.global_step = checkpoint["global_step"]
@@ -2331,17 +2332,18 @@ class EpigraphTrainer:
         self.global_update_step = int(
             checkpoint.get("global_update_step", checkpoint.get("update_count", 0))
         )
-        accumulators = checkpoint.get("episode_accumulators")
-        if isinstance(accumulators, dict):
-            self._episode_task_returns.copy_(accumulators["task"].to(self.device))
-            self._episode_safe_returns.copy_(accumulators["safe"].to(self.device))
-            self._episode_lengths.copy_(accumulators["length"].to(self.device))
+        if restore_training_state:
+            accumulators = checkpoint.get("episode_accumulators")
+            if isinstance(accumulators, dict):
+                self._episode_task_returns.copy_(accumulators["task"].to(self.device))
+                self._episode_safe_returns.copy_(accumulators["safe"].to(self.device))
+                self._episode_lengths.copy_(accumulators["length"].to(self.device))
         
         # Load remaining milestones
         if "milestones" in checkpoint:
             self.milestones = deque(checkpoint["milestones"])
 
-        if "rng_state" in checkpoint:
+        if restore_training_state and "rng_state" in checkpoint:
             rng_state = checkpoint["rng_state"]
             try:
                 random.setstate(rng_state["py"])

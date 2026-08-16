@@ -49,7 +49,8 @@ def setup_environment(args, config):
     env_cfg.seed = args.seed
     env_cfg.params = config.params
     
-    env = gym.make(args.task, cfg=env_cfg)
+    render_mode = getattr(args, "render_mode", None)
+    env = gym.make(args.task, cfg=env_cfg, render_mode=render_mode)
     return env, env_cfg
 
 

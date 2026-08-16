@@ -27,6 +27,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from statistics import mean, pstdev
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -34,7 +35,54 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import yaml
 
-__all__ = ["EvalRecorder", "wandb_available", "EvalWandBLogger"]
+__all__ = [
+    "EvalRecorder",
+    "EvalWandBLogger",
+    "print_paper_metrics",
+    "resolve_best_checkpoint",
+    "wandb_available",
+]
+
+
+_CHECKPOINT_SCORE_RE = re.compile(
+    r"^ckpt_milestone_\d+_score_([-+]?\d+(?:\.\d+)?)\.(?:pt|pth)$"
+)
+
+
+def resolve_best_checkpoint(
+    explicit_checkpoint: Optional[str],
+    checkpoint_root: str,
+) -> str:
+    """Resolve an explicit checkpoint or the highest-score milestone below a root."""
+    if explicit_checkpoint:
+        checkpoint = os.path.abspath(explicit_checkpoint)
+        if not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+        return checkpoint
+
+    root = os.path.abspath(checkpoint_root)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"Checkpoint root does not exist: {root}")
+
+    candidates = []
+    for current_dir, _, filenames in os.walk(root):
+        for filename in filenames:
+            match = _CHECKPOINT_SCORE_RE.match(filename)
+            if match is None:
+                continue
+            candidates.append(
+                (float(match.group(1)), os.path.join(current_dir, filename))
+            )
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No scored milestone checkpoint was found below: {root}"
+        )
+
+    score, checkpoint = max(candidates, key=lambda item: (item[0], item[1]))
+    print(f"[CHECKPOINT] Auto-selected best fixed checkpoint (score={score:.6f}):")
+    print(f"[CHECKPOINT] {checkpoint}")
+    return checkpoint
 
 
 def _to_float(value, index: int = 0) -> Optional[float]:
@@ -405,6 +453,7 @@ class EvalRecorder:
             "num_episodes": len(self.episode_summaries),
             "episodes": [summary.__dict__ for summary in self.episode_summaries],
             "aggregated": self._build_aggregates(),
+            "paper_metrics": self.build_paper_metrics(),
         }
 
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -499,6 +548,53 @@ class EvalRecorder:
             if agg is not None:
                 aggregates[key] = agg
         return aggregates
+
+    def build_paper_metrics(self) -> Dict[str, float]:
+        """Return the six scalar metrics used in the fixed-human comparison table."""
+        metric_values = {
+            "P_fin": [
+                summary.progress_final for summary in self.episode_summaries
+            ],
+            "Steps": [
+                float(summary.episode_length) for summary in self.episode_summaries
+            ],
+            "rho_track": [
+                summary.on_track_ratio for summary in self.episode_summaries
+            ],
+            "bar_R": [summary.score for summary in self.episode_summaries],
+            "rho_C": [summary.c_zone_ratio for summary in self.episode_summaries],
+            "rho_col": [
+                summary.collision_ratio for summary in self.episode_summaries
+            ],
+        }
+        result: Dict[str, float] = {}
+        for key, values in metric_values.items():
+            stats = _aggregate(values)
+            if stats is not None:
+                result[key] = stats["mean"]
+        return result
+
+
+def print_paper_metrics(recorder: EvalRecorder):
+    """Print the compact metric block used by the paper."""
+    metrics = recorder.build_paper_metrics()
+    if not metrics:
+        return
+
+    print("\n[PAPER METRICS]")
+    labels = (
+        ("P_fin", "P_fin   [up]"),
+        ("Steps", "Steps   [down]"),
+        ("rho_track", "rho_track [up]"),
+        ("bar_R", "bar_R   [up]"),
+        ("rho_C", "rho_C   [down]"),
+        ("rho_col", "rho_col [down]"),
+    )
+    for key, label in labels:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        print(f"  {label}: {value:.6f}")
 
 
 def _format(value: Optional[float]) -> Optional[float]:

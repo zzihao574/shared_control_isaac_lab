@@ -11,6 +11,7 @@ Features:
 """
 
 import argparse
+import copy
 import os
 import sys
 import traceback
@@ -28,7 +29,13 @@ for _path in (REPO_ROOT, SRC_ROOT):
 
 from isaaclab.app import AppLauncher
 
-from scripts.utils.eval_logging import EvalRecorder, EvalWandBLogger, wandb_available
+from scripts.utils.eval_logging import (
+    EvalRecorder,
+    EvalWandBLogger,
+    print_paper_metrics,
+    resolve_best_checkpoint,
+    wandb_available,
+)
 
 DEFAULT_CONFIG_PATH = os.path.abspath(
     os.path.join(
@@ -41,6 +48,9 @@ DEFAULT_CONFIG_PATH = os.path.abspath(
         "agents",
         "training_params_epigraph.yaml",
     )
+)
+DEFAULT_FIXED_CHECKPOINT_ROOT = os.path.join(
+    REPO_ROOT, "logs", "epigraph", "fixed_impedance"
 )
 
 
@@ -91,6 +101,15 @@ def setup_reproducibility(seed: int, strict_determinism: bool = True):
 
 
 def load_config(checkpoint_path: str, fallback_path: str) -> dict:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint.get("params"), dict):
+        config = copy.deepcopy(checkpoint["params"])
+        checkpoint_mode = checkpoint.get("human_model_type")
+        if checkpoint_mode is not None:
+            config["human_model_type"] = checkpoint_mode
+        print("[CONFIG] Restored resolved configuration embedded in checkpoint.")
+        return config
+
     checkpoint_dir = os.path.dirname(checkpoint_path)
     possible_names = [
         "training_params_epigraph.yaml",
@@ -133,7 +152,7 @@ def create_trainer(
 ) -> Any:
     from surgical_project.algorithms.marl.epigraph.trainer import EpigraphTrainer
 
-    algo_cfg = config["algorithms"]["rmappo"]
+    algo_cfg = config["algorithms"]["epigraph"]
     epi_cfg = config["epigraph"]
     max_global_steps = algo_cfg.get("max_global_steps", 150000)
     trainer = EpigraphTrainer(
@@ -151,7 +170,21 @@ def create_trainer(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate trained Epigraph policy.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file (.pt/.pth).")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to checkpoint file. If omitted, the highest-score milestone "
+            "below --checkpoint_root is selected."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_root",
+        type=str,
+        default=DEFAULT_FIXED_CHECKPOINT_ROOT,
+        help="Root searched when --checkpoint is omitted.",
+    )
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of evaluation episodes.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments (default: 1).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -341,6 +374,7 @@ def evaluate(args):
     config_path = resolve_config_path(args.config, args.checkpoint)
     print(f"[SETUP] Using config: {config_path}")
     config = load_config(args.checkpoint, config_path)
+    config.setdefault("logging", {})["use_wandb"] = False
 
     setup_reproducibility(args.seed, strict_determinism=True)
 
@@ -349,7 +383,7 @@ def evaluate(args):
     trainer = create_trainer(env, config, args.checkpoint, device=device)
 
     print(f"[LOAD] Loading checkpoint: {args.checkpoint}")
-    trainer.load_checkpoint(args.checkpoint)
+    trainer.load_checkpoint(args.checkpoint, restore_training_state=False)
     trainer.set_eval_mode()
 
     completion_threshold = config.get("reward_parameters", {}).get("completion_threshold", 0.01)
@@ -411,15 +445,7 @@ def evaluate(args):
     save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
     recorder.save(save_dir)
     print(f"[SAVE] Evaluation artifacts written to: {save_dir}")
-
-    aggregates = recorder._build_aggregates()
-    if aggregates:
-        print("\n[EVALUATION SUMMARY]")
-        for key, stats in aggregates.items():
-            print(
-                f"  {key}: mean={stats['mean']:.3f} std={stats['std']:.3f} "
-                f"min={stats['min']:.3f} max={stats['max']:.3f}"
-            )
+    print_paper_metrics(recorder)
 
     if wandb_logger:
         table_data = [
@@ -463,6 +489,7 @@ def evaluate(args):
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
+    args.checkpoint = resolve_best_checkpoint(args.checkpoint, args.checkpoint_root)
 
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app

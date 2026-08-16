@@ -26,7 +26,13 @@ for _path in (REPO_ROOT, SRC_ROOT):
 
 from isaaclab.app import AppLauncher
 
-from scripts.utils.eval_logging import EvalRecorder, EvalWandBLogger, wandb_available
+from scripts.utils.eval_logging import (
+    EvalRecorder,
+    EvalWandBLogger,
+    print_paper_metrics,
+    resolve_best_checkpoint,
+    wandb_available,
+)
 from scripts.utils.training_helpers_rmappo import TrainingConfiguration, MetricsHub
 from train_rmappo import (
     setup_global_reproducibility,
@@ -45,6 +51,9 @@ DEFAULT_CONFIG_PATH = os.path.abspath(
         "agents",
         "training_params_rmappo.yaml",
     )
+)
+DEFAULT_FIXED_CHECKPOINT_ROOT = os.path.join(
+    REPO_ROOT, "logs", "rmappo_dual", "fixed_impedance"
 )
 
 
@@ -148,9 +157,23 @@ def inject_step_tracer(env, config, num_envs):
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate trained rMAPPO dual-network policy.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pth).")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to checkpoint file. If omitted, the highest-score milestone "
+            "below --checkpoint_root is selected."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_root",
+        type=str,
+        default=DEFAULT_FIXED_CHECKPOINT_ROOT,
+        help="Root searched when --checkpoint is omitted.",
+    )
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0", help="Environment task name.")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: checkpoint seed).")
+    parser.add_argument("--seed", type=int, default=42, help="Evaluation random seed.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments (default: 1).")
     parser.add_argument("--num_episodes", type=int, default=1, help="Number of evaluation episodes.")
     parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps per episode (0 = unlimited).")
@@ -290,15 +313,7 @@ def evaluate(args, simulation_app, config_path, config):
     save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
     recorder.save(save_dir)
     print(f"[SAVE] Evaluation artifacts written to: {save_dir}")
-
-    aggregates = recorder._build_aggregates()
-    if aggregates:
-        print("\n[EVALUATION SUMMARY]")
-        for key, stats in aggregates.items():
-            print(
-                f"  {key}: mean={stats['mean']:.3f} std={stats['std']:.3f} "
-                f"min={stats['min']:.3f} max={stats['max']:.3f}"
-            )
+    print_paper_metrics(recorder)
 
     if wandb_logger:
         table_data = [
@@ -340,6 +355,7 @@ def evaluate(args, simulation_app, config_path, config):
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
+    args.checkpoint = resolve_best_checkpoint(args.checkpoint, args.checkpoint_root)
 
     config_path, config = resolve_evaluation_config(args)
     setup_global_reproducibility(args.seed, strict_determinism=True)

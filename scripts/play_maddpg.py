@@ -27,7 +27,13 @@ for _path in (REPO_ROOT, SRC_ROOT):
 
 from isaaclab.app import AppLauncher
 
-from scripts.utils.eval_logging import EvalRecorder, EvalWandBLogger, wandb_available
+from scripts.utils.eval_logging import (
+    EvalRecorder,
+    EvalWandBLogger,
+    print_paper_metrics,
+    resolve_best_checkpoint,
+    wandb_available,
+)
 from scripts.utils.training_helpers_maddpg import TrainingConfiguration
 from train_maddpg import (
     setup_environment,
@@ -47,6 +53,9 @@ DEFAULT_CONFIG_PATH = os.path.abspath(
         "agents",
         "training_params_maddpg.yaml",
     )
+)
+DEFAULT_FIXED_CHECKPOINT_ROOT = os.path.join(
+    REPO_ROOT, "logs", "maddpg_dual", "fixed_impedance"
 )
 
 
@@ -157,7 +166,21 @@ def load_maddpg_checkpoint(maddpg, checkpoint_path: str):
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate trained MADDPG shared-network policy.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to checkpoint file. If omitted, the highest-score milestone "
+            "below --checkpoint_root is selected."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_root",
+        type=str,
+        default=DEFAULT_FIXED_CHECKPOINT_ROOT,
+        help="Root searched when --checkpoint is omitted.",
+    )
     parser.add_argument("--task", type=str, default="Isaac-Surgical-MARL-Direct-v0", help="Environment task name.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments (default: 1).")
@@ -167,6 +190,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Enable stochastic actions with exploration noise.")
     parser.set_defaults(deterministic=True)
     parser.add_argument("--save_dir", type=str, default=None, help="Directory to store evaluation outputs.")
+    parser.add_argument("--video", action="store_true", default=False, help="Record the evaluation episode.")
+    parser.add_argument("--video_length", type=int, default=1200, help="Maximum number of recorded frames.")
+    parser.add_argument(
+        "--camera_eye",
+        type=float,
+        nargs=3,
+        default=(0.70, 0.0, 0.25),
+        metavar=("X", "Y", "Z"),
+        help="Viewport camera position; default view direction points along the negative x-axis.",
+    )
+    parser.add_argument(
+        "--camera_lookat",
+        type=float,
+        nargs=3,
+        default=(-0.08, 0.0, 0.05),
+        metavar=("X", "Y", "Z"),
+        help="Viewport camera target.",
+    )
     parser.add_argument("--wandb", action="store_true", default=False, help="Enable WandB logging.")
     AppLauncher.add_app_launcher_args(parser)
     return parser
@@ -193,6 +234,7 @@ def evaluate(args):
     eval_args.num_envs = max(1, args.num_envs)
     eval_args.task = args.task
     eval_args.seed = args.seed
+    eval_args.render_mode = "rgb_array" if args.video else None
 
     env, _ = setup_environment(eval_args, config)
     actual_env = getattr(env, "unwrapped", env)
@@ -200,12 +242,34 @@ def evaluate(args):
         actual_env.params = config.params
         print("[SETUP] Injected params into environment.")
 
+    camera_eye = tuple(float(value) for value in args.camera_eye)
+    camera_lookat = tuple(float(value) for value in args.camera_lookat)
+    actual_env.sim.set_camera_view(eye=camera_eye, target=camera_lookat)
+    print(f"[CAMERA] eye={camera_eye} lookat={camera_lookat}")
+
     inject_step_tracer(env, config, eval_args.num_envs)
 
     maddpg = initialize_maddpg_algorithm(env, config, eval_args)
     maddpg.set_eval_mode(True)
 
     load_maddpg_checkpoint(maddpg, args.checkpoint)
+
+    save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
+    if args.video:
+        if args.video_length <= 0:
+            raise ValueError("--video_length must be positive.")
+        import gymnasium as gym
+
+        video_folder = os.path.join(save_dir, "videos")
+        video_kwargs = {
+            "video_folder": video_folder,
+            "step_trigger": lambda step: step == 0,
+            "video_length": args.video_length,
+            "name_prefix": "maddpg_fixed_impedance",
+            "disable_logger": True,
+        }
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        print(f"[VIDEO] Recording to: {video_folder}")
 
     completion_threshold = (
         config.params.get("reward_parameters", {}).get("completion_threshold", 0.01)
@@ -294,9 +358,9 @@ def evaluate(args):
             }
             wandb_logger.log_episode(ep, {k: v for k, v in wandb_payload.items() if v is not None})
 
-    save_dir = resolve_save_dir(args.save_dir, args.checkpoint)
     recorder.save(save_dir)
     print(f"[SAVE] Evaluation results written to: {save_dir}")
+    print_paper_metrics(recorder)
 
     if wandb_logger:
         # Upload per-step table
@@ -335,10 +399,17 @@ def evaluate(args):
         )
         wandb_logger.finish()
 
+    if args.video:
+        print("[VIDEO] Finalizing recording...")
+        env.close()
+
 
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
+    args.checkpoint = resolve_best_checkpoint(args.checkpoint, args.checkpoint_root)
+    if args.video:
+        args.enable_cameras = True
 
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
